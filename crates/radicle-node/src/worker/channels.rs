@@ -273,13 +273,12 @@ impl Read for ChannelReader<Vec<u8>> {
             }
             Ok(ChannelEvent::Eof) => {
                 self.space.notify_one();
-                Err(io::ErrorKind::UnexpectedEof.into())
+                Ok(0)
             }
             Ok(ChannelEvent::Close) => {
                 self.space.notify_one();
                 Err(io::ErrorKind::ConnectionReset.into())
             }
-
             Err(chan::RecvTimeoutError::Timeout) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "error reading from stream: channel timed out",
