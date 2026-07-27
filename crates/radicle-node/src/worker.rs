@@ -221,8 +221,6 @@ impl Worker {
                     };
                 };
 
-                log::debug!(target: "worker", "Spawning upload-pack process for {} in job {job}..", header.repo);
-
                 if let Err(e) = self.is_authorized(remote, header.repo) {
                     return FetchResult::Responder {
                         rid: Some(header.repo),
@@ -247,6 +245,8 @@ impl Worker {
                         };
                     }
                 }
+
+                log::debug!(target: "worker", "Spawning upload-pack process for {} in job {job}..", header.repo);
 
                 let result = upload_pack::upload_pack(
                     &self.nid,
