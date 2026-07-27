@@ -44,31 +44,29 @@ impl ChannelsConfig {
 /// provide its underlying channels for reading and writing.
 pub struct ChannelsFlush {
     receiver: ChannelReader,
-    sender: ChannelFlushWriter,
+    sender: ChannelWriter,
 }
 
 impl ChannelsFlush {
     pub fn new(channels: Channels) -> Self {
         Self {
             receiver: channels.receiver,
-            sender: ChannelFlushWriter {
-                writer: channels.sender,
-            },
+            sender: channels.sender,
         }
     }
 
-    pub fn split(&mut self) -> (&mut ChannelReader, &mut ChannelFlushWriter) {
+    pub fn split(&mut self) -> (&mut ChannelReader, &mut ChannelWriter) {
         (&mut self.receiver, &mut self.sender)
     }
 
     pub fn timeout(&self) -> time::Duration {
-        self.sender.writer.timeout.max(self.receiver.timeout)
+        self.sender.timeout.max(self.receiver.timeout)
     }
 }
 
 impl fetch::transport::ConnectionStream for ChannelsFlush {
     type Read = ChannelReader;
-    type Write = ChannelFlushWriter;
+    type Write = ChannelWriter;
 
     fn open(&mut self) -> (&mut Self::Read, &mut Self::Write) {
         (&mut self.receiver, &mut self.sender)
@@ -255,33 +253,22 @@ impl Read for ChannelReader<Vec<u8>> {
 
 /// Wraps a [`chan::Sender`] and provides it with [`io::Write`].
 #[derive(Clone)]
-struct ChannelWriter<T = Vec<u8>> {
+pub struct ChannelWriter<T = Vec<u8>> {
     sender: chan::Sender<T>,
     timeout: time::Duration,
     data: Arc<Notify>,
 }
 
-/// Wraps a [`ChannelWriter`] alongside the associated [`Handle`] and [`NodeId`].
-///
-/// This allows the channel to [`Write::flush`] when calling
-/// [`Write::write`], which is necessary to signal to the
-/// controller to send the wire data.
-pub struct ChannelFlushWriter<T = Vec<u8>> {
-    writer: ChannelWriter<T>,
-}
-
-impl fetch::transport::SignalEof for ChannelFlushWriter<Vec<u8>> {
+impl fetch::transport::SignalEof for ChannelWriter<Vec<u8>> {
     fn eof(&mut self) -> io::Result<()> {
-        self.writer.send([])?;
-        self.flush()
+        self.send([])
     }
 }
 
-impl Write for ChannelFlushWriter<Vec<u8>> {
+impl Write for ChannelWriter<Vec<u8>> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = buf.len();
-        self.writer.send(buf.to_vec())?;
-        self.flush()?;
+        self.send(buf.to_vec())?;
         Ok(n)
     }
 
