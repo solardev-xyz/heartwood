@@ -26,10 +26,6 @@ impl ChannelsConfig {
         }
     }
 
-    pub fn with_timeout(self, timeout: time::Duration) -> Self {
-        Self { timeout, ..self }
-    }
-
     pub fn with_reader_limit(self, reader_limit: FetchPackSizeLimit) -> Self {
         Self {
             reader_limit,
@@ -156,18 +152,6 @@ impl<T: AsRef<[u8]>> Channels<T> {
         };
 
         Ok((network, worker))
-    }
-
-    pub fn try_iter(&self) -> impl Iterator<Item = ChannelEvent<T>> + '_ {
-        self.receiver.try_iter()
-    }
-
-    pub fn send(&self, event: ChannelEvent<T>) -> io::Result<()> {
-        self.sender.send(event)
-    }
-
-    pub fn close(self) -> Result<(), chan::SendError<ChannelEvent<T>>> {
-        self.sender.close()
     }
 }
 
@@ -361,10 +345,5 @@ impl<T: AsRef<[u8]>> ChannelWriter<T> {
                 "error writing to stream: channel is disconnected",
             )),
         }
-    }
-
-    /// Permanently close this stream.
-    pub fn close(self) -> Result<(), chan::SendError<ChannelEvent<T>>> {
-        self.sender.send(ChannelEvent::Close)
     }
 }
