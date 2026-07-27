@@ -926,7 +926,7 @@ async fn run_git_worker(
             read = recv.read(&mut buffer), if recv_open => match read {
                 Ok(None) => {
                     recv_open = false;
-                    let _ = network.send(ChannelEvent::Eof).await;
+                    let _ = network.send(ChannelEvent::Data(Vec::with_capacity(0))).await;
                 }
                 Ok(Some(n)) => {
                     if network.send(ChannelEvent::Data(buffer[..n].to_vec())).await.is_err() {
@@ -937,16 +937,15 @@ async fn run_git_worker(
             },
             event = network.recv() => match event {
                 Ok(ChannelEvent::Data(data)) if send_open => {
-                    if let Err(err) = send.write_all(&data).await {
+                    if data.is_empty() {
+                        send_open = false;
+                        let _ = send.finish();
+                    }
+                    else if let Err(err) = send.write_all(&data).await {
                         break PumpResult::Failed(err.to_string());
                     }
                 }
                 Ok(ChannelEvent::Data(_)) => break PumpResult::Failed("worker wrote after closing Git stream".to_owned()),
-                Ok(ChannelEvent::Eof) if send_open => {
-                    send_open = false;
-                    let _ = send.finish();
-                }
-                Ok(ChannelEvent::Eof) => {}
                 Err(_) => break PumpResult::WorkerDisconnected("worker disconnected".to_owned()),
             }
         }
