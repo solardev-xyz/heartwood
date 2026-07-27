@@ -17,7 +17,7 @@ use uds_windows::UnixListener;
 use crate::control;
 use crate::wire::{self, GIT_ALPN, GOSSIP_ALPN};
 use crate::worker;
-use crate::worker::{ChannelEvent, ChannelsConfig, Task, TaskResult};
+use crate::worker::{ChannelsConfig, Task, TaskResult};
 use crossbeam_channel as chan;
 use handle::Handle;
 use iroh::endpoint::{
@@ -926,17 +926,17 @@ async fn run_git_worker(
             read = recv.read(&mut buffer), if recv_open => match read {
                 Ok(None) => {
                     recv_open = false;
-                    let _ = network.send(ChannelEvent::Data(Vec::with_capacity(0))).await;
+                    let _ = network.send(Vec::with_capacity(0)).await;
                 }
                 Ok(Some(n)) => {
-                    if network.send(ChannelEvent::Data(buffer[..n].to_vec())).await.is_err() {
+                    if network.send(buffer[..n].to_vec()).await.is_err() {
                         break PumpResult::WorkerDisconnected("worker disconnected".to_owned());
                     }
                 }
                 Err(err) => break PumpResult::Failed(err.to_string()),
             },
             event = network.recv() => match event {
-                Ok(ChannelEvent::Data(data)) if send_open => {
+                Ok(data) if send_open => {
                     if data.is_empty() {
                         send_open = false;
                         let _ = send.finish();
@@ -945,7 +945,7 @@ async fn run_git_worker(
                         break PumpResult::Failed(err.to_string());
                     }
                 }
-                Ok(ChannelEvent::Data(_)) => break PumpResult::Failed("worker wrote after closing Git stream".to_owned()),
+                Ok(_) => break PumpResult::Failed("worker wrote after closing Git stream".to_owned()),
                 Err(_) => break PumpResult::WorkerDisconnected("worker disconnected".to_owned()),
             }
         }

@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::ops::Deref;
-use std::{fmt, io, time};
+use std::{io, time};
 
 use crossbeam_channel as chan;
 use radicle::node::config::FetchPackSizeLimit;
@@ -75,26 +75,6 @@ impl fetch::transport::ConnectionStream for ChannelsFlush {
     }
 }
 
-/// Data that can be sent and received on worker channels.
-pub enum ChannelEvent<T = Vec<u8>> {
-    /// Git protocol data.
-    Data(T),
-}
-
-impl<T> From<T> for ChannelEvent<T> {
-    fn from(value: T) -> Self {
-        Self::Data(value)
-    }
-}
-
-impl<T> fmt::Debug for ChannelEvent<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Data(_) => write!(f, "ChannelEvent::Data(..)"),
-        }
-    }
-}
-
 /// Worker channels for communicating through the git stream with the remote.
 pub struct Channels<T = Vec<u8>> {
     sender: ChannelWriter<T>,
@@ -103,8 +83,8 @@ pub struct Channels<T = Vec<u8>> {
 
 impl<T: AsRef<[u8]>> Channels<T> {
     pub fn new(
-        sender: chan::Sender<ChannelEvent<T>>,
-        receiver: chan::Receiver<ChannelEvent<T>>,
+        sender: chan::Sender<T>,
+        receiver: chan::Receiver<T>,
         sender_data: Arc<Notify>,
         receiver_space: Arc<Notify>,
         config: ChannelsConfig,
@@ -125,8 +105,8 @@ impl<T: AsRef<[u8]>> Channels<T> {
     }
 
     pub fn pair(config: ChannelsConfig) -> io::Result<(NetworkChannels<T>, Channels<T>)> {
-        let (worker_send, network_recv) = chan::bounded::<ChannelEvent<T>>(MAX_WORKER_CHANNEL_SIZE);
-        let (network_send, worker_recv) = chan::bounded::<ChannelEvent<T>>(MAX_WORKER_CHANNEL_SIZE);
+        let (worker_send, network_recv) = chan::bounded::<T>(MAX_WORKER_CHANNEL_SIZE);
+        let (network_send, worker_recv) = chan::bounded::<T>(MAX_WORKER_CHANNEL_SIZE);
         let worker_data = Arc::new(Notify::new());
         let worker_space = Arc::new(Notify::new());
 
@@ -150,15 +130,15 @@ impl<T: AsRef<[u8]>> Channels<T> {
 
 /// Async side of a worker byte-stream bridge.
 pub struct NetworkChannels<T = Vec<u8>> {
-    sender: chan::Sender<ChannelEvent<T>>,
-    receiver: chan::Receiver<ChannelEvent<T>>,
+    sender: chan::Sender<T>,
+    receiver: chan::Receiver<T>,
     worker_data: Arc<Notify>,
     worker_space: Arc<Notify>,
 }
 
 impl<T: Send + 'static> NetworkChannels<T> {
     /// Receive an event written by a blocking worker without blocking Tokio.
-    pub async fn recv(&self) -> Result<ChannelEvent<T>, chan::RecvError> {
+    pub async fn recv(&self) -> Result<T, chan::RecvError> {
         loop {
             let notified = self.worker_data.notified();
             match self.receiver.try_recv() {
@@ -170,10 +150,7 @@ impl<T: Send + 'static> NetworkChannels<T> {
     }
 
     /// Send an event to a blocking worker while applying bounded backpressure.
-    pub async fn send(
-        &self,
-        mut event: ChannelEvent<T>,
-    ) -> Result<(), chan::SendError<ChannelEvent<T>>> {
+    pub async fn send(&self, mut event: T) -> Result<(), chan::SendError<T>> {
         loop {
             let notified = self.worker_space.notified();
             match self.sender.try_send(event) {
@@ -219,14 +196,14 @@ impl ReadLimiter {
 #[derive(Clone)]
 pub struct ChannelReader<T = Vec<u8>> {
     buffer: io::Cursor<Vec<u8>>,
-    receiver: chan::Receiver<ChannelEvent<T>>,
+    receiver: chan::Receiver<T>,
     space: Arc<Notify>,
     timeout: time::Duration,
     limiter: ReadLimiter,
 }
 
 impl<T> Deref for ChannelReader<T> {
-    type Target = chan::Receiver<ChannelEvent<T>>;
+    type Target = chan::Receiver<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.receiver
@@ -235,7 +212,7 @@ impl<T> Deref for ChannelReader<T> {
 
 impl<T: AsRef<[u8]>> ChannelReader<T> {
     pub fn new(
-        receiver: chan::Receiver<ChannelEvent<T>>,
+        receiver: chan::Receiver<T>,
         space: Arc<Notify>,
         timeout: time::Duration,
         limit: FetchPackSizeLimit,
@@ -259,7 +236,7 @@ impl Read for ChannelReader<Vec<u8>> {
         }
 
         match self.receiver.recv_timeout(self.timeout) {
-            Ok(ChannelEvent::Data(data)) => {
+            Ok(data) => {
                 self.space.notify_one();
                 self.buffer = io::Cursor::new(data);
                 self.buffer.read(buf)
@@ -279,7 +256,7 @@ impl Read for ChannelReader<Vec<u8>> {
 /// Wraps a [`chan::Sender`] and provides it with [`io::Write`].
 #[derive(Clone)]
 struct ChannelWriter<T = Vec<u8>> {
-    sender: chan::Sender<ChannelEvent<T>>,
+    sender: chan::Sender<T>,
     timeout: time::Duration,
     data: Arc<Notify>,
 }
@@ -295,8 +272,7 @@ pub struct ChannelFlushWriter<T = Vec<u8>> {
 
 impl fetch::transport::SignalEof for ChannelFlushWriter<Vec<u8>> {
     fn eof(&mut self) -> io::Result<()> {
-        self.writer
-            .send(ChannelEvent::Data(Vec::with_capacity(0)))?;
+        self.writer.send([])?;
         self.flush()
     }
 }
@@ -315,7 +291,7 @@ impl Write for ChannelFlushWriter<Vec<u8>> {
 }
 
 impl<T: AsRef<[u8]>> ChannelWriter<T> {
-    pub fn send(&self, event: impl Into<ChannelEvent<T>>) -> io::Result<()> {
+    pub fn send(&self, event: impl Into<T>) -> io::Result<()> {
         match self.sender.send_timeout(event.into(), self.timeout) {
             Ok(()) => {
                 self.data.notify_one();

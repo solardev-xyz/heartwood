@@ -18,7 +18,7 @@ use radicle::storage::refs::RefsAt;
 use radicle::storage::{ReadRepository, ReadStorage};
 use radicle::{Storage, cob, crypto};
 
-pub use channels::{ChannelEvent, ChannelsConfig};
+pub use channels::ChannelsConfig;
 
 /// Runtime-local identifier for one independent Git connection.
 pub type JobId = u64;
