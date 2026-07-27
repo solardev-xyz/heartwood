@@ -79,8 +79,6 @@ impl fetch::transport::ConnectionStream for ChannelsFlush {
 pub enum ChannelEvent<T = Vec<u8>> {
     /// Git protocol data.
     Data(T),
-    /// A request to close the channel.
-    Close,
     /// A signal that the git protocol has ended, eg. when the remote fetch closes the
     /// connection.
     Eof,
@@ -96,7 +94,6 @@ impl<T> fmt::Debug for ChannelEvent<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Data(_) => write!(f, "ChannelEvent::Data(..)"),
-            Self::Close => write!(f, "ChannelEvent::Close"),
             Self::Eof => write!(f, "ChannelEvent::Eof"),
         }
     }
@@ -274,10 +271,6 @@ impl Read for ChannelReader<Vec<u8>> {
             Ok(ChannelEvent::Eof) => {
                 self.space.notify_one();
                 Ok(0)
-            }
-            Ok(ChannelEvent::Close) => {
-                self.space.notify_one();
-                Err(io::ErrorKind::ConnectionReset.into())
             }
             Err(chan::RecvTimeoutError::Timeout) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,

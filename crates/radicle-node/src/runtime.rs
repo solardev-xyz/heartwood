@@ -947,7 +947,6 @@ async fn run_git_worker(
                     let _ = send.finish();
                 }
                 Ok(ChannelEvent::Eof) => {}
-                Ok(ChannelEvent::Close) => break PumpResult::WorkerDisconnected("worker closed Git stream".to_owned()),
                 Err(_) => break PumpResult::WorkerDisconnected("worker disconnected".to_owned()),
             }
         }
