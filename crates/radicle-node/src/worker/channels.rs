@@ -208,7 +208,7 @@ impl<T> Deref for ChannelReader<T> {
     }
 }
 
-impl<T: AsRef<[u8]>> ChannelReader<T> {
+impl<T> ChannelReader<T> {
     pub fn new(
         receiver: chan::Receiver<T>,
         space: Arc<Notify>,
@@ -277,7 +277,7 @@ impl Write for ChannelWriter<Vec<u8>> {
     }
 }
 
-impl<T: AsRef<[u8]>> ChannelWriter<T> {
+impl<T> ChannelWriter<T> {
     pub fn send(&self, event: impl Into<T>) -> io::Result<()> {
         match self.sender.send_timeout(event.into(), self.timeout) {
             Ok(()) => {
