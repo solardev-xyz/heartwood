@@ -1,4 +1,3 @@
-#![allow(clippy::too_many_arguments)]
 pub(crate) mod channels;
 mod upload_pack;
 

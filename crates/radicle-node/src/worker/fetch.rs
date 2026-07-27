@@ -56,6 +56,7 @@ impl Handle {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn fetch<D: node::refs::Store>(
         self,
         rid: RepoId,
