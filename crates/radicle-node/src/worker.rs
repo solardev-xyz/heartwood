@@ -19,8 +19,6 @@ use radicle::storage::refs::RefsAt;
 use radicle::storage::{ReadRepository, ReadStorage};
 use radicle::{Storage, cob, crypto};
 
-use crate::runtime::thread;
-
 pub use channels::{ChannelEvent, ChannelsConfig};
 
 /// Runtime-local identifier for one independent Git connection.
@@ -102,7 +100,6 @@ pub struct FetchConfig {
 
 /// A worker that replicates Git objects.
 struct Worker {
-    nid: NodeId,
     storage: Storage,
     fetch_config: FetchConfig,
     tasks: chan::Receiver<Task>,
@@ -249,7 +246,6 @@ impl Worker {
                 log::debug!(target: "worker", "Spawning upload-pack process for {} in job {job}..", header.repo);
 
                 let result = upload_pack::upload_pack(
-                    &self.nid,
                     &header.repo,
                     remote,
                     &self.storage,
@@ -344,7 +340,6 @@ impl Pool {
     /// Create a new worker pool with the given parameters.
     pub fn with(
         tasks: chan::Receiver<Task>,
-        nid: NodeId,
         notifications: notifications::StoreWriter,
         cache: cob::cache::StoreWriter,
         db: radicle::node::Database,
@@ -355,7 +350,6 @@ impl Pool {
             let policies =
                 policy::Config::new(config.policy, policy::Store::reader(&config.policies_db)?);
             let worker = Worker {
-                nid,
                 tasks: tasks.clone(),
                 storage: config.storage.clone(),
                 fetch_config: config.fetch.clone(),
@@ -364,7 +358,9 @@ impl Pool {
                 cache: cache.clone(),
                 db: db.clone(),
             };
-            let thread = thread::spawn(&nid, format!("worker#{i}"), || worker.run());
+            let thread = std::thread::Builder::new()
+                .name(format!("worker#{i}"))
+                .spawn(|| worker.run())?;
 
             pool.push(thread);
         }
