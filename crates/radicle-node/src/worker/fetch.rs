@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io;
 use std::str::FromStr;
 
 use fetch::git::refs::Applied;
@@ -19,19 +20,17 @@ use radicle::storage::{
 };
 use radicle::{Storage, cob, git, node};
 
-use crate::worker::channels::{ChannelReader, ChannelWriter};
-
-pub enum Handle {
+pub enum Handle<Read: io::Read, Write: io::Write> {
     Clone {
-        handle: fetch::Handle<TempRepository, ChannelReader, ChannelWriter>,
+        handle: fetch::Handle<TempRepository, Read, Write>,
     },
     Pull {
-        handle: fetch::Handle<Repository, ChannelReader, ChannelWriter>,
+        handle: fetch::Handle<Repository, Read, Write>,
         notifications: node::notifications::StoreWriter,
     },
 }
 
-impl Handle {
+impl<Read: io::Read, Write: io::Write> Handle<Read, Write> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         rid: RepoId,
@@ -39,8 +38,8 @@ impl Handle {
         storage: &Storage,
         follow: Allowed,
         blocked: BlockList,
-        read: ChannelReader,
-        write: ChannelWriter,
+        read: Read,
+        write: Write,
         notifications: node::notifications::StoreWriter,
     ) -> Result<Self, error::Handle> {
         let exists = storage.contains(&rid)?;

@@ -246,6 +246,11 @@ impl FetchPackSizeLimit {
     pub fn exceeded_by(&self, bytes: usize) -> bool {
         bytes >= self.limit.as_u64() as usize
     }
+
+    /// Byte count.
+    pub fn as_u64(&self) -> u64 {
+        self.limit.as_u64()
+    }
 }
 
 impl Default for FetchPackSizeLimit {

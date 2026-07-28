@@ -1,12 +1,12 @@
-pub(crate) mod channels;
 mod upload_pack;
 
 pub mod fetch;
 pub mod garbage;
 
+use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use crossbeam_channel as chan;
 use protocol::worker::{AuthorizationError, FetchError, FetchRequest, FetchResult, UploadError};
 use radicle::identity::RepoId;
 use radicle::node::notifications;
@@ -17,25 +17,22 @@ use radicle::storage::refs::RefsAt;
 use radicle::storage::{ReadRepository, ReadStorage};
 use radicle::{Storage, cob, crypto};
 
-pub use channels::ChannelsConfig;
-
-use crate::worker::channels::{ChannelReader, ChannelWriter};
-
 /// Runtime-local identifier for one independent Git connection.
 pub type JobId = u64;
 
 /// Worker pool configuration.
 pub struct Config {
     /// Number of worker threads.
-    capacity: usize,
+    #[allow(unused)]
+    pub(super) capacity: usize,
     /// Git storage.
-    storage: Storage,
+    pub(super) storage: Storage,
     /// Configuration for performing fetched.
-    fetch: FetchConfig,
+    pub(super) fetch: FetchConfig,
     /// Default policy, if a policy for a specific node or repository was not found.
-    policy: SeedingPolicy,
+    pub(super) policy: SeedingPolicy,
     /// Path to the policies database.
-    policies_db: PathBuf,
+    pub(super) policies_db: PathBuf,
 }
 
 impl Config {
@@ -52,34 +49,6 @@ impl Config {
             fetch,
             policy,
             policies_db,
-        }
-    }
-}
-
-/// Task to be accomplished on a worker thread.
-/// This is either going to be an outgoing or incoming fetch.
-pub struct Task {
-    fetch: FetchRequest,
-    job: JobId,
-    read: ChannelReader,
-    write: ChannelWriter,
-    result: tokio::sync::oneshot::Sender<TaskResult>,
-}
-
-impl Task {
-    pub(crate) fn new(
-        fetch: FetchRequest,
-        job: JobId,
-        read: ChannelReader,
-        write: ChannelWriter,
-        result: tokio::sync::oneshot::Sender<TaskResult>,
-    ) -> Self {
-        Self {
-            fetch,
-            job,
-            read,
-            write,
-            result,
         }
     }
 }
@@ -101,65 +70,52 @@ pub struct FetchConfig {
     pub expiry: garbage::Expiry,
 }
 
+type Policies = policy::Config<policy::store::Read>;
+
 /// A worker that replicates Git objects.
-struct Worker {
+pub(crate) struct Worker {
     storage: Storage,
     fetch_config: FetchConfig,
-    tasks: chan::Receiver<Task>,
-    policies: policy::Config<policy::store::Read>,
     notifications: notifications::StoreWriter,
     cache: cob::cache::StoreWriter,
     db: radicle::node::Database,
+
+    policy: SeedingPolicy,
+    policies_db: PathBuf,
+
+    timeout: Duration,
 }
 
 impl Worker {
-    /// Waits for tasks and runs them. Blocks indefinitely unless there is an error receiving
-    /// the next task.
-    fn run(mut self) -> Result<(), chan::RecvError> {
-        loop {
-            let task = self.tasks.recv()?;
-            self.process(task);
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        storage: Storage,
+        fetch_config: FetchConfig,
+        notifications: notifications::StoreWriter,
+        cache: cob::cache::StoreWriter,
+        db: radicle::node::Database,
+        policy: SeedingPolicy,
+        policies_db: PathBuf,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            storage,
+            fetch_config,
+            notifications,
+            cache,
+            db,
+            policy,
+            policies_db,
+            timeout,
         }
     }
 
-    fn process(
-        &mut self,
-        Task {
-            fetch,
-            read,
-            write,
-            job,
-            result: result_tx,
-        }: Task,
-    ) {
-        let remote = fetch.remote();
-        let result = self._process(fetch, job, read, write, self.notifications.clone());
-
-        log::trace!(target: "worker", "Sending response back to service..");
-
-        if result_tx
-            .send(TaskResult {
-                remote,
-                job,
-                result,
-            })
-            .is_err()
-        {
-            // The async Git supervisor may have been forcefully cancelled
-            // after its bounded shutdown grace period. The blocking operation
-            // still has to finish, so a missing task-local receiver is expected
-            // in that case.
-            log::debug!(target: "worker", "Git job {job} completed after its result receiver was dropped");
-        }
-    }
-
-    fn _process(
+    pub fn process(
         &mut self,
         fetch: FetchRequest,
         job: JobId,
-        mut read: channels::ChannelReader,
-        write: channels::ChannelWriter,
-        notifs: notifications::StoreWriter,
+        mut read: impl io::Read + Send,
+        write: impl io::Write + Send,
     ) -> FetchResult {
         match fetch {
             FetchRequest::Initiator {
@@ -169,11 +125,38 @@ impl Worker {
                 config,
             } => {
                 log::debug!(target: "worker", "Worker processing outgoing fetch for {rid}");
-                let result = self.fetch(rid, remote, refs_at, config, read, write, notifs);
+
+                let store = match policy::Store::reader(&self.policies_db) {
+                    Ok(store) => store,
+                    Err(err) => {
+                        return FetchResult::Initiator {
+                            rid,
+                            result: Err(FetchError::PolicyStore(err)),
+                        };
+                    }
+                };
+
+                let policies = policy::Config::new(self.policy, store);
+
+                let result = self.fetch(rid, remote, refs_at, config, policies, read, write);
                 FetchResult::Initiator { rid, result }
             }
             FetchRequest::Responder { remote, emitter } => {
                 log::debug!(target: "worker", "Worker processing incoming fetch for {remote} in job {job}..");
+
+                let store = match policy::Store::reader(&self.policies_db) {
+                    Ok(store) => store,
+                    Err(err) => {
+                        return FetchResult::Responder {
+                            rid: None,
+                            result: Err(UploadError::Authorization(
+                                AuthorizationError::PolicyStore(err),
+                            )),
+                        };
+                    }
+                };
+
+                let policies = policy::Config::new(self.policy, store);
 
                 let mut iter = gix_packetline::blocking_io::StreamingPeekableIter::new(
                     &mut read,
@@ -219,7 +202,7 @@ impl Worker {
                     };
                 };
 
-                if let Err(e) = self.is_authorized(remote, header.repo) {
+                if let Err(e) = self.is_authorized(&policies, remote, header.repo) {
                     return FetchResult::Responder {
                         rid: Some(header.repo),
                         result: Err(e.into()),
@@ -246,8 +229,6 @@ impl Worker {
 
                 log::debug!(target: "worker", "Spawning upload-pack process for {} in job {job}..", header.repo);
 
-                let timeout = read.timeout();
-
                 let result = upload_pack::upload_pack(
                     &header.repo,
                     remote,
@@ -255,7 +236,7 @@ impl Worker {
                     &emitter,
                     read,
                     write,
-                    timeout,
+                    self.timeout,
                 )
                 .map(drop)
                 .map_err(UploadError::UploadPack);
@@ -269,11 +250,16 @@ impl Worker {
         }
     }
 
-    fn is_authorized(&self, remote: NodeId, rid: RepoId) -> Result<(), AuthorizationError> {
-        if self.policies.is_blocked(&remote)? {
+    fn is_authorized(
+        &self,
+        policies: &Policies,
+        remote: NodeId,
+        rid: RepoId,
+    ) -> Result<(), AuthorizationError> {
+        if policies.is_blocked(&remote)? {
             return Err(AuthorizationError::Unauthorized(remote, rid));
         }
-        let policy = self.policies.seed_policy(&rid)?.policy;
+        let policy = policies.seed_policy(&rid)?.policy;
         // Check policy first, since if we're blocking then we likely don't have
         // the repository.
         if policy.is_block() {
@@ -296,15 +282,15 @@ impl Worker {
         remote: NodeId,
         refs_at: Option<Vec<RefsAt>>,
         fetch_config: ::fetch::Config,
-        read: channels::ChannelReader,
-        write: channels::ChannelWriter,
-        notifs: notifications::StoreWriter,
+        policies: Policies,
+        read: impl io::Read,
+        write: impl io::Write,
     ) -> Result<protocol::worker::fetch::FetchResult, FetchError> {
         let FetchConfig { local, expiry } = &self.fetch_config;
         // N.b. if the `rid` is blocked this will return an error, so
         // we won't continue with any further set up of the fetch.
-        let allowed = ::fetch::Allowed::from_config(rid, &self.policies)?;
-        let blocked = ::fetch::BlockList::from_config(&self.policies)?;
+        let allowed = ::fetch::Allowed::from_config(rid, &policies)?;
+        let blocked = ::fetch::BlockList::from_config(&policies)?;
 
         let mut cache = self.cache.clone();
         let handle = fetch::Handle::new(
@@ -315,7 +301,7 @@ impl Worker {
             blocked,
             read,
             write,
-            notifs,
+            self.notifications.clone(),
         )?;
         let result = handle.fetch(
             rid,
@@ -334,56 +320,5 @@ impl Worker {
             log::debug!(target: "worker", "Failed to run `git gc`: {e}");
         }
         Ok(result)
-    }
-}
-
-/// A pool of workers. One thread is allocated for each worker.
-pub struct Pool {
-    pool: Vec<std::thread::JoinHandle<Result<(), chan::RecvError>>>,
-}
-
-impl Pool {
-    /// Create a new worker pool with the given parameters.
-    pub fn with(
-        tasks: chan::Receiver<Task>,
-        notifications: notifications::StoreWriter,
-        cache: cob::cache::StoreWriter,
-        db: radicle::node::Database,
-        config: Config,
-    ) -> Result<Self, policy::Error> {
-        let mut pool = Vec::with_capacity(config.capacity);
-        for i in 0..config.capacity {
-            let policies =
-                policy::Config::new(config.policy, policy::Store::reader(&config.policies_db)?);
-            let worker = Worker {
-                tasks: tasks.clone(),
-                storage: config.storage.clone(),
-                fetch_config: config.fetch.clone(),
-                policies,
-                notifications: notifications.clone(),
-                cache: cache.clone(),
-                db: db.clone(),
-            };
-            let thread = std::thread::Builder::new()
-                .name(format!("worker#{i}"))
-                .spawn(|| worker.run())?;
-
-            pool.push(thread);
-        }
-        Ok(Self { pool })
-    }
-
-    /// Run the worker pool.
-    ///
-    /// Blocks until all worker threads have exited.
-    pub fn run(self) -> std::thread::Result<()> {
-        for (i, worker) in self.pool.into_iter().enumerate() {
-            if let Err(err) = worker.join()? {
-                log::trace!(target: "pool", "Worker {i} exited: {err}");
-            }
-        }
-        log::debug!(target: "pool", "Worker pool shutting down..");
-
-        Ok(())
     }
 }

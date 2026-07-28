@@ -5,8 +5,8 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::str::FromStr as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::{fs, io, net, time};
 
 #[cfg(unix)]
@@ -16,9 +16,8 @@ use uds_windows::UnixListener;
 
 use crate::control;
 use crate::wire::{self, GIT_ALPN, GOSSIP_ALPN};
-use crate::worker;
-use crate::worker::channels::{ChannelReader, ChannelWriter, NetworkChannels};
-use crate::worker::{ChannelsConfig, Task, TaskResult};
+use crate::worker::TaskResult;
+use crate::worker::{self, Worker};
 use crossbeam_channel as chan;
 use handle::Handle;
 use iroh::endpoint::{
@@ -34,6 +33,7 @@ use protocol::service::session;
 use radicle::cob::migrate;
 use radicle::crypto::{Signer as _, SigningKey};
 use radicle::node::address::Store as _;
+use radicle::node::config::FetchPackSizeLimit;
 use radicle::node::events::Emitter;
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
@@ -45,15 +45,13 @@ use radicle_protocol::service::io::Io;
 use radicle_protocol::worker::{FetchRequest, FetchResult};
 use radicle_signals::Signal;
 use thiserror::Error;
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
+use tokio_util::io::SyncIoBridge;
 
 /// Maximum pending worker tasks allowed.
 pub const MAX_PENDING_TASKS: usize = 1024;
-
-/// How long a Git supervisor waits for its blocking worker after closing the
-/// byte-stream bridge.
-const GIT_WORKER_DRAIN_TIMEOUT: time::Duration = time::Duration::from_secs(2);
 
 /// How long shutdown waits for network tasks to finish before aborting them.
 const NETWORK_TASK_SHUTDOWN_TIMEOUT: time::Duration = time::Duration::from_secs(3);
@@ -164,16 +162,15 @@ enum RuntimeOutput {
 pub struct Runtime {
     control: ControlSocket,
     pub(crate) handle: Handle,
-    pool: worker::Pool,
     signals: std::sync::mpsc::Receiver<Signal>,
     config: node::Config,
     listen: Vec<net::SocketAddr>,
     secret_key: SigningKey,
     controller: Controller,
-    worker: chan::Sender<Task>,
     output: mpsc::UnboundedReceiver<RuntimeOutput>,
     service_thread: std::thread::JoinHandle<()>,
     emitter: Emitter<Event>,
+    worker: SharedForWorker,
 }
 
 impl Runtime {
@@ -277,39 +274,37 @@ impl Runtime {
             .map_err(Error::Spawn)?;
 
         let handle = Handle::new(socket.clone(), controller.clone(), emitter.clone());
-        let (worker, worker_recv) = chan::bounded::<Task>(MAX_PENDING_TASKS);
         let fetch = worker::FetchConfig {
             local: id,
             expiry: worker::garbage::Expiry::default(),
         };
-        let pool = worker::Pool::with(
-            worker_recv,
-            notifications,
-            cobs_cache,
-            db,
-            worker::Config::new(
-                config.workers.into(),
-                storage.clone(),
-                fetch,
-                seeding_policy,
-                home.node().join(node::POLICIES_DB_FILE),
-            ),
-        )?;
         let control = Self::bind(socket)?;
+
+        let capacity = config.workers.into();
 
         Ok(Self {
             control,
             handle,
-            pool,
             signals,
             config,
             listen,
             secret_key,
             controller,
-            worker,
             output,
             service_thread,
             emitter,
+            worker: SharedForWorker {
+                notifications,
+                cache: cobs_cache,
+                db,
+                config: worker::Config::new(
+                    capacity,
+                    storage,
+                    fetch,
+                    seeding_policy,
+                    home.node().join(node::POLICIES_DB_FILE),
+                ),
+            },
         })
     }
 
@@ -348,14 +343,11 @@ impl Runtime {
             local: *self.secret_key.public_key(),
             endpoint: endpoint.clone(),
             controller: self.controller.clone(),
-            worker: self.worker,
             emitter: self.emitter.clone(),
             peers: tokio::sync::Mutex::new(HashMap::new()),
             jobs: AtomicU64::new(1),
-            incoming_git_limits: Mutex::new(HashMap::new()),
-            outgoing_git_limits: Mutex::new(HashMap::new()),
-            git_concurrency: self.config.limits.fetch_concurrency.into(),
             shutdown: shutdown_rx,
+            worker: self.worker,
         });
 
         let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
@@ -450,7 +442,6 @@ impl Runtime {
         };
         drop(shared);
         let _ = control_thread.join();
-        let _ = self.pool.run();
         let _ = self.service_thread.join();
         if let Some(path) = remove {
             let _ = fs::remove_file(path);
@@ -573,18 +564,22 @@ struct GossipPeer {
     sender: mpsc::Sender<Vec<service::Message>>,
 }
 
+struct SharedForWorker {
+    notifications: notifications::StoreWriter,
+    cache: cob::cache::StoreWriter,
+    db: radicle::node::Database,
+    config: crate::worker::Config,
+}
+
 struct Shared {
     local: NodeId,
     endpoint: Endpoint,
     controller: Controller,
-    worker: chan::Sender<Task>,
     emitter: Emitter<Event>,
     peers: tokio::sync::Mutex<HashMap<NodeId, GossipPeer>>,
     jobs: AtomicU64,
-    incoming_git_limits: Mutex<HashMap<NodeId, Arc<Semaphore>>>,
-    outgoing_git_limits: Mutex<HashMap<NodeId, Arc<Semaphore>>>,
-    git_concurrency: usize,
     shutdown: watch::Receiver<bool>,
+    worker: SharedForWorker,
 }
 
 async fn dispatch(io: Io, shared: Arc<Shared>, tasks: &mut JoinSet<()>) {
@@ -823,24 +818,26 @@ async fn run_gossip(shared: Arc<Shared>, connection: Connection, link: Link) {
 
 async fn run_incoming_git(shared: Arc<Shared>, connection: Connection) {
     let remote = NodeId::from_bytes(*connection.remote_id());
-    let Ok(permit) = git_limiter(&shared.incoming_git_limits, shared.git_concurrency, remote)
-        .try_acquire_owned()
-    else {
-        connection.close(0u32.into(), b"Git concurrency limit exceeded");
-        return;
-    };
     let Ok((send, recv)) = connection.accept_bi().await else {
         return;
     };
-    let config = ChannelsConfig::new(service::FETCH_TIMEOUT);
+
     let fetch = FetchRequest::Responder {
         remote,
         emitter: shared.emitter.clone(),
     };
-    if let Err(error) = run_git_worker(shared, connection, send, recv, fetch, config).await {
+    if let Err(error) = run_git_worker(
+        shared,
+        send,
+        recv,
+        fetch,
+        service::FETCH_TIMEOUT,
+        FetchPackSizeLimit::default(),
+    )
+    .await
+    {
         log::debug!(target: "worker", "Incoming Git connection from {remote} failed: {error}");
     }
-    drop(permit);
 }
 
 async fn run_outgoing_git(
@@ -852,10 +849,6 @@ async fn run_outgoing_git(
     reader_limit: node::config::FetchPackSizeLimit,
     config: radicle_protocol::fetcher::FetchConfig,
 ) -> Result<(), String> {
-    let _permit = tokio::time::timeout(config.timeout(), git_permit(&shared, remote))
-        .await
-        .map_err(|_| "Git concurrency wait timed out".to_owned())??;
-
     let id = match iroh::PublicKey::from_bytes(std::borrow::Borrow::borrow(&remote)) {
         Ok(id) => id,
         Err(err) => {
@@ -876,186 +869,59 @@ async fn run_outgoing_git(
             .map_err(|_| "Git dial timed out".to_owned())?
             .map_err(|e| e.to_string())?;
     let (send, recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
-    let channels = ChannelsConfig::new(config.timeout()).with_reader_limit(reader_limit);
     let fetch = FetchRequest::Initiator {
         rid,
         remote,
         refs_at,
         config: config.fetch_config(),
     };
-    run_git_worker(shared, connection, send, recv, fetch, channels).await
+    run_git_worker(shared, send, recv, fetch, config.timeout(), reader_limit).await
 }
 
 async fn run_git_worker(
     shared: Arc<Shared>,
-    connection: Connection,
-    mut send: SendStream,
-    mut recv: RecvStream,
+    send: SendStream,
+    recv: RecvStream,
     fetch: FetchRequest,
-    config: ChannelsConfig,
+    timeout: time::Duration,
+    reader_limit: FetchPackSizeLimit,
 ) -> Result<(), String> {
-    enum PumpResult {
-        Worker(Box<TaskResult>),
-        WorkerDisconnected(String),
-        Failed(String),
-    }
-
     let job = shared.jobs.fetch_add(1, Ordering::Relaxed);
-    let timeout = config.timeout();
 
-    let (worker_send, network_recv) = chan::bounded(MAX_WORKER_CHANNEL_SIZE);
-    let (network_send, worker_recv) = chan::bounded(MAX_WORKER_CHANNEL_SIZE);
-    let worker_data = Arc::new(Notify::new());
-    let worker_space = Arc::new(Notify::new());
+    let limit = reader_limit.as_u64();
 
-    let writer = ChannelWriter::new(worker_send, config.timeout(), worker_data.clone());
+    let writer = SyncIoBridge::new(send);
+    let reader = SyncIoBridge::new(recv.take(limit));
 
-    let reader = ChannelReader::new(
-        worker_recv,
-        worker_space.clone(),
-        config.timeout(),
-        config.reader_limit(),
+    let remote = fetch.remote();
+
+    let mut worker = Worker::new(
+        shared.worker.config.storage.clone(),
+        shared.worker.config.fetch.clone(),
+        shared.worker.notifications.clone(),
+        shared.worker.cache.clone(),
+        shared.worker.db.clone(),
+        shared.worker.config.policy,
+        shared.worker.config.policies_db.clone(),
+        timeout,
     );
 
-    let network = NetworkChannels::new(network_send, network_recv, worker_data, worker_space);
-
-    let (result_tx, mut result_rx) = oneshot::channel();
-    shared
-        .worker
-        .try_send(Task::new(fetch, job, reader, writer, result_tx))
-        .map_err(|_| "worker queue is full".to_owned())?;
-
-    let mut buffer = vec![0u8; 64 * 1024];
-    let mut recv_open = true;
-    let mut send_open = true;
-    let mut shutdown = shared.shutdown.clone();
-
-    let pump = loop {
-        tokio::select! {
-            biased;
-
-            _ = shutdown.changed() => {
-                break PumpResult::Failed("Git task cancelled".to_owned());
-            }
-            result = &mut result_rx => {
-                match result {
-                    Ok(result) => break PumpResult::Worker(Box::new(result)),
-                    Err(_) => break PumpResult::Failed("worker exited without a result".to_owned()),
-                }
-            }
-            read = recv.read(&mut buffer), if recv_open => match read {
-                Ok(None) => {
-                    recv_open = false;
-                    let _ = network.send(Vec::with_capacity(0)).await;
-                }
-                Ok(Some(n)) => {
-                    if network.send(buffer[..n].to_vec()).await.is_err() {
-                        break PumpResult::WorkerDisconnected("worker disconnected".to_owned());
-                    }
-                }
-                Err(err) => break PumpResult::Failed(err.to_string()),
-            },
-            event = network.recv() => match event {
-                Ok(data) if send_open => {
-                    if data.is_empty() {
-                        send_open = false;
-                        let _ = send.finish();
-                    }
-                    else if let Err(err) = send.write_all(&data).await {
-                        break PumpResult::Failed(err.to_string());
-                    }
-                }
-                Ok(_) => break PumpResult::Failed("worker wrote after closing Git stream".to_owned()),
-                Err(_) => break PumpResult::WorkerDisconnected("worker disconnected".to_owned()),
-            }
-        }
-    };
-
-    // The worker owns both halves of its byte-stream bridge. They are dropped
-    // as `_process` returns, immediately before the task result is sent. Thus a
-    // disconnected bridge usually means that the result is about to arrive,
-    // rather than that the worker failed to report it.
-    let pump = match pump {
-        PumpResult::WorkerDisconnected(error) => {
-            match tokio::time::timeout(GIT_WORKER_DRAIN_TIMEOUT, &mut result_rx).await {
-                Ok(Ok(result)) => PumpResult::Worker(Box::new(result)),
-                Ok(Err(_)) => PumpResult::Failed(error),
-                Err(_) => PumpResult::Failed(error),
-            }
-        }
-        pump => pump,
-    };
-
-    match pump {
-        PumpResult::Worker(result) => {
-            let _ = send.finish();
-            let deadline = tokio::time::Instant::now() + timeout;
-            while recv_open {
-                match tokio::time::timeout_at(deadline, recv.read(&mut buffer)).await {
-                    Ok(Ok(None)) => recv_open = false,
-                    Ok(Ok(Some(_))) => {}
-                    Ok(Err(err)) => return Err(err.to_string()),
-                    Err(_) => return Err("Git stream completion timed out".to_owned()),
-                }
-            }
-            match tokio::time::timeout_at(deadline, send.stopped()).await {
-                Ok(Ok(None)) => {}
-                Ok(Ok(Some(code))) => return Err(format!("remote stopped Git stream: {code}")),
-                Ok(Err(err)) => return Err(err.to_string()),
-                Err(_) => return Err("Git stream acknowledgement timed out".to_owned()),
-            }
-            shared
-                .controller
-                .send(ServiceInput::Worker(*result))
-                .map_err(|e| e.to_string())
-        }
-        PumpResult::Failed(error) => {
-            connection.close(0u32.into(), b"Git task stopped");
-            drop(send);
-            drop(recv);
-            drop(network);
-
-            // A blocking worker cannot be cancelled. Keep its result receiver
-            // alive while closing the bridge gives it a chance to unwind.
-            match tokio::time::timeout(GIT_WORKER_DRAIN_TIMEOUT, result_rx).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => {
-                    log::debug!(target: "worker", "Git worker for job {job} exited without a result");
-                }
-                Err(_) => {
-                    log::debug!(target: "worker", "Timed out waiting for Git worker job {job} to stop");
-                }
-            }
-            Err(error)
-        }
-        PumpResult::WorkerDisconnected(_) => unreachable!("handled above"),
-    }
-}
-
-async fn git_permit(
-    shared: &Arc<Shared>,
-    remote: NodeId,
-) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-    if shared.git_concurrency == 0 {
-        return Err("Git concurrency is disabled".to_owned());
-    }
-    git_limiter(&shared.outgoing_git_limits, shared.git_concurrency, remote)
-        .acquire_owned()
+    let result = tokio::task::spawn_blocking(move || worker.process(fetch, job, reader, writer))
         .await
-        .map_err(|_| "Git limiter closed".to_owned())
-}
+        .map_err(|e| e.to_string())?;
 
-fn git_limiter(
-    limits: &Mutex<HashMap<NodeId, Arc<Semaphore>>>,
-    concurrency: usize,
-    remote: NodeId,
-) -> Arc<Semaphore> {
-    limits
-        .lock()
-        .expect("Git limiter poisoned")
-        .entry(remote)
-        .or_insert_with(|| Arc::new(Semaphore::new(concurrency)))
-        .clone()
+    let result = TaskResult {
+        remote,
+        result,
+        job,
+    };
+
+    shared
+        .controller
+        .send(ServiceInput::Worker(result))
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 /// Translates an [`iroh::PublicKey`] and a slice of addresses into an [`EndpointAddr`]
