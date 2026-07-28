@@ -56,19 +56,11 @@ mod mpsc {
     pub(super) use tokio::sync::mpsc as tokio;
 }
 
-/// Maximum pending worker tasks allowed.
-pub const MAX_PENDING_TASKS: usize = 1024;
-
 /// How long shutdown waits for network tasks to finish before aborting them.
 const NETWORK_TASK_SHUTDOWN_TIMEOUT: time::Duration = time::Duration::from_secs(3);
 
 /// How long shutdown waits for iroh to drain and acknowledge connections.
 const IROH_SHUTDOWN_TIMEOUT: time::Duration = time::Duration::from_secs(3);
-
-/// Maximum size of channel used to communicate with a worker.
-/// Note that as long as we're using [`std::io::copy`] to copy data from the
-/// upload-pack's stdout, the data chunks are of a maximum size of 8192 bytes.
-pub const MAX_WORKER_CHANNEL_SIZE: usize = 64;
 
 /// A command delivered to the synchronous service actor.
 pub(crate) enum ServiceInput {
