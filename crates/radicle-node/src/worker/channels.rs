@@ -259,12 +259,6 @@ pub struct ChannelWriter<T = Vec<u8>> {
     data: Arc<Notify>,
 }
 
-impl fetch::transport::SignalEof for ChannelWriter<Vec<u8>> {
-    fn eof(&mut self) -> io::Result<()> {
-        self.send([])
-    }
-}
-
 impl Write for ChannelWriter<Vec<u8>> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = buf.len();

@@ -3,6 +3,7 @@ pub(crate) mod ls_refs;
 
 use std::collections::BTreeSet;
 use std::io;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -27,26 +28,9 @@ use crate::stage::RefPrefix;
 /// processes for communicating during their respective protocols.
 pub trait ConnectionStream {
     type Read: io::Read;
-    type Write: io::Write + SignalEof;
+    type Write: io::Write;
 
     fn open(&mut self) -> (&mut Self::Read, &mut Self::Write);
-}
-
-/// The ability to signal EOF to the server side so that it can stop
-/// serving for this fetch request.
-pub trait SignalEof {
-    /// Since the git protocol is tunneled over an existing
-    /// connection, we can't signal the end of the protocol via the
-    /// usual means, which is to close the connection. Git also
-    /// doesn't have any special message we can send to signal the end
-    /// of the protocol.
-    ///
-    /// Hence, there's no other way for the server to know that we're
-    /// done sending requests than to send a special message outside
-    /// the git protocol. This message can then be processed by the
-    /// remote worker to end the protocol. We use the special "eof"
-    /// control message for this.
-    fn eof(&mut self) -> io::Result<()>;
 }
 
 /// Configuration for running a Git `handshake`, `ls-refs`, or
@@ -176,7 +160,10 @@ where
     /// fetch commands.
     pub(crate) fn done(&mut self) -> io::Result<()> {
         let (_, w) = self.stream.open();
-        w.eof()
+        w.write(&[]).map(|n| {
+            debug_assert_eq!(n, 0);
+            ()
+        })
     }
 }
 
