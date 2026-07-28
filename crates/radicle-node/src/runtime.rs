@@ -17,6 +17,7 @@ use uds_windows::UnixListener;
 use crate::control;
 use crate::wire::{self, GIT_ALPN, GOSSIP_ALPN};
 use crate::worker;
+use crate::worker::channels::{ChannelReader, ChannelWriter, NetworkChannels};
 use crate::worker::{ChannelsConfig, Task, TaskResult};
 use crossbeam_channel as chan;
 use handle::Handle;
@@ -44,7 +45,7 @@ use radicle_protocol::service::io::Io;
 use radicle_protocol::worker::{FetchRequest, FetchResult};
 use radicle_signals::Signal;
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 /// Maximum pending worker tasks allowed.
@@ -59,6 +60,11 @@ const NETWORK_TASK_SHUTDOWN_TIMEOUT: time::Duration = time::Duration::from_secs(
 
 /// How long shutdown waits for iroh to drain and acknowledge connections.
 const IROH_SHUTDOWN_TIMEOUT: time::Duration = time::Duration::from_secs(3);
+
+/// Maximum size of channel used to communicate with a worker.
+/// Note that as long as we're using [`std::io::copy`] to copy data from the
+/// upload-pack's stdout, the data chunks are of a maximum size of 8192 bytes.
+pub const MAX_WORKER_CHANNEL_SIZE: usize = 64;
 
 /// A command delivered to the synchronous service actor.
 pub(crate) enum ServiceInput {
@@ -896,13 +902,27 @@ async fn run_git_worker(
 
     let job = shared.jobs.fetch_add(1, Ordering::Relaxed);
     let timeout = config.timeout();
-    let (network, worker_channels) =
-        worker::channels::Channels::pair(config).map_err(|e| e.to_string())?;
+
+    let (worker_send, network_recv) = chan::bounded(MAX_WORKER_CHANNEL_SIZE);
+    let (network_send, worker_recv) = chan::bounded(MAX_WORKER_CHANNEL_SIZE);
+    let worker_data = Arc::new(Notify::new());
+    let worker_space = Arc::new(Notify::new());
+
+    let writer = ChannelWriter::new(worker_send, config.timeout(), worker_data.clone());
+
+    let reader = ChannelReader::new(
+        worker_recv,
+        worker_space.clone(),
+        config.timeout(),
+        config.reader_limit(),
+    );
+
+    let network = NetworkChannels::new(network_send, network_recv, worker_data, worker_space);
 
     let (result_tx, mut result_rx) = oneshot::channel();
     shared
         .worker
-        .try_send(Task::new(fetch, job, worker_channels, result_tx))
+        .try_send(Task::new(fetch, job, reader, writer, result_tx))
         .map_err(|_| "worker queue is full".to_owned())?;
 
     let mut buffer = vec![0u8; 64 * 1024];

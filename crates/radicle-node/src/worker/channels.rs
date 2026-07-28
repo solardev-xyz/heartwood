@@ -7,11 +7,6 @@ use radicle::node::config::FetchPackSizeLimit;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-/// Maximum size of channel used to communicate with a worker.
-/// Note that as long as we're using [`std::io::copy`] to copy data from the
-/// upload-pack's stdout, the data chunks are of a maximum size of 8192 bytes.
-pub const MAX_WORKER_CHANNEL_SIZE: usize = 64;
-
 #[derive(Clone, Copy, Debug)]
 pub struct ChannelsConfig {
     timeout: time::Duration,
@@ -36,93 +31,9 @@ impl ChannelsConfig {
     pub fn timeout(self) -> time::Duration {
         self.timeout
     }
-}
 
-/// A reader and writer pair that can be used in the fetch protocol.
-///
-/// It implements [`radicle::fetch::transport::ConnectionStream`] to
-/// provide its underlying channels for reading and writing.
-pub struct ChannelsFlush {
-    receiver: ChannelReader,
-    sender: ChannelWriter,
-}
-
-impl ChannelsFlush {
-    pub fn new(channels: Channels) -> Self {
-        Self {
-            receiver: channels.receiver,
-            sender: channels.sender,
-        }
-    }
-
-    pub fn split(&mut self) -> (&mut ChannelReader, &mut ChannelWriter) {
-        (&mut self.receiver, &mut self.sender)
-    }
-
-    pub fn timeout(&self) -> time::Duration {
-        self.sender.timeout.max(self.receiver.timeout)
-    }
-}
-
-impl fetch::transport::ConnectionStream for ChannelsFlush {
-    type Read = ChannelReader;
-    type Write = ChannelWriter;
-
-    fn open(&mut self) -> (&mut Self::Read, &mut Self::Write) {
-        (&mut self.receiver, &mut self.sender)
-    }
-}
-
-/// Worker channels for communicating through the git stream with the remote.
-pub struct Channels<T = Vec<u8>> {
-    sender: ChannelWriter<T>,
-    receiver: ChannelReader<T>,
-}
-
-impl<T: AsRef<[u8]>> Channels<T> {
-    pub fn new(
-        sender: chan::Sender<T>,
-        receiver: chan::Receiver<T>,
-        sender_data: Arc<Notify>,
-        receiver_space: Arc<Notify>,
-        config: ChannelsConfig,
-    ) -> Self {
-        let sender = ChannelWriter {
-            sender,
-            timeout: config.timeout,
-            data: sender_data,
-        };
-        let receiver = ChannelReader::new(
-            receiver,
-            receiver_space,
-            config.timeout,
-            config.reader_limit,
-        );
-
-        Self { sender, receiver }
-    }
-
-    pub fn pair(config: ChannelsConfig) -> io::Result<(NetworkChannels<T>, Channels<T>)> {
-        let (worker_send, network_recv) = chan::bounded::<T>(MAX_WORKER_CHANNEL_SIZE);
-        let (network_send, worker_recv) = chan::bounded::<T>(MAX_WORKER_CHANNEL_SIZE);
-        let worker_data = Arc::new(Notify::new());
-        let worker_space = Arc::new(Notify::new());
-
-        let worker = Channels::new(
-            worker_send,
-            worker_recv,
-            worker_data.clone(),
-            worker_space.clone(),
-            config,
-        );
-        let network = NetworkChannels {
-            sender: network_send,
-            receiver: network_recv,
-            worker_data,
-            worker_space,
-        };
-
-        Ok((network, worker))
+    pub fn reader_limit(self) -> FetchPackSizeLimit {
+        self.reader_limit
     }
 }
 
@@ -135,6 +46,20 @@ pub struct NetworkChannels<T = Vec<u8>> {
 }
 
 impl<T: Send + 'static> NetworkChannels<T> {
+    pub fn new(
+        sender: chan::Sender<T>,
+        receiver: chan::Receiver<T>,
+        worker_data: Arc<Notify>,
+        worker_space: Arc<Notify>,
+    ) -> Self {
+        Self {
+            sender,
+            receiver,
+            worker_data,
+            worker_space,
+        }
+    }
+
     /// Receive an event written by a blocking worker without blocking Tokio.
     pub async fn recv(&self) -> Result<T, chan::RecvError> {
         loop {
@@ -223,6 +148,10 @@ impl<T> ChannelReader<T> {
             limiter: ReadLimiter::new(limit),
         }
     }
+
+    pub(crate) fn timeout(&self) -> time::Duration {
+        self.timeout
+    }
 }
 
 impl Read for ChannelReader<Vec<u8>> {
@@ -272,6 +201,14 @@ impl Write for ChannelWriter<Vec<u8>> {
 }
 
 impl<T> ChannelWriter<T> {
+    pub fn new(sender: chan::Sender<T>, timeout: time::Duration, data: Arc<Notify>) -> Self {
+        Self {
+            sender,
+            timeout,
+            data,
+        }
+    }
+
     pub fn send(&self, event: impl Into<T>) -> io::Result<()> {
         match self.sender.send_timeout(event.into(), self.timeout) {
             Ok(()) => {

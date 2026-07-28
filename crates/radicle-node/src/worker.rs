@@ -6,7 +6,6 @@ pub mod garbage;
 
 use std::path::PathBuf;
 
-use channels::Channels;
 use crossbeam_channel as chan;
 use protocol::worker::{AuthorizationError, FetchError, FetchRequest, FetchResult, UploadError};
 use radicle::identity::RepoId;
@@ -19,6 +18,8 @@ use radicle::storage::{ReadRepository, ReadStorage};
 use radicle::{Storage, cob, crypto};
 
 pub use channels::ChannelsConfig;
+
+use crate::worker::channels::{ChannelReader, ChannelWriter};
 
 /// Runtime-local identifier for one independent Git connection.
 pub type JobId = u64;
@@ -60,7 +61,8 @@ impl Config {
 pub struct Task {
     fetch: FetchRequest,
     job: JobId,
-    channels: Channels,
+    read: ChannelReader,
+    write: ChannelWriter,
     result: tokio::sync::oneshot::Sender<TaskResult>,
 }
 
@@ -68,13 +70,15 @@ impl Task {
     pub(crate) fn new(
         fetch: FetchRequest,
         job: JobId,
-        channels: Channels,
+        read: ChannelReader,
+        write: ChannelWriter,
         result: tokio::sync::oneshot::Sender<TaskResult>,
     ) -> Self {
         Self {
             fetch,
             job,
-            channels,
+            read,
+            write,
             result,
         }
     }
@@ -122,14 +126,14 @@ impl Worker {
         &mut self,
         Task {
             fetch,
-            channels,
+            read,
+            write,
             job,
             result: result_tx,
         }: Task,
     ) {
         let remote = fetch.remote();
-        let channels = channels::ChannelsFlush::new(channels);
-        let result = self._process(fetch, job, channels, self.notifications.clone());
+        let result = self._process(fetch, job, read, write, self.notifications.clone());
 
         log::trace!(target: "worker", "Sending response back to service..");
 
@@ -153,7 +157,8 @@ impl Worker {
         &mut self,
         fetch: FetchRequest,
         job: JobId,
-        mut channels: channels::ChannelsFlush,
+        mut read: channels::ChannelReader,
+        write: channels::ChannelWriter,
         notifs: notifications::StoreWriter,
     ) -> FetchResult {
         match fetch {
@@ -164,17 +169,14 @@ impl Worker {
                 config,
             } => {
                 log::debug!(target: "worker", "Worker processing outgoing fetch for {rid}");
-                let result = self.fetch(rid, remote, refs_at, config, channels, notifs);
+                let result = self.fetch(rid, remote, refs_at, config, read, write, notifs);
                 FetchResult::Initiator { rid, result }
             }
             FetchRequest::Responder { remote, emitter } => {
                 log::debug!(target: "worker", "Worker processing incoming fetch for {remote} in job {job}..");
 
-                let timeout = channels.timeout();
-                let (mut stream_r, stream_w) = channels.split();
-
                 let mut iter = gix_packetline::blocking_io::StreamingPeekableIter::new(
-                    &mut stream_r,
+                    &mut read,
                     &[gix_packetline::PacketLineRef::Flush],
                     false, /* packet tracing */
                 );
@@ -244,13 +246,15 @@ impl Worker {
 
                 log::debug!(target: "worker", "Spawning upload-pack process for {} in job {job}..", header.repo);
 
+                let timeout = read.timeout();
+
                 let result = upload_pack::upload_pack(
                     &header.repo,
                     remote,
                     &self.storage,
                     &emitter,
-                    stream_r,
-                    stream_w,
+                    read,
+                    write,
                     timeout,
                 )
                 .map(drop)
@@ -285,13 +289,15 @@ impl Worker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fetch(
         &mut self,
         rid: RepoId,
         remote: NodeId,
         refs_at: Option<Vec<RefsAt>>,
         fetch_config: ::fetch::Config,
-        channels: channels::ChannelsFlush,
+        read: channels::ChannelReader,
+        write: channels::ChannelWriter,
         notifs: notifications::StoreWriter,
     ) -> Result<protocol::worker::fetch::FetchResult, FetchError> {
         let FetchConfig { local, expiry } = &self.fetch_config;
@@ -307,7 +313,8 @@ impl Worker {
             &self.storage,
             allowed,
             blocked,
-            channels,
+            read,
+            write,
             notifs,
         )?;
         let result = handle.fetch(
