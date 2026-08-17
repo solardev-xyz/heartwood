@@ -1174,13 +1174,35 @@ impl Patch {
                 }
             }
             Action::ReviewCommentResolve { review, comment } => {
+                let title = self.title().to_string();
                 if let Some(review) = lookup::review_mut(self, &review)? {
+                    log::warn!(
+                        "Resolving review comment {comment} in patch with title '{}' of repo {}. This might crash.",
+                        title,
+                        repo.rid()
+                    );
                     thread::resolve(&mut review.comments, entry, comment)?;
+                    log::info!(
+                        "Resolved review comment {comment} in patch with title '{}' of repo {}. This did not crash.",
+                        title,
+                        repo.rid()
+                    );
                 }
             }
             Action::ReviewCommentUnresolve { review, comment } => {
+                let title = self.title().to_string();
                 if let Some(review) = lookup::review_mut(self, &review)? {
+                    log::warn!(
+                        "Unresolving review comment {comment} in patch with title '{}' of repo {}. This might crash.",
+                        title,
+                        repo.rid()
+                    );
                     thread::unresolve(&mut review.comments, entry, comment)?;
+                    log::info!(
+                        "Unresolved review comment {comment} in patch with title '{}' of repo {}. This did not crash.",
+                        title,
+                        repo.rid()
+                    );
                 }
             }
             Action::ReviewComment {
