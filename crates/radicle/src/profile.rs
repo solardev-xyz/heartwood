@@ -275,7 +275,13 @@ impl Profile {
     }
 
     pub fn load() -> Result<Self, Error> {
-        let home = self::home()?;
+        Self::load_from(self::home()?)
+    }
+
+    /// Load the profile at the given home, without consulting `$RAD_HOME`.
+    /// This is the entry point for hosts that embed Radicle as a library
+    /// and manage the home location themselves.
+    pub fn load_from(home: Home) -> Result<Self, Error> {
         let keystore = Keystore::new(&home.keys());
         let public_key = keystore
             .public_key()?
