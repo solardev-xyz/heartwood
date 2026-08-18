@@ -129,6 +129,19 @@ impl Worker {
                 FetchResult::Initiator { rid, result }
             }
             FetchRequest::Responder { remote, emitter } => {
+                // Embedded hosts that cannot spawn child processes (e.g. iOS)
+                // decline to serve instead of spawning `git upload-pack`.
+                if cfg!(feature = "no-serve") {
+                    log::debug!(target: "worker", "Declining incoming fetch for {remote} on stream {stream} (no-serve build)");
+                    drop(emitter);
+                    return FetchResult::Responder {
+                        rid: None,
+                        result: Err(UploadError::PacketLine(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "this node does not serve fetches (no-serve build)",
+                        ))),
+                    };
+                }
                 log::debug!(target: "worker", "Worker processing incoming fetch for {remote} on stream {stream}..");
 
                 let timeout = channels.timeout();

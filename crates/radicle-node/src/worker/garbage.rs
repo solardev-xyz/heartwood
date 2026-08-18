@@ -50,6 +50,12 @@ pub fn collect(
     rid: &RepoId,
     expiry: &Expiry,
 ) -> io::Result<ExitStatus> {
+    // Embedded hosts that cannot spawn child processes (e.g. iOS) skip
+    // collection; storage grows unpruned until a host-driven maintenance
+    // strategy replaces `git gc` in-process.
+    if cfg!(feature = "no-gc") {
+        return Ok(ExitStatus::default());
+    }
     let git_dir = storage.path_of(rid);
     let mut gc = Command::new("git");
     gc.current_dir(git_dir)

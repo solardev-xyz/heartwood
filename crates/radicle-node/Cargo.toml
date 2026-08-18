@@ -12,6 +12,11 @@ rust-version.workspace = true
 
 [features]
 default = ["backtrace", "i2p", "systemd", "structured-logger", "socket2", "tor"]
+## Decline to serve inbound fetches instead of spawning `git upload-pack`.
+## For embedded hosts that cannot spawn child processes (e.g. iOS).
+no-serve = []
+## Skip `git gc` storage maintenance (no child processes).
+no-gc = []
 dhat-heap = ["dep:dhat"]
 i2p = ["cyphernet/i2p", "radicle/i2p", "radicle-protocol/i2p"]
 systemd = ["dep:radicle-systemd"]
