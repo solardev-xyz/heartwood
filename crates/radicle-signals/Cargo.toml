@@ -8,7 +8,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[target.'cfg(unix)'.dependencies]
+# iOS is excluded: an embedded (in-app) node never installs process
+# signal handlers there, and signals_receipts' sem_safe dependency uses
+# `sem_getvalue`, which the libc crate does not provide for iOS targets.
+# On iOS only the `Signal` type compiles — all the embedded runtime needs.
+[target.'cfg(all(unix, not(target_os = "ios")))'.dependencies]
 libc = { workspace = true }
 signals_receipts = { version = "0.2.0", features = ["channel_notify_facility"] }
 
