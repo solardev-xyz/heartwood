@@ -244,6 +244,46 @@ fn test_replication() {
     }
 }
 
+/// A node built to serve fetches entirely in-process (the no-spawn / iOS
+/// build) can still *publish*: it creates a repository and an issue COB, and
+/// a peer fetches both — including the issue — over the network, with the
+/// serving side never spawning `git upload-pack`. This is the missing half
+/// of publishing from an embedded node.
+#[cfg(feature = "serve-in-process")]
+#[test]
+fn test_in_process_serve_publishes_cob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+
+    let mut alice = alice.spawn();
+    let mut bob = bob.spawn();
+    let issue_id = bob.issue(
+        acme,
+        Title::new("Ship it").unwrap(),
+        "filed from an embedded, no-spawn node",
+    );
+
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+
+    alice.handle.seed(acme, Scope::All).unwrap();
+    // Bob serves this fetch in-process (serve-in-process build).
+    let result = alice
+        .handle
+        .fetch(acme, bob.id, DEFAULT_TIMEOUT, None)
+        .unwrap();
+    assert!(result.is_success(), "in-process fetch failed: {result:?}");
+
+    let repo = alice.storage.repository(acme).unwrap();
+    let issues = issue::Issues::open(&repo, WriteAs::new(&alice.signer)).unwrap();
+    assert!(
+        issues.get(&issue_id).unwrap().is_some(),
+        "issue {issue_id} did not replicate from the in-process-serving node"
+    );
+}
+
 #[test]
 fn test_replication_ref_in_sigrefs() {
     let tmp = tempfile::tempdir().unwrap();
