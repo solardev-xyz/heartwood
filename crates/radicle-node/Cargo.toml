@@ -17,6 +17,11 @@ default = ["backtrace", "i2p", "systemd", "structured-logger", "socket2", "tor"]
 no-serve = []
 ## Skip `git gc` storage maintenance (no child processes).
 no-gc = []
+## Serve inbound fetches in-process (libgit2 object access + a hand-written
+## non-delta packfile) instead of spawning `git upload-pack`. Lets no-spawn
+## hosts (e.g. iOS) publish. Takes precedence over the spawned path, but is
+## still overridden by `no-serve`.
+serve-in-process = ["dep:git2", "dep:flate2", "dep:sha1"]
 dhat-heap = ["dep:dhat"]
 i2p = ["cyphernet/i2p", "radicle/i2p", "radicle-protocol/i2p"]
 systemd = ["dep:radicle-systemd"]
@@ -30,7 +35,9 @@ crossbeam-channel = "0.5.6"
 cyphernet = { workspace = true, features = ["dns", "ed25519", "p2p-ed25519", "noise-framework", "noise_sha2"] }
 dhat = { version = "0.3.3", optional = true }
 fastrand = { workspace = true }
+flate2 = { version = "1", optional = true }
 getrandom = { workspace = true, features = ["std"] }
+git2 = { workspace = true, optional = true }
 gix-packetline = { workspace = true, features = ["blocking-io"] }
 indexmap = { workspace = true }
 lexopt = { workspace = true }
@@ -45,6 +52,7 @@ radicle-signals = { workspace = true }
 radicle-log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
+sha1 = { version = "0.10", optional = true }
 snapbox = { workspace = true, optional = true }
 socket2 = { version = "0.5.7", features = ["all"], optional = true }
 structured-logger = { version = "1.0.4", optional = true }

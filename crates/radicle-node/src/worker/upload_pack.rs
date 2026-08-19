@@ -20,6 +20,7 @@ use crate::runtime::thread;
 /// N.b. The upload-pack process itself is strict, i.e. it will read
 /// requests from the client indefinitely, and so the client side MUST
 /// send the EOF file message.
+#[cfg_attr(feature = "serve-in-process", allow(dead_code))]
 pub fn upload_pack<R, W>(
     nid: &NodeId,
     remote: NodeId,
@@ -169,6 +170,7 @@ where
 
 /// A combination of the upload-pack sender with an [`Emitter`] for reporting
 /// the progress events to subscribers.
+#[cfg_attr(feature = "serve-in-process", allow(dead_code))]
 struct Reporter<W> {
     rid: RepoId,
     remote: NodeId,
@@ -178,6 +180,7 @@ struct Reporter<W> {
     last_sent: Instant,
 }
 
+#[cfg_attr(feature = "serve-in-process", allow(dead_code))]
 impl<W> Reporter<W> {
     fn new(rid: RepoId, remote: NodeId, emitter: Emitter<Event>, send: W) -> Self {
         Self {

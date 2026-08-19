@@ -1,6 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 pub(crate) mod channels;
 mod upload_pack;
+#[cfg(feature = "serve-in-process")]
+mod upload_pack_inproc;
 
 pub mod fetch;
 pub mod garbage;
@@ -200,6 +202,22 @@ impl Worker {
                     };
                 }
 
+                // Serve the fetch in-process when built for no-spawn hosts,
+                // otherwise spawn `git upload-pack` as before.
+                #[cfg(feature = "serve-in-process")]
+                let result = {
+                    let _ = (&self.nid, timeout); // used only by the spawned path
+                    upload_pack_inproc::upload_pack(
+                        remote,
+                        &self.storage,
+                        &emitter,
+                        &header,
+                        stream_r,
+                        stream_w,
+                    )
+                    .map_err(UploadError::UploadPack)
+                };
+                #[cfg(not(feature = "serve-in-process"))]
                 let result = upload_pack::upload_pack(
                     &self.nid,
                     remote,
