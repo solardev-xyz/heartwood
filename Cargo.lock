@@ -2820,6 +2820,7 @@ dependencies = [
  "radicle-git-ref-format",
  "radicle-localtime",
  "radicle-oid",
+ "rustix",
  "schemars",
  "serde",
  "serde-untagged",

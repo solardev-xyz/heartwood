@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use std::{io, net, time};
@@ -66,10 +65,12 @@ pub enum Control {
     Worker(TaskResult),
     /// Flush data in the given stream to the remote.
     Flush { remote: NodeId, stream: StreamId },
-    /// The addresses a dial's name resolved to, from its resolver thread.
+    /// The addresses a dial's name resolved to, from its resolver thread,
+    /// and when its lookup finished.
     Resolved {
         id: u64,
         answers: io::Result<Vec<net::SocketAddr>>,
+        finished: Instant,
     },
 }
 
@@ -80,8 +81,21 @@ struct Resolving {
     addr: Address,
     /// `None` for a timeout too large to add to the current time.
     deadline: Option<Instant>,
-    /// Set once a worker has taken the name to resolve.
-    taken: Arc<AtomicBool>,
+    /// Who has its name: no one yet, a worker, or the reactor.
+    claim: Arc<resolver::Claim>,
+}
+
+/// Why a dial failed, and whose failure it was. Only the remote's counts
+/// against the peer.
+#[derive(Debug)]
+enum DialFailure {
+    /// This node's own: its policy refused the address, it had no resolver
+    /// free, or it didn't get to a timely answer in time. The peer may never
+    /// have been tried.
+    Local(io::Error),
+    /// The peer's: its name didn't resolve, or resolved too slowly, or its
+    /// address couldn't be reached.
+    Remote(io::Error),
 }
 
 /// Peer session type.
@@ -486,6 +500,10 @@ where
 
     /// Opens the outbound connection `route` names, for `nid` at `addr`.
     fn connect(&mut self, nid: NodeId, addr: Address, route: Route) {
+        if !matches!(route, Route::Connect { .. }) {
+            let err = io::Error::other("a dial needs a resolved route");
+            return self.dial_failed(nid, &addr, DialFailure::Local(err));
+        }
         match dial(route, nid, self.secret_key.clone())
             .and_then(Transport::<WireSession>::with_session)
         {
@@ -503,25 +521,24 @@ where
                 self.actions
                     .push_back(reactor::Action::RegisterTransport(token, transport));
             }
-            Err(err) => self.dial_failed(nid, &addr, err),
+            Err(err) => self.dial_failed(nid, &addr, DialFailure::Remote(err)),
         }
     }
 
-    /// Fails the dial of `nid` at `addr` with `err`.
-    fn dial_failed(&mut self, nid: NodeId, addr: &Address, err: io::Error) {
-        logger::establish_connection(addr, &err);
-
-        self.service
-            .disconnected(nid, Link::Outbound, &DisconnectReason::Dial(Arc::new(err)));
-    }
-
-    /// Fails the dial of `nid` at `addr` with `err`, a reason of this node's
-    /// own: the remote was never tried, and isn't held to account for it.
-    fn dial_refused(&mut self, nid: NodeId, addr: &Address, err: io::Error) {
-        logger::establish_connection(addr, &err);
-
-        self.service
-            .disconnected(nid, Link::Outbound, &DisconnectReason::Local(Arc::new(err)));
+    /// Fails the dial of `nid` at `addr`: only a remote failure is held
+    /// against the peer.
+    fn dial_failed(&mut self, nid: NodeId, addr: &Address, failure: DialFailure) {
+        let reason = match failure {
+            DialFailure::Local(err) => {
+                logger::establish_connection(addr, &err);
+                DisconnectReason::Local(Arc::new(err))
+            }
+            DialFailure::Remote(err) => {
+                logger::establish_connection(addr, &err);
+                DisconnectReason::Dial(Arc::new(err))
+            }
+        };
+        self.service.disconnected(nid, Link::Outbound, &reason);
     }
 
     /// Resolves `host` on a thread of its own, through the gate, and dials
@@ -532,25 +549,22 @@ where
         self.next_resolution += 1;
         let timeout = self.gate.resolve_timeout();
         let deadline = Instant::now().checked_add(timeout);
-        let taken = Arc::new(AtomicBool::new(false));
+        let claim = Arc::new(resolver::Claim::default());
         let job = resolver::Job {
             id,
             host,
             port,
             deadline,
-            taken: taken.clone(),
+            claim: claim.clone(),
         };
         if self.resolvers.submit(job).is_err() {
             // Every resolver is busy and the queue is full: fail at once, as
             // this node's own failure.
-            return self.dial_refused(
-                nid,
-                &addr,
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "too many names are being resolved",
-                ),
+            let err = io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many names are being resolved",
             );
+            return self.dial_failed(nid, &addr, DialFailure::Local(err));
         }
         self.resolving.insert(
             id,
@@ -558,7 +572,7 @@ where
                 nid,
                 addr,
                 deadline,
-                taken,
+                claim,
             },
         );
         if deadline.is_some() {
@@ -566,10 +580,15 @@ where
         }
     }
 
-    /// A resolution's answer: the dial goes on to a checked address, or fails.
-    /// An answer that comes after its dial's deadline fails it, whenever the
-    /// reactor gets to it.
-    fn resolved(&mut self, id: u64, answers: io::Result<Vec<net::SocketAddr>>) {
+    /// A resolution's answer, and when its lookup `finished`: the dial goes
+    /// on to a checked address, or fails.
+    ///
+    /// An answer the reactor gets to after its dial's deadline fails it,
+    /// however long the reactor took. Whose failure that is depends on when
+    /// the lookup finished: one that answered in time, but waited for the
+    /// reactor, is this node's; one that finished late, or failed, is the
+    /// peer's.
+    fn resolved(&mut self, id: u64, answers: io::Result<Vec<net::SocketAddr>>, finished: Instant) {
         // Expired, and failed already.
         let Some(Resolving {
             nid,
@@ -580,22 +599,37 @@ where
         else {
             return;
         };
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return self.dial_failed(
-                nid,
-                &addr,
-                io::Error::new(io::ErrorKind::TimedOut, "name resolution timed out"),
-            );
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            let failure = if answers.is_ok() && finished < deadline {
+                DialFailure::Local(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "name resolution timed out: its answer came in time, \
+                     but waited on this node past the deadline",
+                ))
+            } else {
+                DialFailure::Remote(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "name resolution timed out",
+                ))
+            };
+            return self.dial_failed(nid, &addr, failure);
         }
         match checked(&addr, answers, self.service.config(), self.gate.as_ref()) {
             Ok(route) => self.connect(nid, addr, route),
-            Err(err) => self.dial_failed(nid, &addr, err),
+            Err(failure) => self.dial_failed(nid, &addr, failure),
         }
     }
 
     /// Fails the dials whose names haven't resolved by `now`, and asks to be
     /// woken again at the next deadline still ahead: a timer can fire before
     /// the deadline it was set for.
+    ///
+    /// A name no worker has taken is expired, so none will: this node's
+    /// failure. One a worker is still resolving is the peer's: it is too
+    /// slow. One whose lookup has finished has its answer on the way, and
+    /// [`Wire::resolved`] judges it by when it finished.
     fn expire_resolutions(&mut self, now: Instant) {
         let expired = self
             .resolving
@@ -604,33 +638,37 @@ where
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         for id in expired {
-            let Some(Resolving {
-                nid, addr, taken, ..
-            }) = self.resolving.remove(&id)
-            else {
+            let Some(resolving) = self.resolving.get(&id) else {
                 continue;
             };
-            if taken.load(Ordering::Acquire) {
-                // A worker resolved the name, and it was too slow.
-                self.dial_failed(
-                    nid,
-                    &addr,
-                    io::Error::new(io::ErrorKind::TimedOut, "name resolution timed out"),
-                );
-            } else {
+            let failure = if resolving.claim.expire() {
                 // No worker was free before the deadline: the name was never
-                // tried.
-                self.dial_refused(
-                    nid,
-                    &addr,
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "no resolver was free before the dial's deadline",
-                    ),
-                );
+                // tried, and now no worker will try it.
+                DialFailure::Local(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no resolver was free before the dial's deadline",
+                ))
+            } else if resolving.claim.finished().is_some() {
+                // Its lookup has finished: its answer, on its way, decides.
+                continue;
+            } else {
+                // A worker is resolving the name, and it is too slow.
+                DialFailure::Remote(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "name resolution timed out",
+                ))
+            };
+            if let Some(Resolving { nid, addr, .. }) = self.resolving.remove(&id) {
+                self.dial_failed(nid, &addr, failure);
             }
         }
-        if let Some(next) = self.resolving.values().filter_map(|r| r.deadline).min() {
+        if let Some(next) = self
+            .resolving
+            .values()
+            .filter(|r| r.claim.finished().is_none())
+            .filter_map(|r| r.deadline)
+            .min()
+        {
             self.actions.push_back(reactor::Action::SetTimer(
                 next.saturating_duration_since(now) + time::Duration::from_millis(1),
             ));
@@ -1038,7 +1076,11 @@ where
             Control::User(cmd) => self.service.command(cmd),
             Control::Worker(result) => self.worker_result(result),
             Control::Flush { remote, stream } => self.flush(remote, stream),
-            Control::Resolved { id, answers } => self.resolved(id, answers),
+            Control::Resolved {
+                id,
+                answers,
+                finished,
+            } => self.resolved(id, answers, finished),
         }
     }
 
@@ -1180,7 +1222,9 @@ where
                             self.resolve(node_id, addr, host, port)
                         }
                         Ok(route) => self.connect(node_id, addr, route),
-                        Err(err) => self.dial_failed(node_id, &addr, err),
+                        // The node's own policy, or its configuration, refused
+                        // the address: no socket was opened.
+                        Err(err) => self.dial_failed(node_id, &addr, DialFailure::Local(err)),
                     }
                 }
                 Io::Disconnect(nid, reason) => {
@@ -1394,18 +1438,22 @@ fn checked(
     answers: io::Result<Vec<net::SocketAddr>>,
     config: &radicle::node::Config,
     gate: &dyn Gate,
-) -> io::Result<Route> {
-    let answers = answers?;
+) -> Result<Route, DialFailure> {
+    // A name that doesn't resolve is the peer's.
+    let answers = answers.map_err(DialFailure::Remote)?;
     if answers.is_empty() {
-        return Err(io::Error::new(
+        return Err(DialFailure::Remote(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             format!("{target} resolved to no address"),
-        ));
+        )));
     }
+    // One whose every address the node's policy refuses is the node's.
     let addr = answers
         .into_iter()
         .find(|addr| gate.allows(target, addr))
-        .ok_or_else(|| refused(format!("every address {target} resolved to")))?;
+        .ok_or_else(|| {
+            DialFailure::Local(refused(format!("every address {target} resolved to")))
+        })?;
 
     Ok(match &target.host {
         HostName::Dns(_) => through(addr, config.proxy),
@@ -1584,6 +1632,7 @@ mod test {
 
     use protocol::service::ServiceState as _;
     use protocol::service::{Message, ZeroBytes};
+    use radicle::assert_matches;
     use radicle::identity::RepoId;
     use radicle::node;
     use radicle::test::arbitrary;
@@ -1732,11 +1781,22 @@ mod test {
                 &config,
                 &gate(),
             );
-            assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::NotFound);
+            // A name that doesn't resolve, or resolves to nothing, is the
+            // peer's; an answer the policy refuses is this node's.
+            assert_matches!(
+                failed,
+                Err(DialFailure::Remote(e)) if e.kind() == io::ErrorKind::NotFound
+            );
             let empty = checked(&target, Ok(vec![]), &config, &gate());
-            assert_eq!(empty.unwrap_err().kind(), io::ErrorKind::AddrNotAvailable);
+            assert_matches!(
+                empty,
+                Err(DialFailure::Remote(e)) if e.kind() == io::ErrorKind::AddrNotAvailable
+            );
             let refused = checked(&target, Ok(vec![(REFUSED, 8776).into()]), &config, &gate());
-            assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_matches!(
+                refused,
+                Err(DialFailure::Local(e)) if e.kind() == io::ErrorKind::PermissionDenied
+            );
         }
     }
 

@@ -2934,6 +2934,231 @@ fn test_dial_a_name_too_slow_to_resolve_costs_the_peer() {
     assert!(after > before, "{after:?} after {before:?}");
 }
 
+/// A gate whose name `online.test` resolves to `online`, and every other
+/// name to `target`, whose port it refuses.
+#[derive(Debug)]
+struct PolicyGate {
+    online: std::net::SocketAddr,
+    target: std::net::SocketAddr,
+}
+
+impl radicle::node::dial::Gate for PolicyGate {
+    fn allows(&self, _: &radicle::node::Address, addr: &std::net::SocketAddr) -> bool {
+        addr.port() != self.target.port()
+    }
+
+    fn resolve(&self, host: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        Ok(vec![if host == "online.test" {
+            self.online
+        } else {
+            self.target
+        }])
+    }
+}
+
+#[test]
+// Review of heartwood #4, round 3: an address alice's own policy refuses,
+// given as an IP address or resolved from a name, costs bob nothing: 32
+// refusals would have put him past the threshold of automatic connections.
+fn test_dial_policy_refusals_cost_the_peer_nothing() {
+    use radicle::node::address::{KnownAddress, Source, Store as _};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dan = Node::init(tmp.path(), config::relay("dan"), 51).spawn();
+    let bob = Node::init(tmp.path(), config::relay("bob"), 37).spawn();
+    let mut cfg = config::relay("alice");
+    cfg.peers = radicle::node::config::PeerConfig::Static;
+    cfg.limits.connection.outbound = 2.into();
+    let mut node = Node::init(tmp.path(), cfg, 13);
+    node.db
+        .addresses_mut()
+        .insert(
+            &bob.id,
+            1,
+            radicle::node::Features::SEED,
+            &bob.alias,
+            0,
+            &radicle::node::UserAgent::default(),
+            localtime::LocalTime::now().into(),
+            [KnownAddress::new(by_name(&bob), Source::Peer)],
+        )
+        .unwrap();
+    let book = node.home.database_mut(node.config.database).unwrap();
+    let alice = node.spawn_with_gate(std::sync::Arc::new(PolicyGate {
+        online: dan.addr,
+        target: bob.addr,
+    }));
+    let mut handle = alice.handle.clone();
+    let online = format!("online.test:{}", dan.addr.port()).parse().unwrap();
+    assert!(matches!(
+        handle.connect(dan.id, online, connect_options()).unwrap(),
+        ConnectResult::Connected
+    ));
+    let before = penalty(&alice, &bob, &book);
+
+    let literal = handle
+        .connect(bob.id, bob.addr.into(), connect_options())
+        .unwrap();
+    assert!(
+        matches!(&literal, ConnectResult::Disconnected { reason } if reason.contains("refused")),
+        "{literal:?}"
+    );
+    assert_eq!(penalty(&alice, &bob, &book), before);
+    for _ in 0..31 {
+        let resolved = handle
+            .connect(bob.id, by_name(&bob), connect_options())
+            .unwrap();
+        assert!(
+            matches!(&resolved, ConnectResult::Disconnected { reason } if reason.contains("refused")),
+            "{resolved:?}"
+        );
+    }
+    let after = penalty(&alice, &bob, &book);
+    assert_eq!(after, before);
+    assert!(!after.is_connect_threshold_reached());
+}
+
+/// Bob's dial, by name, whose lookup finishes `release_after` into a 700 ms
+/// query that keeps alice's reactor busy, past its 300 ms deadline: the
+/// dial's outcome, and bob's penalty before and after.
+fn dial_answered_during_a_busy_reactor(
+    release_after: time::Duration,
+) -> (
+    ConnectResult,
+    radicle::node::Penalty,
+    radicle::node::Penalty,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice, bob, _dan, gate, book) =
+        penalty_fixture(tmp.path(), time::Duration::from_millis(300));
+    let before = penalty(&alice, &bob, &book);
+    let (mut handle, nid, addr) = (alice.handle.clone(), bob.id, by_name(&bob));
+    let call = thread::spawn(move || handle.connect(nid, addr, connect_options()).unwrap());
+    gate.held.wait_for(1);
+    let (entered, entering) = std::sync::mpsc::sync_channel(1);
+    let busy: std::sync::Arc<service::QueryState> = std::sync::Arc::new(move |_| {
+        entered.send(()).unwrap();
+        thread::sleep(time::Duration::from_millis(700));
+        Ok(())
+    });
+    let (answered, _) = std::sync::mpsc::sync_channel(1);
+    alice
+        .handle
+        .command(service::Command::QueryState(busy, answered))
+        .unwrap();
+    entering.recv_timeout(time::Duration::from_secs(2)).unwrap();
+    thread::sleep(release_after);
+    gate.held.release();
+    gate.held.wait_for(0);
+    let result = call.join().unwrap();
+    let after = penalty(&alice, &bob, &book);
+    (result, before, after)
+}
+
+#[test]
+// Review of heartwood #4, round 3: a lookup is judged by when it finished,
+// not by when the reactor got to its answer. Both dials fail at their
+// deadline; only the lookup that finished past it costs bob.
+fn test_dial_a_lookup_is_judged_by_when_it_finished() {
+    let timed_out = |result: &ConnectResult| matches!(result, ConnectResult::Disconnected { reason } if reason.contains("name resolution timed out"));
+    // Done in 50 ms, consumed after 700: this node was too busy.
+    let (result, before, after) =
+        dial_answered_during_a_busy_reactor(time::Duration::from_millis(50));
+    assert!(timed_out(&result), "{result:?}");
+    assert_eq!(after, before, "a timely lookup cost the peer");
+    // Done in 400 ms, past the 300 ms deadline: the peer's name was slow.
+    let (result, before, after) =
+        dial_answered_during_a_busy_reactor(time::Duration::from_millis(400));
+    assert!(timed_out(&result), "{result:?}");
+    assert!(after > before, "a late lookup cost the peer nothing");
+}
+
+#[test]
+// Review of heartwood #4, round 3: a worker that checked a job's deadline,
+// and is preempted before it claims it, finds the reactor has expired it, and
+// never resolves it.
+fn test_dial_an_expired_name_is_never_resolved_after() {
+    use crate::resolver::seams::{self, Point};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice, bob, _dan, gate, book) =
+        penalty_fixture(tmp.path(), time::Duration::from_millis(300));
+    let before = penalty(&alice, &bob, &book);
+    let host = "preempted.test";
+    seams::pause(Point::Claim, host);
+    let addr: radicle::node::Address = format!("{host}:{}", bob.addr.port()).parse().unwrap();
+    let (mut handle, nid) = (alice.handle.clone(), bob.id);
+    let call = thread::spawn(move || handle.connect(nid, addr, connect_options()).unwrap());
+    let until = time::Instant::now() + time::Duration::from_secs(5);
+    while !seams::waiting(Point::Claim, host) {
+        assert!(time::Instant::now() < until, "no worker reached its claim");
+        thread::sleep(time::Duration::from_millis(5));
+    }
+    // Past the deadline, with the worker held before its claim.
+    let result = call.join().unwrap();
+    assert!(
+        matches!(&result, ConnectResult::Disconnected { reason } if reason.contains("no resolver was free")),
+        "{result:?}"
+    );
+    seams::release(Point::Claim, host);
+    let until = time::Instant::now() + time::Duration::from_secs(5);
+    let claimed = loop {
+        if let Some(claimed) = seams::claim(host) {
+            break claimed;
+        }
+        assert!(time::Instant::now() < until, "the worker never claimed");
+        thread::sleep(time::Duration::from_millis(5));
+    };
+    assert!(!claimed, "the worker took a job the reactor had expired");
+    assert_eq!(
+        gate.held.active.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the expired name was resolved"
+    );
+    assert_eq!(penalty(&alice, &bob, &book), before);
+    gate.held.release();
+}
+
+#[test]
+// Review of heartwood #4, round 3: a lookup that finished in time, whose
+// answer reaches the reactor only after the deadline has expired the dial's
+// timer, is still judged by when it finished: it costs bob nothing.
+fn test_dial_a_timely_answer_the_deadline_overtook_costs_nothing() {
+    use crate::resolver::seams::{self, Point};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice, bob, _dan, gate, book) =
+        penalty_fixture(tmp.path(), time::Duration::from_millis(300));
+    let before = penalty(&alice, &bob, &book);
+    let host = "overtaken.test";
+    seams::pause(Point::Answer, host);
+    // The lookup finishes at once; its answer is held back.
+    gate.held.release();
+    let addr: radicle::node::Address = format!("{host}:{}", bob.addr.port()).parse().unwrap();
+    let (mut handle, nid) = (alice.handle.clone(), bob.id);
+    let call = thread::spawn(move || handle.connect(nid, addr, connect_options()).unwrap());
+    let until = time::Instant::now() + time::Duration::from_secs(5);
+    while !seams::waiting(Point::Answer, host) {
+        assert!(time::Instant::now() < until, "no lookup finished");
+        thread::sleep(time::Duration::from_millis(5));
+    }
+    // Past the deadline, the reactor's timer has fired, with the answer
+    // still held back. The dial waits for it.
+    thread::sleep(time::Duration::from_millis(500));
+    alice.handle.sessions().unwrap();
+    assert!(
+        !call.is_finished(),
+        "the dial failed before its answer came"
+    );
+    seams::release(Point::Answer, host);
+    let result = call.join().unwrap();
+    assert!(
+        matches!(&result, ConnectResult::Disconnected { reason } if reason.contains("name resolution timed out")),
+        "{result:?}"
+    );
+    assert_eq!(penalty(&alice, &bob, &book), before);
+}
+
 #[test]
 // heartwood#14 (freedom-core design 0008): a fetch of a repository being
 // repaired waits, through the runtime, until the host opens it again.
