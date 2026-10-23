@@ -3056,6 +3056,7 @@ dependencies = [
  "sha1",
  "snapbox",
  "socket2",
+ "sqlite",
  "structured-logger",
  "tempfile",
  "test-log",
