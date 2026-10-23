@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use std::{io, net, time};
 
@@ -64,10 +64,14 @@ pub enum Control {
 }
 
 /// Peer session type.
-type WireSession = NoiseSession<crypto::SigningKey, Sha256, Socks5Session<TcpStream>>;
+pub(crate) type WireSession = NoiseSession<crypto::SigningKey, Sha256, Socks5Session<TcpStream>>;
 
 /// Reactor action.
 type Action = reactor::Action<Listener, Transport<WireSession>>;
+
+/// Where the wire leaves the error the service stopped the node with, for the
+/// runtime to return once the reactor has ended.
+pub type Stopped = Arc<Mutex<Option<service::Error>>>;
 
 /// A worker stream.
 struct Stream {
@@ -316,6 +320,8 @@ pub(crate) struct Wire<D, S> {
     peers: Peers,
     /// A (practically) infinite source of tokens to identify transports and listeners.
     tokens: Tokens,
+    /// The error the service stopped the node with, once it has.
+    stopped: Stopped,
 }
 
 impl<D, S> Wire<D, S>
@@ -327,6 +333,7 @@ where
         service: Service<D, S>,
         worker: chan::Sender<Task>,
         secret_key: crypto::SigningKey,
+        stopped: Stopped,
     ) -> Self {
         assert!(service.started().is_some(), "Service must be initialized");
 
@@ -341,6 +348,7 @@ where
             listening: RandomMap::default(),
             peers: Peers(RandomMap::default()),
             tokens: Tokens::default(),
+            stopped,
         }
     }
 
@@ -510,6 +518,20 @@ where
         self.metrics.worker_queue_size = self.worker.len();
 
         self.service.tick(LocalTime::now(), &self.metrics);
+    }
+
+    fn stopped(&mut self) -> bool {
+        if !self.service.is_stopped() {
+            return false;
+        }
+        if let Some(error) = self.service.take_fatal() {
+            log::error!(target: "wire", "Stopping the node: {error}");
+            self.stopped
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(error);
+        }
+        true
     }
 
     fn timer_reacted(&mut self) {
@@ -1467,6 +1489,7 @@ mod test {
             alice.into_service(),
             worker_tx,
             crypto::SigningKey::mock(100),
+            Stopped::default(),
         );
 
         (wire, rid, bob_id, bob_addr)

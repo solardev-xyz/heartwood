@@ -60,6 +60,12 @@ impl<S> Peer<S> {
         Address::from(self.addr)
     }
 
+    /// The peer's policy database. It is on disk, so that a test can damage it
+    /// behind the service's back.
+    pub fn policies_path(&self) -> std::path::PathBuf {
+        self.tempdir.path().join(node::POLICIES_DB_FILE)
+    }
+
     pub fn into_service(self) -> Service<S> {
         self.service
     }
@@ -172,7 +178,11 @@ where
     ) -> Self {
         let mut config = Config::new(id as usize);
 
-        let policies = policy::Store::<policy::store::Write>::memory().unwrap();
+        let tempdir = tempfile::TempDir::with_prefix(name).unwrap();
+        let policies = policy::Store::<policy::store::Write>::open(
+            tempdir.path().join(node::POLICIES_DB_FILE),
+        )
+        .unwrap();
         let mut policies = policy::Config::new(config.policy, policies);
         let ip = [198, 18, 0, id].into();
 
@@ -186,8 +196,15 @@ where
         }
 
         f(&mut config);
-
-        let tempdir = tempfile::TempDir::with_prefix(name).unwrap();
+        // With the default policy `f` may have set.
+        drop(policies);
+        let policies = policy::Config::new(
+            config.policy,
+            policy::Store::<policy::store::Write>::open(
+                tempdir.path().join(node::POLICIES_DB_FILE),
+            )
+            .unwrap(),
+        );
 
         let nid = *config.secret_key.public_key();
 
@@ -209,7 +226,7 @@ where
         .into();
 
         let announcement =
-            service::gossip::node(&config.config, Timestamp::from(config.local_time) + 1);
+            service::gossip::node(&config.config, Timestamp::from(config.local_time) + 1).unwrap();
         let emitter: Emitter<Event> = Default::default();
 
         let mut service = Service::new(

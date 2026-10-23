@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{PoisonError, mpsc};
 use std::{fs, io, net, time};
 
 #[cfg(unix)]
@@ -37,7 +37,7 @@ use thiserror::Error;
 use crate::control;
 use crate::reactor;
 use crate::reactor::Reactor;
-use crate::wire::Wire;
+use crate::wire::{Stopped, Wire};
 use crate::worker;
 
 /// Maximum pending worker tasks allowed.
@@ -94,6 +94,15 @@ pub enum Error {
     /// A git version error.
     #[error("git version error: {0}")]
     GitVersion(#[from] git::VersionError),
+    /// The configuration asks for no fetches at all.
+    #[error("invalid configuration: fetch concurrency must be at least 1")]
+    ZeroFetchConcurrency,
+    /// The configuration has more external addresses than an announcement carries.
+    #[error("invalid configuration: {0}")]
+    TooManyAddresses(#[from] gossip::TooManyAddresses),
+    /// No nonce solves the node announcement's proof of work.
+    #[error("unable to solve the node announcement's proof of work")]
+    ProofOfWork,
 }
 
 impl From<service::Error> for Error {
@@ -122,6 +131,8 @@ pub struct Runtime {
     pub pool: worker::Pool,
     pub local_addrs: Vec<net::SocketAddr>,
     pub signals: mpsc::Receiver<Signal>,
+    /// The error the service stopped the node with, once it has.
+    stopped: Stopped,
 }
 
 impl Runtime {
@@ -173,9 +184,12 @@ impl Runtime {
         log::info!(target: "node", "Default seeding policy set to '{}'", policy);
         log::info!(target: "node", "Initializing service ({network:?})..");
 
-        let announcement = service::gossip::node(&config, timestamp)
+        if usize::from(config.limits.fetch_concurrency) == 0 {
+            return Err(Error::ZeroFetchConcurrency);
+        }
+        let announcement = service::gossip::node(&config, timestamp)?
             .solve(Default::default())
-            .expect("Runtime::init: unable to solve proof-of-work puzzle");
+            .ok_or(Error::ProofOfWork)?;
 
         log::info!(target: "node", "Opening node database..");
         let db = home.database_mut(config.database)?.init(
@@ -226,7 +240,8 @@ impl Runtime {
 
         let (worker_send, worker_recv) =
             crossbeam_channel::bounded::<worker::Task>(MAX_PENDING_TASKS);
-        let mut wire = Wire::new(service, worker_send, secret_key.clone());
+        let stopped = Stopped::default();
+        let mut wire = Wire::new(service, worker_send, secret_key.clone(), stopped.clone());
         let mut local_addrs = Vec::new();
 
         for addr in listen {
@@ -271,6 +286,7 @@ impl Runtime {
             pool,
             signals,
             local_addrs,
+            stopped,
         })
     }
 
@@ -291,9 +307,9 @@ impl Runtime {
             });
         }
 
-        let stopped = Arc::new(AtomicBool::new(false));
+        let watcher_stop = Arc::new(AtomicBool::new(false));
         let signals = thread::spawn(&self.id, "signals", {
-            let stopped = stopped.clone();
+            let stopped = watcher_stop.clone();
             move || {
                 loop {
                     use radicle::node::Handle as _;
@@ -327,7 +343,7 @@ impl Runtime {
 
         // The node has stopped: the signal watcher ends at its next check,
         // whether or not the host still holds its signal sender.
-        stopped.store(true, Ordering::Release);
+        watcher_stop.store(true, Ordering::Release);
         if signals.join().is_err() {
             log::error!(target: "node", "The signal watcher thread panicked");
         }
@@ -342,7 +358,16 @@ impl Runtime {
 
         log::debug!(target: "node", "Node shutdown completed for {}", self.id);
 
-        Ok(())
+        // A node the service stopped returns the error it stopped with.
+        match self
+            .stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     #[cfg(all(feature = "socket2", feature = "systemd", target_os = "linux"))]
