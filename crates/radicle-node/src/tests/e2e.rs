@@ -3015,3 +3015,46 @@ fn test_gate_a_namespace_quarantine_isnt_served() {
         .unwrap();
     assert!(result.is_success(), "{result:?}");
 }
+
+#[test]
+// heartwood#14: closing a repository waits for a fetch of it already under
+// way, which holds its gate pass until it is done.
+fn test_gate_closing_waits_for_a_fetch_under_way() {
+    use crate::worker::seams;
+    use radicle::node::gate::{Busy, RepoGate, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    let gate = RepoGate::new();
+    let mut alice = alice.spawn_with_repositories(gate.clone());
+    let bob = bob.spawn();
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+    alice.handle.seed(acme, Scope::All).unwrap();
+
+    seams::hold(acme);
+    let mut handle = alice.handle.clone();
+    let fetching =
+        thread::spawn(move || handle.fetch(acme, bob.id, DEFAULT_TIMEOUT, None).unwrap());
+    let until = time::Instant::now() + time::Duration::from_secs(10);
+    while !seams::waiting(acme) {
+        assert!(time::Instant::now() < until, "the fetch never began");
+        thread::sleep(time::Duration::from_millis(5));
+    }
+    // The fetch holds its pass: closing can't finish, but closes all the same.
+    assert_eq!(
+        gate.close(acme, RepoState::Repairing, time::Duration::from_millis(200)),
+        Err(Busy {
+            rid: acme,
+            passes: 1
+        })
+    );
+    assert!(gate.enter(acme).is_none());
+    // Let go, the fetch it already began completes, and the close with it.
+    seams::release(acme);
+    gate.close(acme, RepoState::Repairing, time::Duration::from_secs(20))
+        .unwrap();
+    assert!(fetching.join().unwrap().is_success());
+}

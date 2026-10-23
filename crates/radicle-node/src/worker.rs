@@ -283,6 +283,8 @@ impl Worker {
                 state: self.repositories.state(&rid),
             });
         };
+        #[cfg(test)]
+        seams::with_pass(rid);
         let FetchConfig { local, expiry } = &self.fetch_config;
         // N.b. if the `rid` is blocked this will return an error, so
         // we won't continue with any further set up of the fetch.
@@ -370,5 +372,56 @@ impl Pool {
         log::debug!(target: "pool", "Worker pool shutting down..");
 
         Ok(())
+    }
+}
+
+/// A test-only seam: a fetch held, with its gate pass, until a test releases
+/// it, per repository.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    use radicle::identity::RepoId;
+
+    #[derive(Default)]
+    struct Seams {
+        /// Repositories whose fetches wait, holding their pass.
+        held: HashMap<RepoId, bool>,
+        /// Repositories with a fetch waiting now.
+        waiting: HashMap<RepoId, bool>,
+    }
+
+    static SEAMS: LazyLock<(Mutex<Seams>, Condvar)> = LazyLock::new(Default::default);
+
+    /// Fetches of `rid` wait with their pass, until [`release`].
+    pub fn hold(rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert(rid, true);
+    }
+
+    pub fn release(rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert(rid, false);
+        SEAMS.1.notify_all();
+    }
+
+    /// Whether a fetch of `rid` waits now, with its pass.
+    pub fn waiting(rid: RepoId) -> bool {
+        SEAMS
+            .0
+            .lock()
+            .unwrap()
+            .waiting
+            .get(&rid)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn with_pass(rid: RepoId) {
+        let mut seams = SEAMS.0.lock().unwrap();
+        while seams.held.get(&rid).copied().unwrap_or(false) {
+            seams.waiting.insert(rid, true);
+            seams = SEAMS.1.wait(seams).unwrap();
+        }
+        seams.waiting.insert(rid, false);
     }
 }
