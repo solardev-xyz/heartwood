@@ -19,10 +19,8 @@ use crate::git::Oid;
 use crate::git::fmt::{RefStr, RefString};
 use crate::prelude::{NodeId, RepoId};
 use crate::storage::git::{Repository, Storage};
-use crate::storage::refs::{SIGREFS_BRANCH, SignedRefs};
-use crate::storage::{
-    ReadRepository as _, RepositoryError, SignRepository as _, WriteStorage as _,
-};
+use crate::storage::refs::SignedRefs;
+use crate::storage::{RepositoryError, SignRepository as _, WriteStorage as _};
 
 use super::fsync_enabled;
 
@@ -68,7 +66,7 @@ pub struct Checkpoint {
 }
 
 /// What one unit of a check found.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Check {
     /// Refs remain: the next unit runs from this checkpoint.
     Continue(Checkpoint),
@@ -77,8 +75,8 @@ pub enum Check {
     Clean,
     /// Every ref points at an object the repository has, but the refs differ
     /// from the signed refs, and the namespace is the signer's: [`resign`]
-    /// it.
-    Stale,
+    /// it, with this proof that the check is complete.
+    Stale(Complete),
     /// The namespace doesn't verify, and can't be re-signed: its repository
     /// is to be quarantined as `namespace`. Nothing was changed.
     Quarantine(Problem),
@@ -116,74 +114,279 @@ pub enum Error {
     FsyncOff,
     #[error("the key of {signer} may not sign the namespace of {namespace}")]
     NotOwner { namespace: NodeId, signer: NodeId },
+    /// The namespace's refs changed since its check: it has to be checked
+    /// again.
+    #[error("the refs of {namespace} changed since its check")]
+    Changed { namespace: NodeId },
+}
+
+/// Proof that a check of a namespace ran to its end and found it stale: what
+/// [`resign`] takes. Only [`check`] makes one, in a pass's last unit, bound to
+/// the namespace and its [`version`] then.
+///
+/// A pass is only as complete as the checkpoints it resumed from: the
+/// reconcile state that keeps them binds each to the namespace's version.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Complete {
+    namespace: NodeId,
+    version: Oid,
+}
+
+impl Complete {
+    /// The namespace found stale.
+    pub fn namespace(&self) -> &NodeId {
+        &self.namespace
+    }
+
+    /// Its version when its check ended.
+    pub fn version(&self) -> Oid {
+        self.version
+    }
+}
+
+/// A namespace's signed refs, read and verified once for a whole pass of its
+/// check, and the commit they were read at: every unit compares against them.
+/// A pass of the check starts over if its `rad/sigrefs` moves, as the
+/// namespace's [`version`] then changes; a unit that finds it moved stops.
+#[derive(Debug)]
+pub struct Signed {
+    namespace: NodeId,
+    state: SignedState,
+}
+
+#[derive(Debug)]
+enum SignedState {
+    /// Verified, at this commit.
+    Verified {
+        at: Oid,
+        refs: BTreeMap<RefString, Oid>,
+    },
+    /// The namespace has no `rad/sigrefs`.
+    Absent,
+    /// Its `rad/sigrefs` doesn't load, or doesn't verify.
+    Unverified(String),
+}
+
+impl Signed {
+    /// Reads and verifies `namespace`'s signed refs in `repo`: once a pass.
+    pub fn load(repo: &Repository, namespace: &NodeId) -> Result<Self, Error> {
+        let state = match SignedRefs::load(*namespace, repo) {
+            Ok(Some(signed)) => SignedState::Verified {
+                at: signed.at,
+                refs: BTreeMap::from(signed.refs().clone()),
+            },
+            Ok(None) => SignedState::Absent,
+            Err(err) => SignedState::Unverified(err.to_string()),
+        };
+        Ok(Self {
+            namespace: *namespace,
+            state,
+        })
+    }
+
+    /// The namespace they are the signed refs of.
+    pub fn namespace(&self) -> &NodeId {
+        &self.namespace
+    }
+
+    fn refs(&self) -> Option<&BTreeMap<RefString, Oid>> {
+        match &self.state {
+            SignedState::Verified { refs, .. } => Some(refs),
+            SignedState::Absent | SignedState::Unverified(_) => None,
+        }
+    }
+
+    fn at(&self) -> Option<Oid> {
+        match &self.state {
+            SignedState::Verified { at, .. } => Some(*at),
+            SignedState::Absent | SignedState::Unverified(_) => None,
+        }
+    }
+}
+
+/// The prefix of `namespace`'s refs.
+fn prefix(namespace: &NodeId) -> String {
+    format!("refs/namespaces/{namespace}/")
+}
+
+/// Refs under it a namespace's check and version leave out, as
+/// `ReadRepository::references_of` leaves them out.
+const TMP_HEADS: &str = "refs/tmp/heads/";
+
+/// The signed refs' own ref, within a namespace.
+const SIGREFS: &str = "refs/rad/sigrefs";
+
+/// The names of `namespace`'s refs in `repo`, within the namespace, as libgit2
+/// yields them, in no particular order: none is held but the one `each` is
+/// given, and none is parsed.
+fn each_name(
+    repo: &Repository,
+    namespace: &NodeId,
+    mut each: impl FnMut(&str),
+) -> Result<(), Error> {
+    let prefix = prefix(namespace);
+    for name in repo.backend.references_glob(&format!("{prefix}*"))?.names() {
+        let name = name?;
+        if let Some(name) = name.strip_prefix(&prefix)
+            && !name.starts_with(TMP_HEADS)
+        {
+            each(name);
+        }
+    }
+    Ok(())
+}
+
+/// The target of `namespace`'s ref `name` in `repo`, if it has one.
+fn target(repo: &Repository, namespace: &NodeId, name: &str) -> Result<Option<Oid>, Error> {
+    let reference = match repo
+        .backend
+        .find_reference(&format!("{}{name}", prefix(namespace)))
+    {
+        Ok(reference) => reference,
+        Err(e) if e.code() == git::raw::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let target = match reference.target() {
+        Some(target) => target,
+        None => reference
+            .resolve()?
+            .target()
+            .ok_or(crate::storage::Error::InvalidRef)?,
+    };
+    Ok(Some(target.into()))
 }
 
 /// The version of `namespace`'s refs in `repo`: a hash over every ref's name
 /// and target, `rad/sigrefs` included. Any change to a ref changes it.
+///
+/// It is the exclusive or of each ref's own hash, over `name target`, and
+/// their count, hashed: independent of the order libgit2 yields refs in, so
+/// no ref is held but the one it hashes. A ref name has no space.
 pub fn version(repo: &Repository, namespace: &NodeId) -> Result<Oid, Error> {
-    let mut text = String::new();
-    for (name, target) in repo.references_of(namespace)? {
-        // A ref name has no space or line feed.
-        text.push_str(name.as_str());
-        text.push(' ');
-        text.push_str(&target.to_string());
-        text.push('\n');
+    let prefix = prefix(namespace);
+    let mut sum = [0u8; 20];
+    let mut count = 0u64;
+    for reference in repo.backend.references_glob(&format!("{prefix}*"))? {
+        let reference = reference?;
+        let Ok(full) = reference.name() else {
+            return Err(crate::storage::Error::InvalidRef.into());
+        };
+        let Some(name) = full.strip_prefix(&prefix) else {
+            continue;
+        };
+        if name.starts_with(TMP_HEADS) {
+            continue;
+        }
+        let target = match reference.target() {
+            Some(target) => target,
+            None => reference
+                .resolve()?
+                .target()
+                .ok_or(crate::storage::Error::InvalidRef)?,
+        };
+        let text = format!("{name} {target}");
+        let hash = git::raw::Oid::hash_object(git::raw::ObjectType::Blob, text.as_bytes())?;
+        for (sum, byte) in sum.iter_mut().zip(hash.as_bytes()) {
+            *sum ^= byte;
+        }
+        count += 1;
     }
+    let mut text = sum.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    text.push_str(&format!(" {count}"));
     let hash = git::raw::Oid::hash_object(git::raw::ObjectType::Blob, text.as_bytes())?;
     Ok(hash.into())
 }
 
-/// One unit of the check of `namespace` in `repo`: at most `limit` refs (one
-/// if `limit` is zero), after `from`'s, in the order of their names. The
-/// names are those of the namespace's refs, `rad/sigrefs` aside, and those
-/// of its signed refs.
+/// One unit of the check of a namespace in `repo` against its `signed`
+/// refs, which the caller loaded once for the pass ([`Signed::load`]): at
+/// most `limit` refs (one if `limit` is zero), after `from`'s, in the order of
+/// their names. The names are those of the namespace's refs, `rad/sigrefs`
+/// aside, and those of its signed refs.
 ///
 /// Each ref must point at an object the repository has, or the namespace is
 /// quarantined. A ref that is unsigned, at another target than its signed
 /// one, or signed but absent quarantines the namespace too, unless the
 /// namespace is the signer's: then it only marks the namespace stale, to be
-/// re-signed once every ref has been checked.
+/// re-signed once every ref has been checked. The last unit of a stale pass
+/// returns the [`Complete`] proof [`resign`] takes.
+///
+/// A unit holds no more than `limit + 1` refs at once. It still reads every
+/// ref of the namespace, to find the next ones after `from`, as libgit2
+/// yields them in no order; that is a string comparison each, and libgit2's
+/// own reading of `packed-refs`. Signed refs aren't read again: if
+/// `rad/sigrefs` moved since they were, the unit stops with
+/// [`Error::Changed`].
 ///
 /// A namespace with no refs and no `rad/sigrefs` is clean. Nothing in the
 /// repository changes.
 pub fn check(
     repo: &Repository,
-    namespace: &NodeId,
+    signed: &Signed,
     authority: Authority,
     from: &Checkpoint,
     limit: usize,
 ) -> Result<Check, Error> {
-    let sigrefs = SIGREFS_BRANCH.to_ref_string();
-    let refs = BTreeMap::from(repo.references_of(namespace)?);
-    let signed = match SignedRefs::load(*namespace, repo) {
-        Ok(signed) => signed.map(|signed| BTreeMap::from(signed.refs().clone())),
-        Err(err) => {
-            return Ok(Check::Quarantine(Problem::Unverified {
-                reason: err.to_string(),
-            }));
+    let namespace = signed.namespace;
+    if let SignedState::Unverified(reason) = &signed.state {
+        return Ok(Check::Quarantine(Problem::Unverified {
+            reason: reason.clone(),
+        }));
+    }
+    let limit = limit.max(1);
+    let after = from.after.as_ref();
+
+    // The names of the first `limit + 1` of the namespace's refs after
+    // `from`: held as they stream past, the largest let go.
+    let mut current = BTreeSet::<String>::new();
+    each_name(repo, &namespace, |name| {
+        if name == SIGREFS
+            || after.is_some_and(|after| name <= after.as_str())
+            || (current.len() > limit && current.last().is_some_and(|last| name >= last.as_str()))
+        {
+            return;
         }
-    };
-    let names = refs
-        .keys()
-        .filter(|name| **name != sigrefs)
-        .chain(signed.iter().flat_map(BTreeMap::keys))
-        .map(RefString::as_refstr)
-        .collect::<BTreeSet<&RefStr>>();
-    let after = match &from.after {
+        current.insert(name.to_owned());
+        if current.len() > limit + 1 {
+            current.pop_last();
+        }
+    })?;
+    if target(repo, &namespace, SIGREFS)? != signed.at() {
+        return Err(Error::Changed { namespace });
+    }
+    let current = current
+        .into_iter()
+        .map(|name| {
+            let target = target(repo, &namespace, &name)?;
+            let name = RefString::try_from(name)
+                .map_err(|e| crate::storage::Error::Ref(crate::git::RefError::from(e)))?;
+            Ok((name, target))
+        })
+        .collect::<Result<BTreeMap<RefString, Option<Oid>>, Error>>()?;
+    let bound = match after {
         Some(after) => Bound::Excluded(after.as_refstr()),
         None => Bound::Unbounded,
     };
+    // And of its signed refs.
+    let signed_after = signed
+        .refs()
+        .into_iter()
+        .flat_map(|refs| refs.range::<RefStr, _>((bound, Bound::Unbounded)))
+        .take(limit + 1)
+        .map(|(name, oid)| (name.as_refstr(), *oid))
+        .collect::<BTreeMap<_, _>>();
+    let names = current
+        .keys()
+        .map(RefString::as_refstr)
+        .chain(signed_after.keys().copied())
+        .collect::<BTreeSet<&RefStr>>();
     let odb = repo.backend.odb()?;
 
     let mut stale = from.stale;
     let mut last = None;
-    let mut rest = names.range::<&RefStr, _>((after, Bound::Unbounded));
-    for name in rest.by_ref().take(limit.max(1)) {
-        let target = refs.get(*name).copied();
-        let signed = signed
-            .as_ref()
-            .and_then(|signed| signed.get(*name))
-            .copied();
+    let mut rest = names.iter();
+    for name in rest.by_ref().take(limit) {
+        let target = current.get(*name).copied().flatten();
+        let signed = signed_after.get(*name).copied();
         let refname = (*name).to_owned();
         let problem = match (target, signed) {
             (Some(target), _) if !odb.exists(target.into()) => {
@@ -215,14 +418,18 @@ pub fn check(
             after: Some(last.to_owned()),
             stale,
         }),
-        _ if stale => Check::Stale,
+        _ if stale => Check::Stale(Complete {
+            namespace,
+            version: version(repo, &namespace)?,
+        }),
         _ => Check::Clean,
     })
 }
 
-/// Re-signs `namespace` in the repository `rid` of `storage` over its refs as
-/// they are, with `signer`, whose key must be the namespace's: once a check of
-/// it ended [`Check::Stale`].
+/// Re-signs the namespace a check found stale, in the repository `rid` of
+/// `storage`, over its refs as they are, with `signer`, whose key must be the
+/// namespace's. It takes the check's [`Complete`] proof, and refuses with
+/// [`Error::Changed`] if the namespace's version has moved since.
 ///
 /// It refuses to sign unless libgit2's fsync is on ([`super::enable_fsync`],
 /// which reconciliation calls first). It opens its own repository object,
@@ -232,15 +439,16 @@ pub fn check(
 pub fn resign<S>(
     storage: &Storage,
     rid: RepoId,
-    namespace: &NodeId,
+    complete: Complete,
     signer: &S,
 ) -> Result<SignedRefs, Error>
 where
     S: crypto::Signer,
 {
-    if signer.public_key() != namespace {
+    let namespace = complete.namespace;
+    if *signer.public_key() != namespace {
         return Err(Error::NotOwner {
-            namespace: *namespace,
+            namespace,
             signer: *signer.public_key(),
         });
     }
@@ -248,6 +456,9 @@ where
         return Err(Error::FsyncOff);
     }
     let repo = storage.repository_mut(rid)?;
+    if version(&repo, &namespace)? != complete.version {
+        return Err(Error::Changed { namespace });
+    }
     Ok(repo.sign_refs(signer)?)
 }
 
@@ -259,7 +470,7 @@ mod tests {
     use std::str::FromStr as _;
 
     use crate::crypto::{Signer as _, SigningKey};
-    use crate::storage::ReadStorage as _;
+    use crate::storage::{ReadRepository as _, ReadStorage as _};
     use crate::test::fixtures;
 
     struct Fixture {
@@ -323,19 +534,47 @@ mod tests {
 
         /// Every unit of a check, run to its end, with `limit` refs each.
         fn run(&self, authority: Authority, limit: usize) -> (Check, usize) {
-            let repo = self.repo();
-            let mut from = Checkpoint::default();
-            for units in 1.. {
-                match check(&repo, &self.nid(), authority, &from, limit).unwrap() {
-                    Check::Continue(next) => {
-                        assert!(next.after > from.after, "{next:?} after {from:?}");
-                        from = next;
-                    }
-                    end => return (end, units),
-                }
-            }
-            unreachable!()
+            run(
+                &self.repo(),
+                &self.nid(),
+                authority,
+                Checkpoint::default(),
+                limit,
+            )
         }
+
+        /// A check's proof that the namespace is stale.
+        fn complete(&self) -> Complete {
+            match self.run(Authority::Owner, UNIT_REFS).0 {
+                Check::Stale(complete) => complete,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// Every unit of the check of `namespace`, from `from`, with `limit` refs
+    /// each: its end, and how many units it took. More units than the
+    /// namespace has names, and one more, fail the test rather than run on.
+    fn run(
+        repo: &Repository,
+        namespace: &NodeId,
+        authority: Authority,
+        mut from: Checkpoint,
+        limit: usize,
+    ) -> (Check, usize) {
+        let signed = Signed::load(repo, namespace).unwrap();
+        let mut names = signed.refs().map_or(0, BTreeMap::len);
+        each_name(repo, namespace, |_| names += 1).unwrap();
+        for units in 1..=names + 2 {
+            match check(repo, &signed, authority, &from, limit).unwrap() {
+                Check::Continue(next) => {
+                    assert!(next.after > from.after, "{next:?} after {from:?}");
+                    from = next;
+                }
+                end => return (end, units),
+            }
+        }
+        panic!("a check of {names} names ran past {} units", names + 2)
     }
 
     fn refname(name: &str) -> RefString {
@@ -363,15 +602,14 @@ mod tests {
         let repo = f.repo();
         for authority in [Authority::of(&stranger, Some(&stranger)), Authority::None] {
             assert_eq!(
-                check(
+                run(
                     &repo,
                     &stranger,
                     authority,
-                    &Checkpoint::default(),
+                    Checkpoint::default(),
                     UNIT_REFS
-                )
-                .unwrap(),
-                Check::Clean
+                ),
+                (Check::Clean, 1)
             );
         }
     }
@@ -401,11 +639,11 @@ mod tests {
                 target: master.into(),
             })
         );
-        assert_eq!(f.run(Authority::Owner, UNIT_REFS).0, Check::Stale);
+        let complete = f.complete();
         // Checking signs nothing.
         assert_eq!(f.target("refs/rad/sigrefs"), sigrefs);
 
-        resign(&f.storage, f.rid, &f.nid(), &f.signer).unwrap();
+        resign(&f.storage, f.rid, complete, &f.signer).unwrap();
         assert_ne!(f.target("refs/rad/sigrefs"), sigrefs);
         for authority in [Authority::Owner, Authority::None] {
             assert_eq!(f.run(authority, UNIT_REFS).0, Check::Clean);
@@ -433,8 +671,8 @@ mod tests {
                 target: parent.into(),
             })
         );
-        assert_eq!(f.run(Authority::Owner, 1).0, Check::Stale);
-        resign(&f.storage, f.rid, &f.nid(), &f.signer).unwrap();
+        assert!(matches!(f.run(Authority::Owner, 1).0, Check::Stale(_)));
+        resign(&f.storage, f.rid, f.complete(), &f.signer).unwrap();
         assert_eq!(f.run(Authority::None, 1).0, Check::Clean);
     }
 
@@ -456,8 +694,7 @@ mod tests {
                 signed: master.into(),
             })
         );
-        assert_eq!(f.run(Authority::Owner, UNIT_REFS).0, Check::Stale);
-        resign(&f.storage, f.rid, &f.nid(), &f.signer).unwrap();
+        resign(&f.storage, f.rid, f.complete(), &f.signer).unwrap();
         assert_eq!(f.run(Authority::None, UNIT_REFS).0, Check::Clean);
     }
 
@@ -474,8 +711,7 @@ mod tests {
             f.run(Authority::None, UNIT_REFS).0,
             Check::Quarantine(Problem::Unsigned { .. })
         ));
-        assert_eq!(f.run(Authority::Owner, UNIT_REFS).0, Check::Stale);
-        resign(&f.storage, f.rid, &f.nid(), &f.signer).unwrap();
+        resign(&f.storage, f.rid, f.complete(), &f.signer).unwrap();
         assert_eq!(f.run(Authority::None, UNIT_REFS).0, Check::Clean);
     }
 
@@ -528,34 +764,24 @@ mod tests {
         f.set("refs/heads/master", f.other_object());
         let repo = f.repo();
         let nid = f.nid();
-        let first = check(&repo, &nid, Authority::Owner, &Checkpoint::default(), 2).unwrap();
+        let signed = Signed::load(&repo, &nid).unwrap();
+        let first = check(&repo, &signed, Authority::Owner, &Checkpoint::default(), 2).unwrap();
         let Check::Continue(from) = first else {
             panic!("{first:?}")
         };
         assert!(from.stale);
         // The next units find nothing more, but the namespace stays stale.
-        let mut from = from;
-        let end = loop {
-            match check(&repo, &nid, Authority::Owner, &from, 2).unwrap() {
-                Check::Continue(next) => from = next,
-                end => break end,
-            }
-        };
-        assert_eq!(end, Check::Stale);
+        assert!(matches!(
+            run(&repo, &nid, Authority::Owner, from, 2).0,
+            Check::Stale(_)
+        ));
         // A checkpoint past the moved ref doesn't see it: why a checkpoint
         // holds only while the namespace's version is unchanged.
         let clean = Checkpoint {
             after: Some(refname("refs/heads/master")),
             stale: false,
         };
-        let mut from = clean;
-        let end = loop {
-            match check(&repo, &nid, Authority::None, &from, 1).unwrap() {
-                Check::Continue(next) => from = next,
-                end => break end,
-            }
-        };
-        assert_eq!(end, Check::Clean);
+        assert_eq!(run(&repo, &nid, Authority::None, clean, 1).0, Check::Clean);
     }
 
     #[test]
@@ -584,17 +810,98 @@ mod tests {
         let sigrefs = f.target("refs/rad/sigrefs");
         let other = SigningKey::mock(0x01);
         assert!(matches!(
-            resign(&f.storage, f.rid, &f.nid(), &other),
+            resign(&f.storage, f.rid, f.complete(), &other),
             Err(Error::NotOwner { .. })
         ));
         assert_eq!(f.target("refs/rad/sigrefs"), sigrefs);
-        // Nor does the namespace's own key sign another's.
+        // Nor does the namespace's own key sign another's, though a check
+        // under the wrong authority found it stale.
+        let theirs = format!("refs/namespaces/{}/refs/heads/x", other.public_key());
+        let repo = f.repo();
+        repo.backend
+            .reference(&theirs, f.target("refs/heads/master"), true, "test")
+            .unwrap();
+        let (Check::Stale(complete), _) = run(
+            &repo,
+            other.public_key(),
+            Authority::Owner,
+            Checkpoint::default(),
+            UNIT_REFS,
+        ) else {
+            panic!("not stale")
+        };
         assert!(matches!(
-            resign(&f.storage, f.rid, other.public_key(), &f.signer),
+            resign(&f.storage, f.rid, complete, &f.signer),
             Err(Error::NotOwner { .. })
         ));
         let theirs = format!("refs/namespaces/{}/refs/rad/sigrefs", other.public_key());
         assert!(f.repo().backend.find_reference(&theirs).is_err());
+    }
+
+    // Review of heartwood #6, round 1: a stale namespace is re-signed only
+    // once a check has run to its end. Its first unit, which found a stale
+    // ref, gives no proof to re-sign with, and the pass ends quarantined at a
+    // missing object after it.
+    #[test]
+    fn a_namespace_is_re_signed_only_after_a_whole_check() {
+        let f = Fixture::new();
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        f.set("refs/aaa/stale", f.target("refs/heads/master"));
+        write_loose_ref(f.repo().path(), &f.name("refs/zzz/missing"), missing);
+        let repo = f.repo();
+        let signed = Signed::load(&repo, &f.nid()).unwrap();
+        // The first unit: a checkpoint, no proof.
+        let first = check(&repo, &signed, Authority::Owner, &Checkpoint::default(), 1).unwrap();
+        assert!(
+            matches!(&first, Check::Continue(from) if from.stale),
+            "{first:?}"
+        );
+        // The whole pass: quarantined, so nothing to re-sign with.
+        assert_eq!(
+            f.run(Authority::Owner, 1).0,
+            Check::Quarantine(Problem::MissingObject {
+                refname: refname("refs/zzz/missing"),
+                target: Oid::from_str(missing).unwrap(),
+            })
+        );
+    }
+
+    // Review of heartwood #6, round 1: refs that changed after the check
+    // aren't signed.
+    #[test]
+    fn a_namespace_changed_since_its_check_isn_t_signed() {
+        let f = Fixture::new();
+        f.set("refs/heads/topic", f.target("refs/heads/master"));
+        let complete = f.complete();
+        assert_eq!(complete.namespace(), &f.nid());
+        assert_eq!(complete.version(), version(&f.repo(), &f.nid()).unwrap());
+        let sigrefs = f.target("refs/rad/sigrefs");
+        // Since the check, another ref moved.
+        f.set("refs/heads/topic", f.other_object());
+        assert!(matches!(
+            resign(&f.storage, f.rid, complete, &f.signer),
+            Err(Error::Changed { .. })
+        ));
+        assert_eq!(f.target("refs/rad/sigrefs"), sigrefs);
+    }
+
+    // Review of heartwood #6, round 1: a unit that finds `rad/sigrefs` moved
+    // since the pass read the signed refs stops.
+    #[test]
+    fn a_unit_stops_if_the_signed_refs_moved() {
+        let f = Fixture::new();
+        let repo = f.repo();
+        let signed = Signed::load(&repo, &f.nid()).unwrap();
+        f.set("refs/heads/topic", f.target("refs/heads/master"));
+        f.storage
+            .repository_mut(f.rid)
+            .unwrap()
+            .sign_refs(&f.signer)
+            .unwrap();
+        assert!(matches!(
+            check(&repo, &signed, Authority::None, &Checkpoint::default(), 1),
+            Err(Error::Changed { .. })
+        ));
     }
 
     #[test]
@@ -603,5 +910,91 @@ mod tests {
         assert!(fsync_enabled());
         super::super::enable_fsync().unwrap();
         assert!(fsync_enabled());
+    }
+
+    /// Writes `count` refs of the namespace, all at the namespace's
+    /// `refs/heads/master` commit, into the repository's `packed-refs`, as
+    /// `git pack-refs` would.
+    fn pack_refs(f: &Fixture, count: usize) {
+        let master = f.target("refs/heads/master");
+        let mut packed = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+        let mut names = (0..count)
+            .map(|i| f.name(&format!("refs/heads/bulk/{i:06}")))
+            .collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            packed.push_str(&format!("{master} {name}\n"));
+        }
+        std::fs::write(f.repo().path().join("packed-refs"), packed).unwrap();
+    }
+
+    // Review of heartwood #6, round 1: a unit holds no more refs than it
+    // checks, and reads the signed refs not at all. With 100,000 packed refs,
+    // a one-ref unit took 0.15 to 0.3 s in a debug build here (0.07 to 0.14 s
+    // in release), well inside the watchdog's 30 s; the check that loaded and
+    // verified the whole namespace every unit took 2.2 s, and fails this.
+    #[test]
+    fn a_unit_s_work_doesn_t_grow_with_the_namespace() {
+        let f = Fixture::new();
+        pack_refs(&f, 100_000);
+        let repo = f.repo();
+        let nid = f.nid();
+        let signed = Signed::load(&repo, &nid).unwrap();
+        let mut from = Checkpoint::default();
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let unit = check(&repo, &signed, Authority::Owner, &from, 1).unwrap();
+            let took = start.elapsed();
+            eprintln!("a one-ref unit of 100,000 refs took {took:?}");
+            assert!(
+                took < std::time::Duration::from_secs(1),
+                "a one-ref unit took {took:?}"
+            );
+            let Check::Continue(next) = unit else {
+                panic!("{unit:?}")
+            };
+            from = next;
+        }
+    }
+
+    // Review of heartwood #6, round 1: libgit2 yields loose refs before packed
+    // ones, so a later name may sort first. Every unit still takes the next
+    // names in order, and every name is checked once.
+    #[test]
+    fn a_check_visits_every_name_in_order_loose_and_packed() {
+        let f = Fixture::new();
+        pack_refs(&f, 10);
+        // A loose ref sorting after them all, and one before.
+        f.set("refs/zzz/last", f.target("refs/heads/master"));
+        f.set("refs/aaa/first", f.target("refs/heads/master"));
+        let repo = f.repo();
+        let nid = f.nid();
+        let signed = Signed::load(&repo, &nid).unwrap();
+        let mut names = Vec::new();
+        each_name(&repo, &nid, |name| {
+            if name != SIGREFS {
+                names.push(name.to_owned())
+            }
+        })
+        .unwrap();
+        names.extend(signed.refs().unwrap().keys().map(|name| name.to_string()));
+        names.sort();
+        names.dedup();
+
+        let mut from = Checkpoint::default();
+        let mut visited = Vec::new();
+        let end = loop {
+            match check(&repo, &signed, Authority::Owner, &from, 1).unwrap() {
+                Check::Continue(next) => {
+                    visited.push(next.after.as_ref().unwrap().to_string());
+                    from = next;
+                }
+                end => break end,
+            }
+            assert!(visited.len() <= names.len(), "{visited:?}");
+        };
+        assert!(matches!(end, Check::Stale(_)), "{end:?}");
+        // The last unit checks the last name, and returns no checkpoint.
+        assert_eq!(visited, names[..names.len() - 1]);
     }
 }

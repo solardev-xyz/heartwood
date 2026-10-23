@@ -491,15 +491,28 @@ impl Node {
     /// Spawn a node in its own thread.
     pub fn spawn(self) -> NodeHandle {
         let socket = self.home.socket_default();
-        self.spawn_with(Some(socket))
+        self.spawn_with(Some(socket), std::sync::Arc::new(radicle::node::dial::Open))
     }
 
     /// Spawn a node in its own thread, with no control socket: only its handle controls it.
     pub fn spawn_without_control_socket(self) -> NodeHandle {
-        self.spawn_with(None)
+        self.spawn_with(None, std::sync::Arc::new(radicle::node::dial::Open))
     }
 
-    fn spawn_with(self, socket: Option<PathBuf>) -> NodeHandle {
+    /// Spawn a node in its own thread, dialling through `gate`.
+    pub fn spawn_with_gate(
+        self,
+        gate: std::sync::Arc<dyn radicle::node::dial::Gate>,
+    ) -> NodeHandle {
+        let socket = self.home.socket_default();
+        self.spawn_with(Some(socket), gate)
+    }
+
+    fn spawn_with(
+        self,
+        socket: Option<PathBuf>,
+        gate: std::sync::Arc<dyn radicle::node::dial::Gate>,
+    ) -> NodeHandle {
         let alias = self.config.alias.clone();
 
         let listen = vec![(Ipv4Addr::LOCALHOST, 0).into()];
@@ -511,6 +524,7 @@ impl Node {
             listen,
             signals,
             self.secret_key.clone(),
+            gate,
         )
         .unwrap();
 

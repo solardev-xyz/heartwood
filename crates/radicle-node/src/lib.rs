@@ -8,6 +8,7 @@ pub(crate) mod reactor;
 pub mod runtime;
 
 mod control;
+mod resolver;
 mod wire;
 mod worker;
 

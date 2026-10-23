@@ -277,10 +277,25 @@ impl Reactor {
     where
         H: 'static + ReactionHandler,
     {
+        Self::with(|_| Ok(service), thread_name)
+    }
+
+    /// [`Reactor::new`], for a service built with the reactor's [`Controller`]
+    /// in hand: `service` makes it before the reactor's thread starts, so the
+    /// service can hand the controller to threads of its own before any
+    /// event reaches it.
+    pub fn with<H>(
+        service: impl FnOnce(Controller) -> Result<H, io::Error>,
+        thread_name: String,
+    ) -> Result<Self, io::Error>
+    where
+        H: 'static + ReactionHandler,
+    {
         let builder = thread::Builder::new().name(thread_name);
         let (sender, receiver) = unbounded();
         let poll = Poll::new()?;
         let controller = Controller::new(sender, Arc::new(Waker::new(poll.registry(), WAKER)?));
+        let service = service(controller.clone())?;
 
         log::debug!(target: "reactor-controller", "Initializing reactor thread…");
         let thread = builder.spawn(move || {
