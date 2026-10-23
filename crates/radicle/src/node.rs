@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod dial;
 pub mod events;
+pub mod gate;
 pub mod notifications;
 pub mod policy;
 pub mod refs;

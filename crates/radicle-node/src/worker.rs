@@ -14,6 +14,7 @@ use crossbeam_channel as chan;
 use protocol::wire::StreamId;
 use protocol::worker::{AuthorizationError, FetchError, FetchRequest, FetchResult, UploadError};
 use radicle::identity::RepoId;
+use radicle::node::gate::RepoGate;
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
 use radicle::node::policy::config::SeedingPolicy;
@@ -36,6 +37,8 @@ pub struct Config {
     pub policy: SeedingPolicy,
     /// Path to the policies database.
     pub policies_db: PathBuf,
+    /// The repository gate: which repositories may be fetched and served.
+    pub repositories: RepoGate,
 }
 
 /// Task to be accomplished on a worker thread.
@@ -73,6 +76,7 @@ struct Worker {
     notifications: notifications::StoreWriter,
     cache: cob::cache::StoreWriter,
     db: radicle::node::Database,
+    repositories: RepoGate,
 }
 
 impl Worker {
@@ -241,6 +245,11 @@ impl Worker {
     }
 
     fn is_authorized(&self, remote: NodeId, rid: RepoId) -> Result<(), AuthorizationError> {
+        // A repository quarantined for a namespace isn't served.
+        let state = self.repositories.state(&rid);
+        if !state.serves() {
+            return Err(AuthorizationError::Gated(rid, state));
+        }
         let policy = self.policies.seed_policy(&rid)?.policy;
         // Check policy first, since if we're blocking then we likely don't have
         // the repository.
@@ -266,6 +275,16 @@ impl Worker {
         channels: channels::ChannelsFlush,
         notifs: notifications::StoreWriter,
     ) -> Result<protocol::worker::fetch::FetchResult, FetchError> {
+        // The repository gate's pass, held until the fetch and its cache
+        // update are done: closing the repository waits for it.
+        let Some(_pass) = self.repositories.enter(rid) else {
+            return Err(FetchError::Closed {
+                rid,
+                state: self.repositories.state(&rid),
+            });
+        };
+        #[cfg(test)]
+        seams::with_pass(rid);
         let FetchConfig { local, expiry } = &self.fetch_config;
         // N.b. if the `rid` is blocked this will return an error, so
         // we won't continue with any further set up of the fetch.
@@ -332,6 +351,7 @@ impl Pool {
                 notifications: notifications.clone(),
                 cache: cache.clone(),
                 db: db.clone(),
+                repositories: config.repositories.clone(),
             };
             let thread = thread::spawn(&nid, format!("worker#{i}"), || worker.run());
 
@@ -352,5 +372,56 @@ impl Pool {
         log::debug!(target: "pool", "Worker pool shutting down..");
 
         Ok(())
+    }
+}
+
+/// A test-only seam: a fetch held, with its gate pass, until a test releases
+/// it, per repository.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    use radicle::identity::RepoId;
+
+    #[derive(Default)]
+    struct Seams {
+        /// Repositories whose fetches wait, holding their pass.
+        held: HashMap<RepoId, bool>,
+        /// Repositories with a fetch waiting now.
+        waiting: HashMap<RepoId, bool>,
+    }
+
+    static SEAMS: LazyLock<(Mutex<Seams>, Condvar)> = LazyLock::new(Default::default);
+
+    /// Fetches of `rid` wait with their pass, until [`release`].
+    pub fn hold(rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert(rid, true);
+    }
+
+    pub fn release(rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert(rid, false);
+        SEAMS.1.notify_all();
+    }
+
+    /// Whether a fetch of `rid` waits now, with its pass.
+    pub fn waiting(rid: RepoId) -> bool {
+        SEAMS
+            .0
+            .lock()
+            .unwrap()
+            .waiting
+            .get(&rid)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn with_pass(rid: RepoId) {
+        let mut seams = SEAMS.0.lock().unwrap();
+        while seams.held.get(&rid).copied().unwrap_or(false) {
+            seams.waiting.insert(rid, true);
+            seams = SEAMS.1.wait(seams).unwrap();
+        }
+        seams.waiting.insert(rid, false);
     }
 }

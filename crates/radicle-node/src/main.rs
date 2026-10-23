@@ -371,6 +371,7 @@ fn execute(options: Options) -> Result<(), ExecutionError> {
         signals,
         signer,
         std::sync::Arc::new(radicle::node::dial::Open),
+        radicle::node::gate::RepoGate::new(),
     )?
     .run()?;
 

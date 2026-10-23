@@ -30,6 +30,7 @@ use radicle::node::address::Store as _;
 use radicle::node::address::{AddressBook, AddressType, KnownAddress};
 use radicle::node::config::{PeerConfig, RateLimit};
 use radicle::node::dial;
+use radicle::node::gate::{RepoGate, RepoState};
 use radicle::node::refs::Store as _;
 use radicle::node::routing::Store as _;
 use radicle::node::seed;
@@ -114,6 +115,17 @@ pub const CONNECTION_RETRY_DELTA: LocalDuration = LocalDuration::from_mins(10);
 pub const FETCH_TIMEOUT: time::Duration = time::Duration::from_secs(30);
 /// Target number of peers to maintain connections to.
 pub const TARGET_OUTBOUND_PEERS: usize = 8;
+/// Fetches of one repository that may wait for its repair to end.
+pub const MAX_DEFERRED_FETCHES: usize = 64;
+
+/// A fetch of a repository being repaired, run once it opens again.
+#[derive(Debug)]
+struct DeferredFetch {
+    from: NodeId,
+    refs_at: Vec<RefsAt>,
+    config: fetcher::FetchConfig,
+    channel: Option<command::Responder<FetchResult>>,
+}
 
 /// Maximum external address limit imposed by message size limits.
 pub use message::ADDRESS_LIMIT;
@@ -209,6 +221,9 @@ pub enum Error {
     Repository(#[from] radicle::storage::RepositoryError),
     #[error("namespaces error: {0}")]
     Namespaces(Box<NamespacesError>),
+    /// The repository gate holds the repository back.
+    #[error("repository {rid} is {state}")]
+    Gated { rid: RepoId, state: RepoState },
 }
 
 impl From<NamespacesError> for Error {
@@ -381,6 +396,14 @@ pub struct Service<D, S> {
     /// Which addresses the node may connect to, asked of announced
     /// addresses before they enter the address book.
     gate: Arc<dyn dial::Gate>,
+    /// The repository gate: which repositories the node may fetch, announce
+    /// and serve.
+    repositories: RepoGate,
+    /// Fetches of repositories being repaired, run once they open again.
+    deferred_fetches: HashMap<RepoId, Vec<DeferredFetch>>,
+    /// Refs announcements of repositories being repaired, made once they
+    /// open again: the namespaces, and whether any were our own.
+    deferred_announcements: HashMap<RepoId, (BTreeSet<NodeId>, bool)>,
     /// Whether the service has stopped: once it has, it does nothing more.
     stopped: bool,
     /// The error it stopped with, until the node takes it.
@@ -408,6 +431,19 @@ where
     S: WriteStorage + 'static,
 {
     /// Initialize service with current time. Call this once.
+    /// The service, consulting `repositories`, the repository gate, before it
+    /// fetches, announces or serves a repository. Without it, every
+    /// repository is open.
+    pub fn with_repositories(mut self, repositories: RepoGate) -> Self {
+        self.repositories = repositories;
+        self
+    }
+
+    /// The repository gate the service consults.
+    pub fn repositories(&self) -> &RepoGate {
+        &self.repositories
+    }
+
     pub fn initialize(&mut self, time: LocalTime) -> Result<(), Error> {
         debug!(target: "service", "Init @{}", time.as_millis());
         assert_ne!(time, LocalTime::default());
@@ -607,6 +643,9 @@ where
             last_online_at: None, // Updated on initialize.
             emitter,
             gate,
+            repositories: RepoGate::new(),
+            deferred_fetches: HashMap::new(),
+            deferred_announcements: HashMap::new(),
             stopped: false,
             fatal: None,
             listening: vec![],
@@ -1016,7 +1055,117 @@ where
             Command::QueryState(query, sender) => {
                 sender.send(query(self)).ok();
             }
+            Command::Gate(rid, state) => self.gate_changed(rid, state),
         }
+    }
+
+    /// `rid`'s state at the repository gate changed to `state`. Opened, the
+    /// fetches and refs announcement of it that waited run now; quarantined,
+    /// they fail. The inventory follows the repositories it leaves out.
+    fn gate_changed(&mut self, rid: RepoId, state: RepoState) {
+        match state {
+            RepoState::Open => {
+                for deferred in self.deferred_fetches.remove(&rid).unwrap_or_default() {
+                    self.fetch(
+                        rid,
+                        deferred.from,
+                        deferred.refs_at,
+                        deferred.config,
+                        deferred.channel,
+                    );
+                }
+                if let Some((namespaces, own)) = self.deferred_announcements.remove(&rid)
+                    && let Err(e) = self.announce_deferred(rid, namespaces, own)
+                {
+                    warn!(target: "service", "Failed to announce the refs of {rid} once it opened: {e}");
+                }
+            }
+            RepoState::Repairing => {}
+            RepoState::Quarantined(_) => {
+                for deferred in self.deferred_fetches.remove(&rid).unwrap_or_default() {
+                    if let Some(channel) = deferred.channel {
+                        channel
+                            .ok(FetchResult::Failed {
+                                reason: format!("repository {rid} is {state}"),
+                            })
+                            .ok();
+                    }
+                }
+                if !state.announces() {
+                    self.deferred_announcements.remove(&rid);
+                }
+            }
+        }
+        // The inventory leaves out a repository quarantined for a namespace.
+        let inventory = match self.inventory() {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                warn!(target: "service", "Failed to read the inventory: {e}");
+                return;
+            }
+        };
+        if inventory
+            != self
+                .inventory
+                .inventory
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+        {
+            let now = self.timestamp();
+            if let Err(e) = self.refresh_and_announce_inventory(now) {
+                warn!(target: "service", "Failed to announce the inventory: {e}");
+            }
+        }
+    }
+
+    /// Announces the refs of `rid` whose announcement waited for it to open:
+    /// of `namespaces`, as our own if any were.
+    fn announce_deferred(
+        &mut self,
+        rid: RepoId,
+        namespaces: BTreeSet<NodeId>,
+        own: bool,
+    ) -> Result<(), Error> {
+        let Some(doc) = self.storage.get(rid)? else {
+            return Ok(());
+        };
+        if own {
+            self.announce_own_refs(rid, doc, namespaces)?;
+        } else {
+            self.announce_refs(rid, doc, namespaces, false)?;
+        }
+        Ok(())
+    }
+
+    /// Keeps a fetch of `rid`, which is being repaired, to run once it opens.
+    /// Past [`MAX_DEFERRED_FETCHES`] for it, the fetch fails instead.
+    fn defer_fetch(
+        &mut self,
+        rid: RepoId,
+        from: NodeId,
+        refs_at: Vec<RefsAt>,
+        config: fetcher::FetchConfig,
+        channel: Option<command::Responder<FetchResult>>,
+    ) {
+        let deferred = self.deferred_fetches.entry(rid).or_default();
+        if deferred.len() >= MAX_DEFERRED_FETCHES {
+            if let Some(channel) = channel {
+                channel
+                    .ok(FetchResult::Failed {
+                        reason: format!("too many fetches of {rid} wait for its repair"),
+                    })
+                    .ok();
+            }
+            return;
+        }
+        debug!(target: "service", "Deferring the fetch of {rid} from {from} until its repair ends");
+        deferred.push(DeferredFetch {
+            from,
+            refs_at,
+            config,
+            channel,
+        });
     }
 
     /// Initiate an outgoing fetch for some repository, based on another node's announcement.
@@ -1063,6 +1212,21 @@ where
         config: fetcher::FetchConfig,
         channel: Option<command::Responder<FetchResult>>,
     ) {
+        match self.repositories.state(&rid) {
+            RepoState::Open => {}
+            RepoState::Repairing => {
+                return self.defer_fetch(rid, from, refs_at, config, channel);
+            }
+            state @ RepoState::Quarantined(_) => {
+                if let Some(c) = channel {
+                    c.ok(FetchResult::Failed {
+                        reason: format!("repository {rid} is {state}"),
+                    })
+                    .ok();
+                }
+                return;
+            }
+        }
         let session = {
             let reason = format!("peer {from} is not connected; cannot initiate fetch");
             let Some(session) = self.sessions.get_mut(&from) else {
@@ -1143,6 +1307,20 @@ where
                 debug!(target: "service", "Unexpected fetch result for {rid} from {from}");
             }
             fetcher::state::event::Fetched::Completed { from, rid, refs: _ } => {
+                // The repository closed after the fetch was sent to a worker:
+                // being repaired, the fetch waits for it to open again.
+                if let Err(crate::worker::FetchError::Closed { .. }) = &result
+                    && self.repositories.state(&rid) == RepoState::Repairing
+                {
+                    let config = self.fetch_config();
+                    if subscribers.is_empty() {
+                        self.defer_fetch(rid, from, vec![], config, None);
+                    }
+                    for responder in subscribers {
+                        self.defer_fetch(rid, from, vec![], config, Some(responder));
+                    }
+                    return;
+                }
                 // Notify responders
                 let fetch_result = match &result {
                     Ok(success) => FetchResult::Success {
@@ -2154,11 +2332,17 @@ where
     ///
     /// When a repository is unseeded, it is also removed from the inventory. Private repositories
     /// are *not* part of a node's inventory.
+    ///
+    /// A repository the repository gate quarantines for a namespace is left
+    /// out.
     fn inventory(&self) -> Result<HashSet<RepoId>, Error> {
-        self.db
+        let mut inventory = self
+            .db
             .routing()
             .get_inventory(self.nid())
-            .map_err(Error::from)
+            .map_err(Error::from)?;
+        inventory.retain(|rid| self.repositories.state(rid).inventoried());
+        Ok(inventory)
     }
 
     /// Process a peer inventory announcement by updating our routing table.
@@ -2292,6 +2476,16 @@ where
         remotes: impl IntoIterator<Item = NodeId>,
         own: bool,
     ) -> Result<(Vec<RefsAt>, Timestamp), Error> {
+        let state = self.repositories.state(&rid);
+        if !state.announces() {
+            // Being repaired, it is announced once it opens again.
+            if state == RepoState::Repairing {
+                let (namespaces, any_own) = self.deferred_announcements.entry(rid).or_default();
+                namespaces.extend(remotes);
+                *any_own |= own;
+            }
+            return Err(Error::Gated { rid, state });
+        }
         let (ann, refs) = self.refs_announcement_for(rid, remotes)?;
         let timestamp = ann.timestamp();
         let peers = self.sessions.connected().map(|(_, p)| p);
