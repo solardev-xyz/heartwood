@@ -73,8 +73,9 @@ impl<T> From<mpsc::SendError<T>> for Error {
 pub struct Handle {
     pub(crate) home: Home,
 
-    /// Path to the control socket in use. Required for shutdown.
-    pub(crate) socket: PathBuf,
+    /// Path to the control socket in use, if the node has one: shutdown
+    /// stops its listener through it.
+    pub(crate) socket: Option<PathBuf>,
 
     pub(crate) controller: reactor::Controller,
 
@@ -112,7 +113,7 @@ impl Clone for Handle {
 impl Handle {
     pub fn new(
         home: Home,
-        socket: PathBuf,
+        socket: Option<PathBuf>,
         controller: reactor::Controller,
         emitter: Emitter<Event>,
     ) -> Self {
@@ -361,12 +362,15 @@ impl radicle::node::Handle for Handle {
         {
             return Ok(());
         }
-        // Send a shutdown request to our own control socket. This is the only way to kill the
-        // control thread gracefully. Since the control thread may have called this function,
-        // the control socket may already be disconnected. Ignore errors.
-        UnixStream::connect(self.socket)
-            .and_then(|sock| Command::Shutdown.to_writer(sock))
-            .ok();
+        // Send a shutdown request to our own control socket, if there is one. This is the only
+        // way to kill the control thread gracefully. Since the control thread may have called
+        // this function, the control socket may already be disconnected. Ignore errors. A node
+        // without a control socket has no control thread to stop.
+        if let Some(socket) = self.socket {
+            UnixStream::connect(socket)
+                .and_then(|sock| Command::Shutdown.to_writer(sock))
+                .ok();
+        }
 
         self.controller
             .shutdown()

@@ -363,7 +363,7 @@ fn execute(options: Options) -> Result<(), ExecutionError> {
         log::debug!(target: "node", "Removing existing control socket..");
         std::fs::remove_file(&socket).ok();
     }
-    Runtime::init(home, config.node, socket, listen, signals, signer)?.run()?;
+    Runtime::init(home, config.node, Some(socket), listen, signals, signer)?.run()?;
 
     Ok(())
 }
