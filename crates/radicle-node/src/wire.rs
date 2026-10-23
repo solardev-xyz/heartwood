@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 use std::{io, net, time};
 
@@ -38,6 +38,7 @@ use crate::reactor;
 use crate::reactor::{Listener, Transport};
 use crate::reactor::{NoiseSession, ProtocolArtifact, SessionEvent, Socks5Session};
 use crate::reactor::{Token, Tokens};
+use crate::resolver;
 use crate::worker;
 use crate::worker::channels::{ChannelEvent, ChannelsConfig};
 use crate::worker::{Task, TaskResult};
@@ -335,9 +336,8 @@ pub(crate) struct Wire<D, S> {
     tokens: Tokens,
     /// Which addresses the node may dial, and how names resolve.
     gate: Arc<dyn Gate>,
-    /// How a resolver thread hands its answer back to the reactor. Set once the
-    /// reactor exists; until then, a name can't be resolved.
-    controller: Arc<OnceLock<reactor::Controller>>,
+    /// The resolver pool's queue.
+    resolvers: resolver::Resolvers,
     /// Dials waiting for their name to resolve, by resolution.
     resolving: HashMap<u64, Resolving>,
     /// The next resolution's ID.
@@ -354,7 +354,7 @@ where
         worker: chan::Sender<Task>,
         secret_key: crypto::SigningKey,
         gate: Arc<dyn Gate>,
-        controller: Arc<OnceLock<reactor::Controller>>,
+        resolvers: resolver::Resolvers,
     ) -> Self {
         assert!(service.started().is_some(), "Service must be initialized");
 
@@ -370,7 +370,7 @@ where
             peers: Peers(RandomMap::default()),
             tokens: Tokens::default(),
             gate,
-            controller,
+            resolvers,
             resolving: HashMap::new(),
             next_resolution: 0,
         }
@@ -508,28 +508,27 @@ where
     /// `nid` at `addr` once the answer is back, or fails the dial at the
     /// deadline. The reactor never waits on a resolver.
     fn resolve(&mut self, nid: NodeId, addr: Address, host: String, port: u16) {
-        let Some(controller) = self.controller.get().cloned() else {
+        let id = self.next_resolution;
+        self.next_resolution += 1;
+        let timeout = self.gate.resolve_timeout();
+        let deadline = Instant::now().checked_add(timeout);
+        let job = resolver::Job {
+            id,
+            host,
+            port,
+            deadline,
+        };
+        if self.resolvers.submit(job).is_err() {
+            // Every resolver is busy and the queue is full: fail at once.
             return self.dial_failed(
                 nid,
                 &addr,
-                io::Error::other("names can't be resolved before the reactor runs"),
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "too many names are being resolved",
+                ),
             );
-        };
-        let id = self.next_resolution;
-        self.next_resolution += 1;
-        let gate = self.gate.clone();
-        let spawned = std::thread::Builder::new()
-            .name("resolver".to_owned())
-            .spawn(move || {
-                let answers = gate.resolve(&host, port);
-                // The reactor may have stopped, or the dial expired: nothing to tell then.
-                controller.cmd(Control::Resolved { id, answers }).ok();
-            });
-        if let Err(err) = spawned {
-            return self.dial_failed(nid, &addr, err);
         }
-        let timeout = self.gate.resolve_timeout();
-        let deadline = Instant::now().checked_add(timeout);
         self.resolving.insert(
             id,
             Resolving {
@@ -544,18 +543,34 @@ where
     }
 
     /// A resolution's answer: the dial goes on to a checked address, or fails.
+    /// An answer that comes after its dial's deadline fails it, whenever the
+    /// reactor gets to it.
     fn resolved(&mut self, id: u64, answers: io::Result<Vec<net::SocketAddr>>) {
         // Expired, and failed already.
-        let Some(Resolving { nid, addr, .. }) = self.resolving.remove(&id) else {
+        let Some(Resolving {
+            nid,
+            addr,
+            deadline,
+        }) = self.resolving.remove(&id)
+        else {
             return;
         };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return self.dial_failed(
+                nid,
+                &addr,
+                io::Error::new(io::ErrorKind::TimedOut, "name resolution timed out"),
+            );
+        }
         match checked(&addr, answers, self.service.config(), self.gate.as_ref()) {
             Ok(route) => self.connect(nid, addr, route),
             Err(err) => self.dial_failed(nid, &addr, err),
         }
     }
 
-    /// Fails the dials whose names haven't resolved by `now`.
+    /// Fails the dials whose names haven't resolved by `now`, and asks to be
+    /// woken again at the next deadline still ahead: a timer can fire before
+    /// the deadline it was set for.
     fn expire_resolutions(&mut self, now: Instant) {
         let expired = self
             .resolving
@@ -571,6 +586,11 @@ where
                     io::Error::new(io::ErrorKind::TimedOut, "name resolution timed out"),
                 );
             }
+        }
+        if let Some(next) = self.resolving.values().filter_map(|r| r.deadline).min() {
+            self.actions.push_back(reactor::Action::SetTimer(
+                next.saturating_duration_since(now) + time::Duration::from_millis(1),
+            ));
         }
     }
 
@@ -1330,7 +1350,16 @@ fn checked(
         .find(|addr| gate.allows(target, addr))
         .ok_or_else(|| refused(format!("every address {target} resolved to")))?;
 
-    Ok(through(addr, config.proxy))
+    Ok(match &target.host {
+        HostName::Dns(_) => through(addr, config.proxy),
+        // An onion or I2P name forwarded without a proxy, as the node always
+        // has: to the address its name resolves to, which a forwarder there
+        // is asked for the name.
+        host => Route::Connect {
+            connect: addr,
+            socks: Some(NetAddr::new(host.clone(), target.port)),
+        },
+    })
 }
 
 /// Establish a new outgoing connection, along `route`, which must be a
@@ -1654,6 +1683,49 @@ mod test {
         }
     }
 
+    // Review of heartwood #4, round 1: with `Open`, an onion or I2P name
+    // forwarded without a proxy takes exactly the route it always has: its
+    // name is resolved, and the address it resolves to is asked for the name
+    // over SOCKS, byte for byte as before.
+    #[test]
+    fn a_forwarded_name_keeps_its_socks_handshake_under_open() {
+        let open = radicle::node::dial::Open;
+        let resolved: net::SocketAddr = (ALLOWED, 9050).into();
+        let mut config = config(false);
+        config.onion = AddressConfig::Forward;
+        config.i2p = AddressConfig::Forward;
+        for name in [
+            "xmrhfasfg5suueegrnc4gsgyi2tyclcy5oz7f5drnrodmdtob6t2ioyd.onion:8776",
+            "f2atcc7udeub5kh4nkljtjwyk7ikjviorufzgwnfwhkphljl3vhq.b32.i2p:8776",
+        ] {
+            let target = address(name);
+            let host = match route(&target, &config, &open).unwrap() {
+                Route::Resolve { host, port } => {
+                    assert_eq!(port, 8776);
+                    host
+                }
+                other => panic!("{name}: unexpected route {other:?}"),
+            };
+            assert_eq!(format!("{host}:8776"), name);
+            let Route::Connect { connect, socks } =
+                checked(&target, Ok(vec![resolved]), &config, &open).unwrap()
+            else {
+                panic!("{name}: not a connection");
+            };
+            assert_eq!(connect, resolved);
+            // What the node always sent: SOCKS to the resolved address, for
+            // the name.
+            let before = socks5::Socks5::with((*target).clone(), false)
+                .advance(&[])
+                .unwrap();
+            let after = socks5::Socks5::with(socks.expect("SOCKS"), true)
+                .advance(&[])
+                .unwrap();
+            assert_eq!(before, vec![5, 1, 0]);
+            assert_eq!(after, before, "{name}");
+        }
+    }
+
     #[test]
     fn an_onion_name_goes_to_its_proxy_as_the_name() {
         let onion = "xmrhfasfg5suueegrnc4gsgyi2tyclcy5oz7f5drnrodmdtob6t2ioyd.onion:8776";
@@ -1837,7 +1909,7 @@ mod test {
             worker_tx,
             crypto::SigningKey::mock(100),
             Arc::new(radicle::node::dial::Open),
-            Arc::default(),
+            resolver::Resolvers::closed(),
         );
 
         (wire, rid, bob_id, bob_addr)

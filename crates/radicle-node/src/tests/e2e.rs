@@ -2385,3 +2385,247 @@ fn test_dial_a_resolver_that_hangs_fails_its_dial_only() {
         "a late answer connected"
     );
 }
+
+/// A gate whose resolver waits until it is released, counting the calls in
+/// it, and then answers `answers`; it allows everything.
+#[derive(Debug)]
+struct HeldGate {
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    answers: Vec<std::net::SocketAddr>,
+}
+
+impl HeldGate {
+    fn new(answers: Vec<std::net::SocketAddr>) -> Self {
+        Self {
+            active: Default::default(),
+            release: Default::default(),
+            answers,
+        }
+    }
+
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+
+    /// Waits until exactly `count` calls are in the resolver.
+    fn wait_for(&self, count: usize) {
+        let until = time::Instant::now() + time::Duration::from_secs(5);
+        while self.active.load(std::sync::atomic::Ordering::SeqCst) != count {
+            assert!(
+                time::Instant::now() < until,
+                "{} calls in the resolver, not {count}",
+                self.active.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            thread::sleep(time::Duration::from_millis(5));
+        }
+    }
+}
+
+impl radicle::node::dial::Gate for HeldGate {
+    fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+        true
+    }
+
+    fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        self.active.fetch_add(1, SeqCst);
+        let (lock, changed) = &*self.release;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+        drop(released);
+        self.active.fetch_sub(1, SeqCst);
+        Ok(self.answers.clone())
+    }
+
+    fn resolve_timeout(&self) -> time::Duration {
+        time::Duration::from_millis(200)
+    }
+}
+
+#[test]
+// Review of heartwood #4, round 1: resolutions are bounded by the pool, as
+// many at once as the node may dial and at most four, even when their dials
+// have given up, and a shutdown doesn't wait on a resolver for long.
+fn test_dial_resolutions_are_bounded_by_the_pool() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gate = std::sync::Arc::new(HeldGate::new(vec![]));
+    let mut cfg = config::relay("alice");
+    cfg.limits.connection.outbound = 2.into();
+    let alice = Node::init(tmp.path(), cfg, 13).spawn_with_gate(gate.clone());
+    let events = alice.handle.events();
+    for wave in 0..2u8 {
+        for i in 0..8u8 {
+            let key = SigningKey::from_seed(radicle::crypto::Seed::new([40 + wave * 8 + i; 32]));
+            alice
+                .handle
+                .command(service::Command::Connect(
+                    *key.public_key(),
+                    format!("node-{wave}-{i}.test:8776").parse().unwrap(),
+                    ConnectOptions {
+                        persistent: false,
+                        timeout: time::Duration::from_secs(2),
+                    },
+                ))
+                .unwrap();
+        }
+        // Two resolvers, both held; two more queued; the other four refused
+        // at once, for want of room.
+        gate.wait_for(2);
+        let mut refused = 0;
+        while refused < 4 {
+            let reason = events
+                .wait(
+                    |e| match e {
+                        Event::PeerDisconnected { reason, .. } => Some(reason.clone()),
+                        _ => None,
+                    },
+                    time::Duration::from_secs(2),
+                )
+                .expect("the dials beyond the queue are refused");
+            refused += usize::from(reason.contains("too many names are being resolved"));
+        }
+        thread::sleep(time::Duration::from_millis(500));
+        gate.wait_for(2);
+    }
+
+    // A shutdown with both resolvers still held returns all the same, soon.
+    let started = time::Instant::now();
+    alice.shutdown();
+    assert!(
+        started.elapsed() < time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    gate.release();
+    gate.wait_for(0);
+}
+
+#[test]
+// Review of heartwood #4, round 1: an answer that comes after its dial's
+// deadline isn't dialled, however long the reactor was busy before it got
+// to it.
+fn test_dial_a_late_answer_fails_however_busy_the_reactor_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bob = Node::init(tmp.path(), config::relay("bob"), 37).spawn();
+    let gate = std::sync::Arc::new(HeldGate::new(vec![bob.addr]));
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13).spawn_with_gate(gate.clone());
+
+    let mut handle = alice.handle.clone();
+    let (nid, addr) = (bob.id, by_name(&bob));
+    let connecting = thread::spawn(move || {
+        handle
+            .connect(
+                nid,
+                addr,
+                ConnectOptions {
+                    persistent: false,
+                    timeout: time::Duration::from_secs(5),
+                },
+            )
+            .unwrap()
+    });
+    gate.wait_for(1);
+    // The reactor is kept busy for 700 ms; the answer comes 350 ms in, past
+    // its 200 ms deadline, while it is.
+    let (entered, entering) = std::sync::mpsc::sync_channel(1);
+    let busy: std::sync::Arc<service::QueryState> = std::sync::Arc::new(move |_| {
+        entered.send(()).ok();
+        thread::sleep(time::Duration::from_millis(700));
+        Ok(())
+    });
+    let (answered, _) = std::sync::mpsc::sync_channel(1);
+    alice
+        .handle
+        .command(service::Command::QueryState(busy, answered))
+        .unwrap();
+    entering.recv_timeout(time::Duration::from_secs(2)).unwrap();
+    thread::sleep(time::Duration::from_millis(350));
+    gate.release();
+
+    let result = connecting.join().unwrap();
+    assert!(
+        matches!(result, ConnectResult::Disconnected { .. }),
+        "a late answer was dialled: {result:?}"
+    );
+}
+
+#[test]
+// Review of heartwood #4, round 1: a dial's deadline holds when the reactor
+// is busy as it starts: a timer that fires early is set again.
+fn test_dial_its_deadline_holds_after_a_busy_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bob = Node::init(tmp.path(), config::relay("bob"), 37).spawn();
+    let gate = std::sync::Arc::new(HeldGate::new(vec![]));
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13).spawn_with_gate(gate.clone());
+    let events = alice.handle.events();
+
+    // A 350 ms command, then the dial, in the same reactor turn.
+    let (entered, entering) = std::sync::mpsc::sync_channel(1);
+    let busy: std::sync::Arc<service::QueryState> = std::sync::Arc::new(move |_| {
+        entered.send(()).ok();
+        thread::sleep(time::Duration::from_millis(350));
+        Ok(())
+    });
+    let (answered, _) = std::sync::mpsc::sync_channel(1);
+    alice
+        .handle
+        .command(service::Command::QueryState(busy, answered))
+        .unwrap();
+    entering.recv_timeout(time::Duration::from_secs(2)).unwrap();
+    alice
+        .handle
+        .command(service::Command::Connect(
+            bob.id,
+            by_name(&bob),
+            ConnectOptions {
+                persistent: false,
+                timeout: time::Duration::from_secs(2),
+            },
+        ))
+        .unwrap();
+    gate.wait_for(1);
+
+    let timed_out = events.wait(
+        |e| matches!(e, Event::PeerDisconnected { nid, .. } if *nid == bob.id).then_some(()),
+        time::Duration::from_millis(650),
+    );
+    gate.release();
+    gate.wait_for(0);
+    assert!(timed_out.is_ok(), "the dial's deadline was lost");
+}
+
+#[test]
+// Review of heartwood #4, round 1: a peer configured by name is resolved at
+// start like any other, not refused because the resolvers weren't ready.
+fn test_dial_a_configured_peer_by_name_at_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bob = Node::init(tmp.path(), config::relay("bob"), 37).spawn();
+    let mut alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    alice.config.connect = [radicle::node::config::ConnectAddress::from((
+        bob.id,
+        by_name(&bob),
+    ))]
+    .into_iter()
+    .collect();
+    let alice = alice.spawn_with_gate(std::sync::Arc::new(test_gate(&bob, true)));
+
+    let events = alice.handle.events();
+    let connected = alice
+        .handle
+        .sessions()
+        .unwrap()
+        .iter()
+        .any(|s| s.nid == bob.id && s.state.is_connected())
+        || events
+            .wait(
+                |e| matches!(e, Event::PeerConnected { nid } if *nid == bob.id).then_some(()),
+                time::Duration::from_secs(10),
+            )
+            .is_ok();
+    assert!(connected, "alice never connected to bob by name");
+}
