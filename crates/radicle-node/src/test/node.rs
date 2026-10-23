@@ -1,7 +1,7 @@
 use std::io::BufRead as _;
 use std::mem::ManuallyDrop;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -470,6 +470,16 @@ impl Node {
 impl Node {
     /// Spawn a node in its own thread.
     pub fn spawn(self) -> NodeHandle {
+        let socket = self.home.socket_default();
+        self.spawn_with(Some(socket))
+    }
+
+    /// Spawn a node in its own thread, with no control socket: only its handle controls it.
+    pub fn spawn_without_control_socket(self) -> NodeHandle {
+        self.spawn_with(None)
+    }
+
+    fn spawn_with(self, socket: Option<PathBuf>) -> NodeHandle {
         let alias = self.config.alias.clone();
 
         let listen = vec![(Ipv4Addr::LOCALHOST, 0).into()];
@@ -477,7 +487,7 @@ impl Node {
         let rt = Runtime::init(
             self.home.clone(),
             self.config,
-            self.home.socket_default(),
+            socket,
             listen,
             signals,
             self.secret_key.clone(),

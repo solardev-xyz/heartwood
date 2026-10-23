@@ -73,6 +73,37 @@ fn test_inventory_sync_basic() {
 
 #[test]
 //
+//     alice -- bob, bob with no control socket
+//
+fn test_node_without_control_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+
+    alice.project("alice", "");
+    bob.project("bob", "");
+
+    let socket = bob.home.socket_default();
+    let mut alice = alice.spawn();
+    let bob = bob.spawn_without_control_socket();
+
+    // Nothing listens for control commands on bob's home.
+    assert!(!socket.exists());
+
+    // Its handle controls it, and it syncs as any node does.
+    alice.connect(&bob);
+    let routes = converge([&alice, &bob]);
+    assert_eq!(routes.len(), 2);
+
+    // And it shuts down through its handle alone: dropping the handle shuts
+    // the node down and joins its thread.
+    bob.shutdown();
+    assert!(!socket.exists());
+}
+
+#[test]
+//
 //     alice -- bob -- eve
 //
 fn test_inventory_sync_bridge() {

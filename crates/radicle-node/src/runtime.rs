@@ -107,7 +107,8 @@ pub enum ControlSocket {
 pub struct Runtime {
     pub id: NodeId,
     pub home: Home,
-    pub control: ControlSocket,
+    /// The control socket, unless the host runs the node without one.
+    pub control: Option<ControlSocket>,
     pub handle: Handle,
     pub storage: Storage,
     pub reactor: Reactor,
@@ -119,11 +120,16 @@ pub struct Runtime {
 impl Runtime {
     /// Initialize the runtime.
     ///
+    /// With `socket`, the node listens for control commands there (the `rad`
+    /// CLI's connection); without it, the node has no control socket at all,
+    /// and only its [`Handle`] controls it: an embedding host that drives the
+    /// node in-process needs no socket on disk.
+    ///
     /// This function spawns threads.
     pub fn init(
         home: Home,
         config: radicle::node::Config,
-        socket: PathBuf,
+        socket: Option<PathBuf>,
         listen: Vec<net::SocketAddr>,
         signals: mpsc::Receiver<Signal>,
         secret_key: SigningKey,
@@ -246,7 +252,7 @@ impl Runtime {
                 policies_db: home.node().join(node::POLICIES_DB_FILE),
             },
         )?;
-        let control = Self::bind(socket)?;
+        let control = socket.map(Self::bind).transpose()?;
 
         Ok(Runtime {
             id,
@@ -264,16 +270,19 @@ impl Runtime {
     pub fn run(self) -> Result<(), Error> {
         let home = self.home;
         let (listener, remove) = match self.control {
-            ControlSocket::Bound(listener, path) => (listener, Some(path)),
-            ControlSocket::Received(listener) => (listener, None),
+            Some(ControlSocket::Bound(listener, path)) => (Some(listener), Some(path)),
+            Some(ControlSocket::Received(listener)) => (Some(listener), None),
+            None => (None, None),
         };
 
         log::info!(target: "node", "Running node {} in {}..", self.id, home.path().display());
 
-        thread::spawn(&self.id, "control", {
-            let handle = self.handle.clone();
-            || control::listen(listener, handle)
-        });
+        if let Some(listener) = listener {
+            thread::spawn(&self.id, "control", {
+                let handle = self.handle.clone();
+                || control::listen(listener, handle)
+            });
+        }
 
         let _signals = thread::spawn(&self.id, "signals", move || {
             loop {
