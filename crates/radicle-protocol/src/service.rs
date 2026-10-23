@@ -29,6 +29,7 @@ use radicle::node::address;
 use radicle::node::address::Store as _;
 use radicle::node::address::{AddressBook, AddressType, KnownAddress};
 use radicle::node::config::{PeerConfig, RateLimit};
+use radicle::node::dial;
 use radicle::node::refs::Store as _;
 use radicle::node::routing::Store as _;
 use radicle::node::seed;
@@ -377,6 +378,9 @@ pub struct Service<D, S> {
     last_online_at: Option<LocalTime>,
     /// Publishes events to subscribers.
     emitter: Emitter<Event>,
+    /// Which addresses the node may connect to, asked of announced
+    /// addresses before they enter the address book.
+    gate: Arc<dyn dial::Gate>,
     /// Whether the service has stopped: once it has, it does nothing more.
     stopped: bool,
     /// The error it stopped with, until the node takes it.
@@ -559,6 +563,7 @@ where
         rng: Rng,
         node: NodeAnnouncement,
         emitter: Emitter<Event>,
+        gate: Arc<dyn dial::Gate>,
     ) -> Self {
         let sessions = Sessions::new(rng.clone());
         let limiter = RateLimiter::new(config.peers());
@@ -601,6 +606,7 @@ where
             started_at: None,     // Updated on initialize.
             last_online_at: None, // Updated on initialize.
             emitter,
+            gate,
             stopped: false,
             fatal: None,
             listening: vec![],
@@ -1488,7 +1494,8 @@ where
                     }
                 }
                 DisconnectReason::Session(e) => e.severity(),
-                DisconnectReason::Command
+                DisconnectReason::Local(_)
+                | DisconnectReason::Command
                 | DisconnectReason::Conflict
                 | DisconnectReason::Policy
                 | DisconnectReason::SelfConnection => Severity::Low,
@@ -1804,6 +1811,7 @@ where
                     return Ok(relay);
                 }
 
+                let gate = self.gate.clone();
                 match self.db.addresses_mut().insert(
                     announcer,
                     ann.version,
@@ -1817,6 +1825,12 @@ where
                         // Ignore non-routable addresses unless received from a local network
                         // peer. This allows the node to function in a local network.
                         .filter(|a| a.is_routable() || relayer_addr.is_local())
+                        // An IP address the node may not dial isn't kept. A name is checked
+                        // when it is dialled, on every address it resolves to.
+                        .filter(|a| match a.host {
+                            HostName::Ip(ip) => gate.allows(a, &net::SocketAddr::new(ip, a.port)),
+                            _ => true,
+                        })
                         .map(|a| KnownAddress::new(a.clone(), address::Source::Peer)),
                 ) {
                     Ok(updated) => {
@@ -2896,6 +2910,10 @@ pub enum DisconnectReason {
     /// Error while dialing the remote. This error occurs before a connection is
     /// even established. Errors of this kind are usually not transient.
     Dial(Arc<dyn std::error::Error + Sync + Send>),
+    /// The dial failed before the remote was tried, for a reason of this
+    /// node's own: no resolver was free to resolve its name in time. It
+    /// counts against nothing of the remote's.
+    Local(Arc<dyn std::error::Error + Sync + Send>),
     /// Error with an underlying established connection. Sometimes, reconnecting
     /// after such an error is possible.
     Connection(Arc<dyn std::error::Error + Sync + Send>),
@@ -2933,6 +2951,7 @@ impl fmt::Display for DisconnectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Dial(err) => write!(f, "{err}"),
+            Self::Local(err) => write!(f, "{err}"),
             Self::Connection(err) => write!(f, "{err}"),
             Self::Command => write!(f, "command"),
             Self::SelfConnection => write!(f, "self-connection"),

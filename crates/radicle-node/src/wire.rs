@@ -1,6 +1,7 @@
 //! Implementation of the transport protocol.
 //!
 //! We use the Noise XK handshake pattern to establish an encrypted stream with a remote peer.
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
@@ -25,16 +26,19 @@ use protocol::wire::*;
 use protocol::worker::{FetchRequest, FetchResult};
 use radicle::collections::{RandomMap, RandomSet};
 use radicle::crypto::{self, Signer as _};
+use radicle::node::Address;
 use radicle::node::Link;
 use radicle::node::NodeId;
 #[cfg(any(feature = "i2p", feature = "tor"))]
 use radicle::node::config::AddressConfig;
+use radicle::node::dial::Gate;
 use radicle::storage::WriteStorage;
 
 use crate::reactor;
 use crate::reactor::{Listener, Transport};
 use crate::reactor::{NoiseSession, ProtocolArtifact, SessionEvent, Socks5Session};
 use crate::reactor::{Token, Tokens};
+use crate::resolver;
 use crate::worker;
 use crate::worker::channels::{ChannelEvent, ChannelsConfig};
 use crate::worker::{Task, TaskResult};
@@ -61,6 +65,37 @@ pub enum Control {
     Worker(TaskResult),
     /// Flush data in the given stream to the remote.
     Flush { remote: NodeId, stream: StreamId },
+    /// The addresses a dial's name resolved to, from its resolver thread,
+    /// and when its lookup finished.
+    Resolved {
+        id: u64,
+        answers: io::Result<Vec<net::SocketAddr>>,
+        finished: Instant,
+    },
+}
+
+/// A dial waiting for its name to resolve.
+#[derive(Debug)]
+struct Resolving {
+    nid: NodeId,
+    addr: Address,
+    /// `None` for a timeout too large to add to the current time.
+    deadline: Option<Instant>,
+    /// Who has its name: no one yet, a worker, or the reactor.
+    claim: Arc<resolver::Claim>,
+}
+
+/// Why a dial failed, and whose failure it was. Only the remote's counts
+/// against the peer.
+#[derive(Debug)]
+enum DialFailure {
+    /// This node's own: its policy refused the address, it had no resolver
+    /// free, or it didn't get to a timely answer in time. The peer may never
+    /// have been tried.
+    Local(io::Error),
+    /// The peer's: its name didn't resolve, or resolved too slowly, or its
+    /// address couldn't be reached.
+    Remote(io::Error),
 }
 
 /// Peer session type.
@@ -320,6 +355,14 @@ pub(crate) struct Wire<D, S> {
     peers: Peers,
     /// A (practically) infinite source of tokens to identify transports and listeners.
     tokens: Tokens,
+    /// Which addresses the node may dial, and how names resolve.
+    gate: Arc<dyn Gate>,
+    /// The resolver pool's queue.
+    resolvers: resolver::Resolvers,
+    /// Dials waiting for their name to resolve, by resolution.
+    resolving: HashMap<u64, Resolving>,
+    /// The next resolution's ID.
+    next_resolution: u64,
     /// The error the service stopped the node with, once it has.
     stopped: Stopped,
 }
@@ -333,6 +376,8 @@ where
         service: Service<D, S>,
         worker: chan::Sender<Task>,
         secret_key: crypto::SigningKey,
+        gate: Arc<dyn Gate>,
+        resolvers: resolver::Resolvers,
         stopped: Stopped,
     ) -> Self {
         assert!(service.started().is_some(), "Service must be initialized");
@@ -348,6 +393,10 @@ where
             listening: RandomMap::default(),
             peers: Peers(RandomMap::default()),
             tokens: Tokens::default(),
+            gate,
+            resolvers,
+            resolving: HashMap::new(),
+            next_resolution: 0,
             stopped,
         }
     }
@@ -449,6 +498,183 @@ where
         }
     }
 
+    /// Opens the outbound connection `route` names, for `nid` at `addr`.
+    fn connect(&mut self, nid: NodeId, addr: Address, route: Route) {
+        if !matches!(route, Route::Connect { .. }) {
+            let err = io::Error::other("a dial needs a resolved route");
+            return self.dial_failed(nid, &addr, DialFailure::Local(err));
+        }
+        match dial(route, nid, self.secret_key.clone())
+            .and_then(Transport::<WireSession>::with_session)
+        {
+            Ok(transport) => {
+                let token = self.tokens.advance();
+                self.outbound.insert(
+                    token,
+                    Outbound {
+                        token,
+                        nid,
+                        addr: (*addr).clone(),
+                    },
+                );
+                log::debug!(target: "wire", "Registering outbound transport for {nid}..");
+                self.actions
+                    .push_back(reactor::Action::RegisterTransport(token, transport));
+            }
+            Err(err) => self.dial_failed(nid, &addr, DialFailure::Remote(err)),
+        }
+    }
+
+    /// Fails the dial of `nid` at `addr`: only a remote failure is held
+    /// against the peer.
+    fn dial_failed(&mut self, nid: NodeId, addr: &Address, failure: DialFailure) {
+        let reason = match failure {
+            DialFailure::Local(err) => {
+                logger::establish_connection(addr, &err);
+                DisconnectReason::Local(Arc::new(err))
+            }
+            DialFailure::Remote(err) => {
+                logger::establish_connection(addr, &err);
+                DisconnectReason::Dial(Arc::new(err))
+            }
+        };
+        self.service.disconnected(nid, Link::Outbound, &reason);
+    }
+
+    /// Resolves `host` on a thread of its own, through the gate, and dials
+    /// `nid` at `addr` once the answer is back, or fails the dial at the
+    /// deadline. The reactor never waits on a resolver.
+    fn resolve(&mut self, nid: NodeId, addr: Address, host: String, port: u16) {
+        let id = self.next_resolution;
+        self.next_resolution += 1;
+        let timeout = self.gate.resolve_timeout();
+        let deadline = Instant::now().checked_add(timeout);
+        let claim = Arc::new(resolver::Claim::default());
+        let job = resolver::Job {
+            id,
+            host,
+            port,
+            deadline,
+            claim: claim.clone(),
+        };
+        if self.resolvers.submit(job).is_err() {
+            // Every resolver is busy and the queue is full: fail at once, as
+            // this node's own failure.
+            let err = io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many names are being resolved",
+            );
+            return self.dial_failed(nid, &addr, DialFailure::Local(err));
+        }
+        self.resolving.insert(
+            id,
+            Resolving {
+                nid,
+                addr,
+                deadline,
+                claim,
+            },
+        );
+        if deadline.is_some() {
+            self.actions.push_back(reactor::Action::SetTimer(timeout));
+        }
+    }
+
+    /// A resolution's answer, and when its lookup `finished`: the dial goes
+    /// on to a checked address, or fails.
+    ///
+    /// An answer the reactor gets to after its dial's deadline fails it,
+    /// however long the reactor took. Whose failure that is depends on when
+    /// the lookup finished: one that answered in time, but waited for the
+    /// reactor, is this node's; one that finished late, or failed, is the
+    /// peer's.
+    fn resolved(&mut self, id: u64, answers: io::Result<Vec<net::SocketAddr>>, finished: Instant) {
+        // Expired, and failed already.
+        let Some(Resolving {
+            nid,
+            addr,
+            deadline,
+            ..
+        }) = self.resolving.remove(&id)
+        else {
+            return;
+        };
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            let failure = if answers.is_ok() && finished < deadline {
+                DialFailure::Local(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "name resolution timed out: its answer came in time, \
+                     but waited on this node past the deadline",
+                ))
+            } else {
+                DialFailure::Remote(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "name resolution timed out",
+                ))
+            };
+            return self.dial_failed(nid, &addr, failure);
+        }
+        match checked(&addr, answers, self.service.config(), self.gate.as_ref()) {
+            Ok(route) => self.connect(nid, addr, route),
+            Err(failure) => self.dial_failed(nid, &addr, failure),
+        }
+    }
+
+    /// Fails the dials whose names haven't resolved by `now`, and asks to be
+    /// woken again at the next deadline still ahead: a timer can fire before
+    /// the deadline it was set for.
+    ///
+    /// A name no worker has taken is expired, so none will: this node's
+    /// failure. One a worker is still resolving is the peer's: it is too
+    /// slow. One whose lookup has finished has its answer on the way, and
+    /// [`Wire::resolved`] judges it by when it finished.
+    fn expire_resolutions(&mut self, now: Instant) {
+        let expired = self
+            .resolving
+            .iter()
+            .filter(|(_, r)| r.deadline.is_some_and(|deadline| deadline <= now))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in expired {
+            let Some(resolving) = self.resolving.get(&id) else {
+                continue;
+            };
+            let failure = if resolving.claim.expire() {
+                // No worker was free before the deadline: the name was never
+                // tried, and now no worker will try it.
+                DialFailure::Local(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no resolver was free before the dial's deadline",
+                ))
+            } else if resolving.claim.finished().is_some() {
+                // Its lookup has finished: its answer, on its way, decides.
+                continue;
+            } else {
+                // A worker is resolving the name, and it is too slow.
+                DialFailure::Remote(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "name resolution timed out",
+                ))
+            };
+            if let Some(Resolving { nid, addr, .. }) = self.resolving.remove(&id) {
+                self.dial_failed(nid, &addr, failure);
+            }
+        }
+        if let Some(next) = self
+            .resolving
+            .values()
+            .filter(|r| r.claim.finished().is_none())
+            .filter_map(|r| r.deadline)
+            .min()
+        {
+            self.actions.push_back(reactor::Action::SetTimer(
+                next.saturating_duration_since(now) + time::Duration::from_millis(1),
+            ));
+        }
+    }
+
     fn flush(&mut self, remote: NodeId, stream: StreamId) {
         let Some((fd, peer)) = self.peers.lookup_mut(&remote) else {
             log::debug!(target: "wire", "Peer {remote} is not known; ignoring flush");
@@ -535,6 +761,7 @@ where
     }
 
     fn timer_reacted(&mut self) {
+        self.expire_resolutions(Instant::now());
         self.service.wake();
     }
 
@@ -849,6 +1076,11 @@ where
             Control::User(cmd) => self.service.command(cmd),
             Control::Worker(result) => self.worker_result(result),
             Control::Flush { remote, stream } => self.flush(remote, stream),
+            Control::Resolved {
+                id,
+                answers,
+                finished,
+            } => self.resolved(id, answers, finished),
         }
     }
 
@@ -985,40 +1217,14 @@ where
                     self.service.attempted(node_id, addr.clone());
                     self.metrics.peer(node_id).outbound_connection_attempts += 1;
 
-                    match dial(
-                        (*addr).clone(),
-                        node_id,
-                        self.secret_key.clone(),
-                        self.service.config(),
-                    )
-                    .and_then(Transport::<WireSession>::with_session)
-                    {
-                        Ok(transport) => {
-                            let token = self.tokens.advance();
-                            self.outbound.insert(
-                                token,
-                                Outbound {
-                                    token,
-                                    nid: node_id,
-                                    addr: (*addr).clone(),
-                                },
-                            );
-                            log::debug!(
-                                target: "wire",
-                                "Registering outbound transport for {node_id}.."
-                            );
-                            self.actions
-                                .push_back(reactor::Action::RegisterTransport(token, transport));
+                    match route(&addr, self.service.config(), self.gate.as_ref()) {
+                        Ok(Route::Resolve { host, port }) => {
+                            self.resolve(node_id, addr, host, port)
                         }
-                        Err(err) => {
-                            logger::establish_connection(&addr, &err);
-
-                            self.service.disconnected(
-                                node_id,
-                                Link::Outbound,
-                                &DisconnectReason::Dial(Arc::new(err)),
-                            );
-                        }
+                        Ok(route) => self.connect(node_id, addr, route),
+                        // The node's own policy, or its configuration, refused
+                        // the address: no socket was opened.
+                        Err(err) => self.dial_failed(node_id, &addr, DialFailure::Local(err)),
                     }
                 }
                 Io::Disconnect(nid, reason) => {
@@ -1107,33 +1313,63 @@ where
     }
 }
 
-/// Establish a new outgoing connection.
-pub fn dial(
-    remote_addr: NetAddr<HostName>,
-    remote_id: crypto::PublicKey,
-    signer: crypto::SigningKey,
-    config: &radicle::node::Config,
-) -> io::Result<WireSession> {
-    // TODO: Nicer error.
-    let remote_id = crypto::VerifyingKey::try_from(&remote_id)
-        .map_err(|source| io::Error::new(io::ErrorKind::InvalidInput, source.to_string()))?;
+/// How to reach a peer address.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    /// Open a connection to `connect`. Through a proxy, ask it for `socks`.
+    Connect {
+        connect: net::SocketAddr,
+        socks: Option<NetAddr<HostName>>,
+    },
+    /// Resolve `host` first, off the reactor ([`checked`] then routes the answer).
+    Resolve { host: String, port: u16 },
+}
 
+/// The refusal of an address the gate doesn't allow.
+fn refused(addr: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{addr} is refused by the address policy"),
+    )
+}
+
+/// How to reach `target`, given the node's configuration and its gate:
+/// - an IP address is checked, then dialled, directly or through the proxy as
+///   that IP address;
+/// - a DNS name is resolved first, whether or not there is a proxy, so that
+///   every address it resolves to is checked ([`checked`]). Only a gate that
+///   lets the proxy resolve names ([`Gate::proxy_resolves_names`], as
+///   [`radicle::node::dial::Open`] does) hands it the name instead;
+/// - an onion or I2P name goes to the proxy its address family is configured
+///   with, as the name, on a path of its own.
+fn route(target: &Address, config: &radicle::node::Config, gate: &dyn Gate) -> io::Result<Route> {
     #[cfg(any(feature = "i2p", feature = "tor"))]
     fn proxy_or_forward<H: std::fmt::Display>(
         config: &AddressConfig,
         global_proxy: Option<net::SocketAddr>,
-        host: H,
+        host: HostName,
+        name: H,
         port: u16,
-    ) -> io::Result<NetAddr<InetHost>> {
+    ) -> io::Result<Route> {
         match config {
             // In proxy mode, simply use the configured proxy address.
             // This takes precedence over any global proxy.
-            AddressConfig::Proxy { address } => Ok((*address).into()),
+            AddressConfig::Proxy { address } => Ok(Route::Connect {
+                connect: *address,
+                socks: Some(NetAddr::new(host, port)),
+            }),
             // In "forward" mode, if a global proxy is set, we use that; otherwise,
             // we treat the address as a regular DNS name.
-            AddressConfig::Forward => Ok(global_proxy
-                .map(Into::into)
-                .unwrap_or_else(|| NetAddr::new(InetHost::Dns(host.to_string()), port))),
+            AddressConfig::Forward => Ok(match global_proxy {
+                Some(proxy) => Route::Connect {
+                    connect: proxy,
+                    socks: Some(NetAddr::new(host, port)),
+                },
+                None => Route::Resolve {
+                    host: name.to_string(),
+                    port,
+                },
+            }),
             // If address type support isn't configured, refuse to connect.
             AddressConfig::Drop => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1142,47 +1378,125 @@ pub fn dial(
         }
     }
 
-    // Determine what address to establish a TCP connection with, given the remote peer
-    // address and our node configuration.
-    let inet_addr: NetAddr<InetHost> = match (&remote_addr.host, config.proxy) {
-        // For IP and DNS addresses, use the global proxy if set; otherwise, use the address as-is.
-        (HostName::Ip(_), Some(proxy)) => proxy.into(),
-        (HostName::Ip(ip), None) => NetAddr::new(InetHost::Ip(*ip), remote_addr.port),
-        (HostName::Dns(_), Some(proxy)) => proxy.into(),
-        (HostName::Dns(dns), None) => NetAddr::new(InetHost::Dns(dns.clone()), remote_addr.port),
+    let port = target.port;
+    match &target.host {
+        HostName::Ip(ip) => {
+            let addr = net::SocketAddr::new(*ip, port);
+            if !gate.allows(target, &addr) {
+                return Err(refused(addr));
+            }
+            Ok(through(addr, config.proxy))
+        }
+        HostName::Dns(name) => match config.proxy {
+            Some(proxy) if gate.proxy_resolves_names() => Ok(Route::Connect {
+                connect: proxy,
+                socks: Some(NetAddr::new(HostName::Dns(name.clone()), port)),
+            }),
+            _ => Ok(Route::Resolve {
+                host: name.clone(),
+                port,
+            }),
+        },
         // For onion addresses, handle with care.
         #[cfg(feature = "tor")]
-        (HostName::Tor(onion), proxy) => {
-            proxy_or_forward(&config.onion, proxy, onion, remote_addr.port)?
+        host @ HostName::Tor(onion) => {
+            proxy_or_forward(&config.onion, config.proxy, host.clone(), onion, port)
         }
         #[cfg(feature = "i2p")]
-        (HostName::I2p(i2p), proxy) => proxy_or_forward(&config.i2p, proxy, i2p, remote_addr.port)?,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "unsupported remote address type",
-            ));
+        host @ HostName::I2p(i2p) => {
+            proxy_or_forward(&config.i2p, config.proxy, host.clone(), i2p, port)
         }
-    };
+        #[allow(unreachable_patterns)]
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported remote address type",
+        )),
+    }
+}
 
-    let addr = {
-        use std::net::ToSocketAddrs as _;
+/// The route to a checked IP address: directly, or through `proxy` as that
+/// IP address, never as a name.
+fn through(addr: net::SocketAddr, proxy: Option<net::SocketAddr>) -> Route {
+    match proxy {
+        Some(proxy) => Route::Connect {
+            connect: proxy,
+            socks: Some(NetAddr::new(HostName::Ip(addr.ip()), addr.port())),
+        },
+        None => Route::Connect {
+            connect: addr,
+            socks: None,
+        },
+    }
+}
 
-        inet_addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or(io::ErrorKind::AddrNotAvailable)?
+/// The route for `target` once its name has resolved to `answers`: the first
+/// address the gate allows. A failed lookup, an empty answer or one whose
+/// every address is refused fails the dial; the name is never handed to a
+/// proxy instead.
+fn checked(
+    target: &Address,
+    answers: io::Result<Vec<net::SocketAddr>>,
+    config: &radicle::node::Config,
+    gate: &dyn Gate,
+) -> Result<Route, DialFailure> {
+    // A name that doesn't resolve is the peer's.
+    let answers = answers.map_err(DialFailure::Remote)?;
+    if answers.is_empty() {
+        return Err(DialFailure::Remote(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("{target} resolved to no address"),
+        )));
+    }
+    // One whose every address the node's policy refuses is the node's.
+    let addr = answers
+        .into_iter()
+        .find(|addr| gate.allows(target, addr))
+        .ok_or_else(|| {
+            DialFailure::Local(refused(format!("every address {target} resolved to")))
+        })?;
+
+    Ok(match &target.host {
+        HostName::Dns(_) => through(addr, config.proxy),
+        // An onion or I2P name forwarded without a proxy, as the node always
+        // has: to the address its name resolves to, which a forwarder there
+        // is asked for the name.
+        host => Route::Connect {
+            connect: addr,
+            socks: Some(NetAddr::new(host.clone(), target.port)),
+        },
+    })
+}
+
+/// Establish a new outgoing connection, along `route`, which must be a
+/// [`Route::Connect`].
+fn dial(
+    route: Route,
+    remote_id: crypto::PublicKey,
+    signer: crypto::SigningKey,
+) -> io::Result<WireSession> {
+    let Route::Connect { connect, socks } = route else {
+        return Err(io::Error::other("a dial needs a resolved route"));
     };
+    // TODO: Nicer error.
+    let remote_id = crypto::VerifyingKey::try_from(&remote_id)
+        .map_err(|source| io::Error::new(io::ErrorKind::InvalidInput, source.to_string()))?;
 
     // NOTE: Previously, here was a note about setting the timeout for connecting
     // to DEFAULT_DIAL_TIMEOUT, for which we have not figured out a way yet.
     // Generally, we should understand what happens if the following call to
     // `connect` fails. How do we learn about it? Where's the leak?
 
-    let connection = TcpStream::connect(addr)?;
+    let connection = TcpStream::connect(connect)?;
 
-    // Whether to tunnel regular connections through the proxy.
-    let force_proxy = config.proxy.is_some();
+    // Through a proxy, the session asks it for `socks`; otherwise it talks to
+    // the peer directly.
+    let (remote_addr, force_proxy) = match socks {
+        Some(socks) => (socks, true),
+        None => (
+            NetAddr::new(HostName::Ip(connect.ip()), connect.port()),
+            false,
+        ),
+    };
 
     Ok(session(
         remote_addr,
@@ -1318,6 +1632,7 @@ mod test {
 
     use protocol::service::ServiceState as _;
     use protocol::service::{Message, ZeroBytes};
+    use radicle::assert_matches;
     use radicle::identity::RepoId;
     use radicle::node;
     use radicle::test::arbitrary;
@@ -1325,6 +1640,227 @@ mod test {
 
     use crate::wire;
     use crate::wire::varint;
+
+    /// A gate that allows only `allowed`, and answers every name with
+    /// `answers`.
+    #[derive(Debug, Default)]
+    struct Fixed {
+        allowed: Vec<net::IpAddr>,
+        answers: Vec<net::SocketAddr>,
+        proxy_resolves_names: bool,
+    }
+
+    impl Gate for Fixed {
+        fn allows(&self, _target: &Address, addr: &net::SocketAddr) -> bool {
+            self.allowed.contains(&addr.ip())
+        }
+
+        fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<net::SocketAddr>> {
+            Ok(self.answers.clone())
+        }
+
+        fn proxy_resolves_names(&self) -> bool {
+            self.proxy_resolves_names
+        }
+    }
+
+    const ALLOWED: [u8; 4] = [203, 0, 113, 7];
+    const REFUSED: [u8; 4] = [10, 0, 0, 7];
+    const PROXY: ([u8; 4], u16) = ([127, 0, 0, 1], 9150);
+
+    fn gate() -> Fixed {
+        Fixed {
+            allowed: vec![ALLOWED.into()],
+            ..Fixed::default()
+        }
+    }
+
+    fn config(proxy: bool) -> radicle::node::Config {
+        let mut config = radicle::node::Config::test(node::Alias::new("dial"));
+        if proxy {
+            config.proxy = Some(PROXY.into());
+            config.onion = AddressConfig::Proxy {
+                address: PROXY.into(),
+            };
+        }
+        config
+    }
+
+    fn address(s: &str) -> Address {
+        s.parse().unwrap()
+    }
+
+    fn ip(addr: [u8; 4], port: u16) -> NetAddr<HostName> {
+        NetAddr::new(HostName::Ip(addr.into()), port)
+    }
+
+    #[test]
+    fn an_ip_address_is_checked_then_dialled() {
+        let target = address("203.0.113.7:8776");
+        assert_eq!(
+            route(&target, &config(false), &gate()).unwrap(),
+            Route::Connect {
+                connect: (ALLOWED, 8776).into(),
+                socks: None
+            }
+        );
+        // Through the proxy, as that address.
+        assert_eq!(
+            route(&target, &config(true), &gate()).unwrap(),
+            Route::Connect {
+                connect: PROXY.into(),
+                socks: Some(ip(ALLOWED, 8776)),
+            }
+        );
+        let refused = route(&address("10.0.0.7:8776"), &config(true), &gate()).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn a_name_is_resolved_first_with_or_without_a_proxy() {
+        let target = address("seed.example:8776");
+        for proxy in [false, true] {
+            assert_eq!(
+                route(&target, &config(proxy), &gate()).unwrap(),
+                Route::Resolve {
+                    host: "seed.example".to_owned(),
+                    port: 8776
+                }
+            );
+        }
+        // Only a gate that lets the proxy resolve names hands it the name, as
+        // the node always did.
+        let open = Fixed {
+            proxy_resolves_names: true,
+            ..gate()
+        };
+        assert_eq!(
+            route(&target, &config(true), &open).unwrap(),
+            Route::Connect {
+                connect: PROXY.into(),
+                socks: Some(NetAddr::new(HostName::Dns("seed.example".to_owned()), 8776)),
+            }
+        );
+        assert_eq!(
+            route(&target, &config(false), &open).unwrap(),
+            Route::Resolve {
+                host: "seed.example".to_owned(),
+                port: 8776
+            }
+        );
+    }
+
+    #[test]
+    fn a_resolved_name_goes_to_the_first_allowed_address_never_as_the_name() {
+        let target = address("seed.example:8776");
+        let answers = || Ok(vec![(REFUSED, 8776).into(), (ALLOWED, 8776).into()]);
+        assert_eq!(
+            checked(&target, answers(), &config(false), &gate()).unwrap(),
+            Route::Connect {
+                connect: (ALLOWED, 8776).into(),
+                socks: None
+            }
+        );
+        assert_eq!(
+            checked(&target, answers(), &config(true), &gate()).unwrap(),
+            Route::Connect {
+                connect: PROXY.into(),
+                socks: Some(ip(ALLOWED, 8776)),
+            }
+        );
+    }
+
+    #[test]
+    fn a_failed_empty_or_refused_answer_fails_the_dial() {
+        let target = address("seed.example:8776");
+        for proxy in [false, true] {
+            let config = config(proxy);
+            let failed = checked(
+                &target,
+                Err(io::ErrorKind::NotFound.into()),
+                &config,
+                &gate(),
+            );
+            // A name that doesn't resolve, or resolves to nothing, is the
+            // peer's; an answer the policy refuses is this node's.
+            assert_matches!(
+                failed,
+                Err(DialFailure::Remote(e)) if e.kind() == io::ErrorKind::NotFound
+            );
+            let empty = checked(&target, Ok(vec![]), &config, &gate());
+            assert_matches!(
+                empty,
+                Err(DialFailure::Remote(e)) if e.kind() == io::ErrorKind::AddrNotAvailable
+            );
+            let refused = checked(&target, Ok(vec![(REFUSED, 8776).into()]), &config, &gate());
+            assert_matches!(
+                refused,
+                Err(DialFailure::Local(e)) if e.kind() == io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    // Review of heartwood #4, round 1: with `Open`, an onion or I2P name
+    // forwarded without a proxy takes exactly the route it always has: its
+    // name is resolved, and the address it resolves to is asked for the name
+    // over SOCKS, byte for byte as before.
+    #[test]
+    fn a_forwarded_name_keeps_its_socks_handshake_under_open() {
+        let open = radicle::node::dial::Open;
+        let resolved: net::SocketAddr = (ALLOWED, 9050).into();
+        let mut config = config(false);
+        config.onion = AddressConfig::Forward;
+        config.i2p = AddressConfig::Forward;
+        for name in [
+            "xmrhfasfg5suueegrnc4gsgyi2tyclcy5oz7f5drnrodmdtob6t2ioyd.onion:8776",
+            "f2atcc7udeub5kh4nkljtjwyk7ikjviorufzgwnfwhkphljl3vhq.b32.i2p:8776",
+        ] {
+            let target = address(name);
+            let host = match route(&target, &config, &open).unwrap() {
+                Route::Resolve { host, port } => {
+                    assert_eq!(port, 8776);
+                    host
+                }
+                other => panic!("{name}: unexpected route {other:?}"),
+            };
+            assert_eq!(format!("{host}:8776"), name);
+            let Route::Connect { connect, socks } =
+                checked(&target, Ok(vec![resolved]), &config, &open).unwrap()
+            else {
+                panic!("{name}: not a connection");
+            };
+            assert_eq!(connect, resolved);
+            // What the node always sent: SOCKS to the resolved address, for
+            // the name.
+            let before = socks5::Socks5::with((*target).clone(), false)
+                .advance(&[])
+                .unwrap();
+            let after = socks5::Socks5::with(socks.expect("SOCKS"), true)
+                .advance(&[])
+                .unwrap();
+            assert_eq!(before, vec![5, 1, 0]);
+            assert_eq!(after, before, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_onion_name_goes_to_its_proxy_as_the_name() {
+        let onion = "xmrhfasfg5suueegrnc4gsgyi2tyclcy5oz7f5drnrodmdtob6t2ioyd.onion:8776";
+        let target = address(onion);
+        match route(&target, &config(true), &gate()).unwrap() {
+            Route::Connect {
+                connect,
+                socks: Some(socks),
+            } => {
+                assert_eq!(connect, net::SocketAddr::from(PROXY));
+                assert!(matches!(socks.host, HostName::Tor(_)));
+            }
+            other => panic!("unexpected route {other:?}"),
+        }
+        // Without an onion route, it is refused before any socket.
+        let dropped = route(&target, &config(false), &gate()).unwrap_err();
+        assert_eq!(dropped.kind(), io::ErrorKind::Unsupported);
+    }
 
     #[test]
     fn test_pong_message_with_extension() {
@@ -1489,6 +2025,8 @@ mod test {
             alice.into_service(),
             worker_tx,
             crypto::SigningKey::mock(100),
+            Arc::new(radicle::node::dial::Open),
+            resolver::Resolvers::closed(),
             Stopped::default(),
         );
 
