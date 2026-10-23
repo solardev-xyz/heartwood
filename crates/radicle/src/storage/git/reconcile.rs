@@ -17,6 +17,7 @@ pub mod state;
 use std::ffi::{OsStr, OsString, c_int};
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::prelude::RepoId;
 
@@ -24,32 +25,57 @@ use super::TempRepository;
 
 use dir::{Dir, Kind};
 
-/// Turns on libgit2's fsync for this process: from then on, every loose
-/// object, pack and loose ref it writes, and their directories, are flushed
-/// to disk as they are written, so a written object is durable before a ref
-/// that points at it is updated. It stays on: nothing here turns it off.
+/// The result of turning libgit2's fsync on, once it has been tried: what
+/// `git_libgit2_opts` returned.
+static FSYNC: OnceLock<c_int> = OnceLock::new();
+
+/// Turns on libgit2's fsync for this process, once: call it at the start of
+/// reconciliation, before any repository is opened. Calls after the first
+/// return the first's result.
 ///
-/// A loose ref is flushed only by a repository opened after this is called,
-/// since libgit2 reads the setting when it opens a repository's refs.
+/// From then on, every loose object, pack and loose ref libgit2 writes, and
+/// the directories it writes them in, are flushed as they are written, so an
+/// object is durable before a ref that points at it is updated. It stays on
+/// for the node's lifetime, as the service's durability setting: nothing
+/// turns it off. Its cost is that every fetch then flushes its pack and its
+/// refs too.
+///
+/// libgit2 reads the setting for a repository's refs once, when it first
+/// reads that repository's refs (`git_refdb_backend_fs`,
+/// `src/libgit2/refdb_fs.c:2543`, libgit2 1.9.3, through
+/// `git_repository_refdb__weakptr`, `src/libgit2/repository.c:1600`). A
+/// repository object that has read its refs before this is called doesn't
+/// flush them.
 pub fn enable_fsync() -> Result<(), FsyncError> {
-    libgit2_sys::init();
-    // SAFETY: with `GIT_OPT_ENABLE_FSYNC_GITDIR`, `git_libgit2_opts` reads
-    // exactly one more argument, an `int`, which is passed; libgit2 is
-    // initialized above.
-    let code = unsafe {
-        libgit2_sys::git_libgit2_opts(
-            libgit2_sys::GIT_OPT_ENABLE_FSYNC_GITDIR as c_int,
-            1 as c_int,
-        )
-    };
+    let code = *FSYNC.get_or_init(|| {
+        // Initializes libgit2 once, as every `git2` call does first.
+        libgit2_sys::init();
+        // SAFETY: `git_libgit2_opts(int option, ...)` is variadic, and for
+        // `GIT_OPT_ENABLE_FSYNC_GITDIR` reads exactly one more argument, an
+        // `int` (libgit2 1.9.3, `include/git2/common.h:456`, "opts(
+        // GIT_OPT_ENABLE_FSYNC_GITDIR, int enabled)"; read with
+        // `va_arg(ap, int)` at `src/libgit2/settings.c:326`). Both are passed
+        // as `c_int`, C's `int`. libgit2 is initialized above.
+        unsafe {
+            libgit2_sys::git_libgit2_opts(
+                libgit2_sys::GIT_OPT_ENABLE_FSYNC_GITDIR as c_int,
+                1 as c_int,
+            )
+        }
+    });
     if code < 0 {
         return Err(FsyncError(code));
     }
     Ok(())
 }
 
+/// Whether [`enable_fsync`] has turned fsync on in this process.
+pub fn fsync_enabled() -> bool {
+    FSYNC.get().is_some_and(|code| *code >= 0)
+}
+
 /// libgit2 refused to turn fsync on, with this error code.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("libgit2 refused to turn fsync on (error {0})")]
 pub struct FsyncError(pub c_int);
 
