@@ -64,7 +64,7 @@ pub enum Control {
 }
 
 /// Peer session type.
-type WireSession = NoiseSession<crypto::SigningKey, Sha256, Socks5Session<TcpStream>>;
+pub(crate) type WireSession = NoiseSession<crypto::SigningKey, Sha256, Socks5Session<TcpStream>>;
 
 /// Reactor action.
 type Action = reactor::Action<Listener, Transport<WireSession>>;
@@ -518,6 +518,20 @@ where
         self.metrics.worker_queue_size = self.worker.len();
 
         self.service.tick(LocalTime::now(), &self.metrics);
+    }
+
+    fn stopped(&mut self) -> bool {
+        if !self.service.is_stopped() {
+            return false;
+        }
+        if let Some(error) = self.service.take_fatal() {
+            log::error!(target: "wire", "Stopping the node: {error}");
+            self.stopped
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(error);
+        }
+        true
     }
 
     fn timer_reacted(&mut self) {
@@ -1018,16 +1032,6 @@ where
                 }
                 Io::Wakeup(d) => {
                     self.actions.push_back(reactor::Action::SetTimer(d.into()));
-                }
-                Io::Stop(error) => {
-                    log::error!(target: "wire", "Stopping the node: {error}");
-                    self.stopped
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .get_or_insert(error);
-                    // Ahead of anything queued: the reactor handles nothing after it.
-                    self.actions.push_front(reactor::Action::Shutdown);
-                    break;
                 }
                 Io::Fetch {
                     rid,

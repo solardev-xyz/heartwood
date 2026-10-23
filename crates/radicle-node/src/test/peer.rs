@@ -196,6 +196,15 @@ where
         }
 
         f(&mut config);
+        // With the default policy `f` may have set.
+        drop(policies);
+        let policies = policy::Config::new(
+            config.policy,
+            policy::Store::<policy::store::Write>::open(
+                tempdir.path().join(node::POLICIES_DB_FILE),
+            )
+            .unwrap(),
+        );
 
         let nid = *config.secret_key.public_key();
 

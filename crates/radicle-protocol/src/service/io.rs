@@ -10,7 +10,6 @@ use radicle::storage::refs::RefsAt;
 
 use crate::fetcher;
 use crate::service::DisconnectReason;
-use crate::service::Error;
 use crate::service::Link;
 use crate::service::message::Message;
 use crate::service::session::Session;
@@ -43,8 +42,6 @@ pub enum Io {
     },
     /// Ask for a wakeup in a specified amount of time.
     Wakeup(LocalDuration),
-    /// Stop the node: the service met an error it can't go on from.
-    Stop(Error),
 }
 
 /// Interface to the network.
@@ -55,11 +52,6 @@ pub struct Outbox {
 }
 
 impl Outbox {
-    /// Stop the node with `error`, ahead of everything already queued.
-    pub fn stop(&mut self, error: Error) {
-        self.io.push_front(Io::Stop(error));
-    }
-
     /// Connect to a peer.
     pub fn connect(&mut self, id: NodeId, addr: Address) {
         self.io.push_back(Io::Connect(id, addr));
