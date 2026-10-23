@@ -410,7 +410,11 @@ mod tests {
         );
         let repo = storage.path().join("repo");
         fs::create_dir_all(repo.join("refs/heads")).unwrap();
-        junction(&repo.join("refs/linked"), &outside.path().join("dir"));
+        // `mklink` takes no `/` in a path.
+        junction(
+            &repo.join("refs").join("linked"),
+            &outside.path().join("dir"),
+        );
         junction(&repo.join("HEAD.lock"), &outside.path().join("dir"));
 
         let done = remove_temporary_clones(storage.path()).unwrap();
