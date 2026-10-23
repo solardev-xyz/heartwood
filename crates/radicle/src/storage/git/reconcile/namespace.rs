@@ -256,12 +256,20 @@ fn target(repo: &Repository, namespace: &NodeId, name: &str) -> Result<Option<Oi
     Ok(Some(target.into()))
 }
 
-/// The version of `namespace`'s refs in `repo`: a hash over every ref's name
-/// and target, `rad/sigrefs` included. Any change to a ref changes it.
+/// The version of `namespace`'s refs in `repo`: a fingerprint of every ref's
+/// name and target, `rad/sigrefs` included, that tells an accidental change
+/// apart, such as a write a kill left part way.
 ///
 /// It is the exclusive or of each ref's own hash, over `name target`, and
 /// their count, hashed: independent of the order libgit2 yields refs in, so
 /// no ref is held but the one it hashes. A ref name has no space.
+///
+/// It is not an authentication boundary: chosen sets of refs can be made to
+/// share one (a generalized birthday search). It relies on design 0008's
+/// single writer: the home's lock, the repository gate, and no `rad` CLI
+/// running at the same time, so nothing can swap in another set of refs
+/// while a checkpoint or a [`Complete`] holds it. If that boundary ever
+/// widens, it has to become a collision-resistant digest.
 pub fn version(repo: &Repository, namespace: &NodeId) -> Result<Oid, Error> {
     let prefix = prefix(namespace);
     let mut sum = [0u8; 20];
