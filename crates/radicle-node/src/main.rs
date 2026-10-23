@@ -366,7 +366,7 @@ fn execute(options: Options) -> Result<(), ExecutionError> {
     Runtime::init(
         home,
         config.node,
-        socket,
+        Some(socket),
         listen,
         signals,
         signer,

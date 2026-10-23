@@ -73,6 +73,145 @@ fn test_inventory_sync_basic() {
 
 #[test]
 //
+//     alice -- bob, bob with no control socket
+//
+fn test_node_without_control_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+
+    alice.project("alice", "");
+    bob.project("bob", "");
+
+    let socket = bob.home.socket_default();
+    let mut alice = alice.spawn();
+    let bob = bob.spawn_without_control_socket();
+
+    // Nothing listens for control commands on bob's home.
+    assert!(!socket.exists());
+
+    // Its handle controls it, and it syncs as any node does.
+    alice.connect(&bob);
+    let routes = converge([&alice, &bob]);
+    assert_eq!(routes.len(), 2);
+
+    // And it shuts down through its handle alone: dropping the handle shuts
+    // the node down and joins its thread.
+    bob.shutdown();
+    assert!(!socket.exists());
+}
+
+/// A node with no control socket, run by a host that keeps its signal
+/// sender, as an embedding host does.
+fn run_with_signals(
+    path: &std::path::Path,
+) -> (
+    std::sync::mpsc::Sender<radicle_signals::Signal>,
+    std::net::SocketAddr,
+    crate::runtime::handle::Handle,
+    thread::JoinHandle<Result<(), crate::runtime::Error>>,
+) {
+    let node = Node::init(path, config::relay("alice"), 139);
+    let (signals, receiver) = std::sync::mpsc::channel();
+    let runtime = crate::runtime::Runtime::init(
+        node.home.clone(),
+        node.config,
+        None,
+        vec![([127, 0, 0, 1], 0).into()],
+        receiver,
+        node.secret_key,
+        std::sync::Arc::new(radicle::node::dial::Open),
+    )
+    .unwrap();
+    assert!(runtime.control.is_none());
+    let address = runtime.local_addrs[0];
+    let handle = runtime.handle.clone();
+    (
+        signals,
+        address,
+        handle,
+        thread::spawn(move || runtime.run()),
+    )
+}
+
+#[test]
+// Review of heartwood #1, round 1: the node's shutdown joins its signal
+// watcher even while the host still holds the signal sender.
+fn test_node_without_control_socket_joins_its_signal_watcher() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (signals, address, handle, running) = run_with_signals(tmp.path());
+
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+
+    // The watcher has ended, and dropped its receiver.
+    assert!(
+        signals.send(radicle_signals::Signal::Hangup).is_err(),
+        "shutdown returned with its signal watcher still alive"
+    );
+    assert!(
+        std::net::TcpStream::connect_timeout(&address, time::Duration::from_millis(200)).is_err()
+    );
+}
+
+#[test]
+// Review of heartwood #1, round 2: a stream of ignored signals doesn't keep
+// the watcher from ending once the node has stopped.
+fn test_node_without_control_socket_stops_while_signals_keep_coming() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (signals, _, handle, running) = run_with_signals(tmp.path());
+    let producing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let producer = thread::spawn({
+        let producing = producing.clone();
+        move || {
+            while producing.load(std::sync::atomic::Ordering::SeqCst) {
+                signals.send(radicle_signals::Signal::WindowChanged).ok();
+                thread::sleep(time::Duration::from_millis(1));
+            }
+        }
+    });
+
+    handle.shutdown().unwrap();
+    let deadline = time::Instant::now() + time::Duration::from_secs(5);
+    while !running.is_finished() && time::Instant::now() < deadline {
+        thread::sleep(time::Duration::from_millis(20));
+    }
+    let finished = running.is_finished();
+    producing.store(false, std::sync::atomic::Ordering::SeqCst);
+    producer.join().unwrap();
+    assert!(
+        finished,
+        "ignored signals kept the node's run from returning"
+    );
+    running.join().unwrap().unwrap();
+}
+
+#[test]
+// While the node runs, its signals act as before: a hangup is ignored, and a
+// termination stops it.
+fn test_node_without_control_socket_stops_on_a_termination_signal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (signals, _, _handle, running) = run_with_signals(tmp.path());
+
+    signals.send(radicle_signals::Signal::Hangup).unwrap();
+    thread::sleep(time::Duration::from_millis(600));
+    assert!(!running.is_finished(), "a hangup stopped the node");
+
+    signals.send(radicle_signals::Signal::Terminate).unwrap();
+    let deadline = time::Instant::now() + time::Duration::from_secs(10);
+    while !running.is_finished() {
+        assert!(
+            time::Instant::now() < deadline,
+            "the node didn't stop on its signal"
+        );
+        thread::sleep(time::Duration::from_millis(20));
+    }
+    running.join().unwrap().unwrap();
+}
+
+#[test]
+//
 //     alice -- bob -- eve
 //
 fn test_inventory_sync_bridge() {

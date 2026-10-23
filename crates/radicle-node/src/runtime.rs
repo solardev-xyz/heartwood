@@ -4,8 +4,9 @@ pub mod thread;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::str::FromStr as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
-use std::{fs, io, net};
+use std::{fs, io, net, time};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
@@ -41,6 +42,11 @@ use crate::worker;
 
 /// Maximum pending worker tasks allowed.
 pub const MAX_PENDING_TASKS: usize = 1024;
+
+/// How long the signal watcher waits for a signal before it checks whether
+/// the node has stopped. A host may keep its signal sender after the node
+/// stops, so the watcher can't rely on the channel closing to end.
+const SIGNAL_WATCH_INTERVAL: time::Duration = time::Duration::from_millis(250);
 
 /// A client error.
 #[derive(Error, Debug)]
@@ -108,7 +114,8 @@ pub enum ControlSocket {
 pub struct Runtime {
     pub id: NodeId,
     pub home: Home,
-    pub control: ControlSocket,
+    /// The control socket, unless the host runs the node without one.
+    pub control: Option<ControlSocket>,
     pub handle: Handle,
     pub storage: Storage,
     pub reactor: Reactor,
@@ -120,6 +127,11 @@ pub struct Runtime {
 impl Runtime {
     /// Initialize the runtime.
     ///
+    /// With `socket`, the node listens for control commands there (the `rad`
+    /// CLI's connection); without it, the node has no control socket at all,
+    /// and only its [`Handle`] controls it: an embedding host that drives the
+    /// node in-process needs no socket on disk.
+    ///
     /// `gate` decides which addresses the node may dial, and resolves names
     /// for it ([`radicle::node::dial::Open`] keeps the node's own behaviour).
     ///
@@ -127,7 +139,7 @@ impl Runtime {
     pub fn init(
         home: Home,
         config: radicle::node::Config,
-        socket: PathBuf,
+        socket: Option<PathBuf>,
         listen: Vec<net::SocketAddr>,
         signals: mpsc::Receiver<Signal>,
         secret_key: SigningKey,
@@ -261,7 +273,7 @@ impl Runtime {
                 policies_db: home.node().join(node::POLICIES_DB_FILE),
             },
         )?;
-        let control = Self::bind(socket)?;
+        let control = socket.map(Self::bind).transpose()?;
 
         Ok(Runtime {
             id,
@@ -279,34 +291,46 @@ impl Runtime {
     pub fn run(self) -> Result<(), Error> {
         let home = self.home;
         let (listener, remove) = match self.control {
-            ControlSocket::Bound(listener, path) => (listener, Some(path)),
-            ControlSocket::Received(listener) => (listener, None),
+            Some(ControlSocket::Bound(listener, path)) => (Some(listener), Some(path)),
+            Some(ControlSocket::Received(listener)) => (Some(listener), None),
+            None => (None, None),
         };
 
         log::info!(target: "node", "Running node {} in {}..", self.id, home.path().display());
 
-        thread::spawn(&self.id, "control", {
-            let handle = self.handle.clone();
-            || control::listen(listener, handle)
-        });
+        if let Some(listener) = listener {
+            thread::spawn(&self.id, "control", {
+                let handle = self.handle.clone();
+                || control::listen(listener, handle)
+            });
+        }
 
-        let _signals = thread::spawn(&self.id, "signals", move || {
-            loop {
-                use radicle::node::Handle as _;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let signals = thread::spawn(&self.id, "signals", {
+            let stopped = stopped.clone();
+            move || {
+                loop {
+                    use radicle::node::Handle as _;
 
-                match self.signals.recv() {
-                    Ok(Signal::Terminate | Signal::Interrupt) => {
-                        log::info!(target: "node", "Termination signal received; shutting down..");
-                        self.handle.shutdown().ok();
+                    // Checked on every turn, so that a stream of ignored signals can't keep
+                    // the watcher from seeing that the node has stopped.
+                    if stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    Ok(Signal::Hangup) => {
-                        log::debug!(target: "node", "Hangup signal (SIGHUP) received; ignoring..");
-                    }
-                    Ok(Signal::WindowChanged) => {}
-                    Err(e) => {
-                        log::warn!(target: "node", "Signal notifications channel error: {e}");
-                        break;
+                    match self.signals.recv_timeout(SIGNAL_WATCH_INTERVAL) {
+                        Ok(Signal::Terminate | Signal::Interrupt) => {
+                            log::info!(target: "node", "Termination signal received; shutting down..");
+                            self.handle.shutdown().ok();
+                            break;
+                        }
+                        Ok(Signal::Hangup) => {
+                            log::debug!(target: "node", "Hangup signal (SIGHUP) received; ignoring..");
+                        }
+                        Ok(Signal::WindowChanged) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(e @ mpsc::RecvTimeoutError::Disconnected) => {
+                            log::warn!(target: "node", "Signal notifications channel error: {e}");
+                            break;
+                        }
                     }
                 }
             }
@@ -315,8 +339,17 @@ impl Runtime {
         self.pool.run().unwrap();
         self.reactor.join().unwrap();
 
+        // The node has stopped: the signal watcher ends at its next check,
+        // whether or not the host still holds its signal sender.
+        stopped.store(true, Ordering::Release);
+        if signals.join().is_err() {
+            log::error!(target: "node", "The signal watcher thread panicked");
+        }
+
         // Nb. We don't join the control thread here, as we have no way of notifying it that the
-        // node is shutting down.
+        // node is shutting down. With a control socket, its listener thread, and any thread
+        // serving a command, outlive `run`, as they always have; the binary exits once `run`
+        // returns. Without one, every thread `run` starts has been joined by now.
 
         // Remove control socket file, but don't freak out if it's not there anymore.
         remove.map(|path| fs::remove_file(path).ok());
