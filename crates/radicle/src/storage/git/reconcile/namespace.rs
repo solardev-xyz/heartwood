@@ -24,7 +24,7 @@ use crate::storage::{
     ReadRepository as _, RepositoryError, SignRepository as _, WriteStorage as _,
 };
 
-use super::{FsyncError, enable_fsync};
+use super::fsync_enabled;
 
 /// The refs one unit of a check takes at most, in its usual form. Its
 /// smallest form takes one.
@@ -112,8 +112,8 @@ pub enum Error {
     Repository(#[from] RepositoryError),
     #[error(transparent)]
     Git(#[from] git::raw::Error),
-    #[error(transparent)]
-    Fsync(#[from] FsyncError),
+    #[error("fsync is off: reconciliation turns it on (`enable_fsync`) before it signs")]
+    FsyncOff,
     #[error("the key of {signer} may not sign the namespace of {namespace}")]
     NotOwner { namespace: NodeId, signer: NodeId },
 }
@@ -224,9 +224,11 @@ pub fn check(
 /// they are, with `signer`, whose key must be the namespace's: once a check of
 /// it ended [`Check::Stale`].
 ///
-/// libgit2's fsync is turned on first ([`enable_fsync`]), and the repository
-/// opened afresh: the signed refs' objects are flushed before their ref is
-/// updated, and the update is flushed before this returns.
+/// It refuses to sign unless libgit2's fsync is on ([`super::enable_fsync`],
+/// which reconciliation calls first). It opens its own repository object,
+/// whose refs it reads only now, so their updates are flushed whatever
+/// repository object its caller holds: the signed refs' objects are flushed
+/// before their ref is updated, and the update before this returns.
 pub fn resign<S>(
     storage: &Storage,
     rid: RepoId,
@@ -242,7 +244,9 @@ where
             signer: *signer.public_key(),
         });
     }
-    enable_fsync()?;
+    if !fsync_enabled() {
+        return Err(Error::FsyncOff);
+    }
     let repo = storage.repository_mut(rid)?;
     Ok(repo.sign_refs(signer)?)
 }
@@ -267,6 +271,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            // As reconciliation does first, before it opens a repository.
+            super::super::enable_fsync().unwrap();
             let tmp = tempfile::tempdir().unwrap();
             let signer = SigningKey::mock(0xb4);
             let storage = Storage::open(tmp.path().join("storage"), fixtures::user()).unwrap();
@@ -592,8 +598,10 @@ mod tests {
     }
 
     #[test]
-    fn fsync_turns_on() {
-        enable_fsync().unwrap();
-        enable_fsync().unwrap();
+    fn fsync_turns_on_once() {
+        super::super::enable_fsync().unwrap();
+        assert!(fsync_enabled());
+        super::super::enable_fsync().unwrap();
+        assert!(fsync_enabled());
     }
 }
