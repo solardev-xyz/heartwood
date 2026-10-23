@@ -5,13 +5,44 @@
 //! again after a kill at any point. Run them only while no node runs on the
 //! storage, since they remove what a live operation would still be using.
 
-use std::ffi::OsString;
+pub mod namespace;
+
+use std::ffi::{OsString, c_int};
 use std::path::Path;
 use std::{fs, io};
 
 use crate::prelude::RepoId;
 
 use super::TempRepository;
+
+/// Turns on libgit2's fsync for this process: from then on, every loose
+/// object, pack and loose ref it writes, and their directories, are flushed
+/// to disk as they are written, so a written object is durable before a ref
+/// that points at it is updated. It stays on: nothing here turns it off.
+///
+/// A loose ref is flushed only by a repository opened after this is called,
+/// since libgit2 reads the setting when it opens a repository's refs.
+pub fn enable_fsync() -> Result<(), FsyncError> {
+    libgit2_sys::init();
+    // SAFETY: with `GIT_OPT_ENABLE_FSYNC_GITDIR`, `git_libgit2_opts` reads
+    // exactly one more argument, an `int`, which is passed; libgit2 is
+    // initialized above.
+    let code = unsafe {
+        libgit2_sys::git_libgit2_opts(
+            libgit2_sys::GIT_OPT_ENABLE_FSYNC_GITDIR as c_int,
+            1 as c_int,
+        )
+    };
+    if code < 0 {
+        return Err(FsyncError(code));
+    }
+    Ok(())
+}
+
+/// libgit2 refused to turn fsync on, with this error code.
+#[derive(Debug, thiserror::Error)]
+#[error("libgit2 refused to turn fsync on (error {0})")]
+pub struct FsyncError(pub c_int);
 
 /// The extension the storage once gave temporary clones.
 const LEGACY_TEMP_EXT: &str = "lock";
