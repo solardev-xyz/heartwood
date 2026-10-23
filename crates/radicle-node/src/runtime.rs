@@ -4,8 +4,10 @@ pub mod thread;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::{fs, io, net};
+use std::{fs, io, net, time};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
@@ -40,6 +42,11 @@ use crate::worker;
 
 /// Maximum pending worker tasks allowed.
 pub const MAX_PENDING_TASKS: usize = 1024;
+
+/// How long the signal watcher waits for a signal before it checks whether
+/// the node has stopped. A host may keep its signal sender after the node
+/// stops, so the watcher can't rely on the channel closing to end.
+const SIGNAL_WATCH_INTERVAL: time::Duration = time::Duration::from_millis(250);
 
 /// A client error.
 #[derive(Error, Debug)]
@@ -284,23 +291,32 @@ impl Runtime {
             });
         }
 
-        let _signals = thread::spawn(&self.id, "signals", move || {
-            loop {
-                use radicle::node::Handle as _;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let signals = thread::spawn(&self.id, "signals", {
+            let stopped = stopped.clone();
+            move || {
+                loop {
+                    use radicle::node::Handle as _;
 
-                match self.signals.recv() {
-                    Ok(Signal::Terminate | Signal::Interrupt) => {
-                        log::info!(target: "node", "Termination signal received; shutting down..");
-                        self.handle.shutdown().ok();
-                        break;
-                    }
-                    Ok(Signal::Hangup) => {
-                        log::debug!(target: "node", "Hangup signal (SIGHUP) received; ignoring..");
-                    }
-                    Ok(Signal::WindowChanged) => {}
-                    Err(e) => {
-                        log::warn!(target: "node", "Signal notifications channel error: {e}");
-                        break;
+                    match self.signals.recv_timeout(SIGNAL_WATCH_INTERVAL) {
+                        Ok(Signal::Terminate | Signal::Interrupt) => {
+                            log::info!(target: "node", "Termination signal received; shutting down..");
+                            self.handle.shutdown().ok();
+                            break;
+                        }
+                        Ok(Signal::Hangup) => {
+                            log::debug!(target: "node", "Hangup signal (SIGHUP) received; ignoring..");
+                        }
+                        Ok(Signal::WindowChanged) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if stopped.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                        Err(e @ mpsc::RecvTimeoutError::Disconnected) => {
+                            log::warn!(target: "node", "Signal notifications channel error: {e}");
+                            break;
+                        }
                     }
                 }
             }
@@ -308,6 +324,13 @@ impl Runtime {
 
         self.pool.run().unwrap();
         self.reactor.join().unwrap();
+
+        // The node has stopped: the signal watcher ends at its next check,
+        // whether or not the host still holds its signal sender.
+        stopped.store(true, Ordering::Release);
+        if signals.join().is_err() {
+            log::error!(target: "node", "The signal watcher thread panicked");
+        }
 
         // Nb. We don't join the control thread here, as we have no way of notifying it that the
         // node is shutting down.

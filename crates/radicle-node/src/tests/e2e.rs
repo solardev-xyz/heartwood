@@ -102,6 +102,81 @@ fn test_node_without_control_socket() {
     assert!(!socket.exists());
 }
 
+/// A node with no control socket, run by a host that keeps its signal
+/// sender, as an embedding host does.
+fn run_with_signals(
+    path: &std::path::Path,
+) -> (
+    std::sync::mpsc::Sender<radicle_signals::Signal>,
+    std::net::SocketAddr,
+    crate::runtime::handle::Handle,
+    thread::JoinHandle<Result<(), crate::runtime::Error>>,
+) {
+    let node = Node::init(path, config::relay("alice"), 139);
+    let (signals, receiver) = std::sync::mpsc::channel();
+    let runtime = crate::runtime::Runtime::init(
+        node.home.clone(),
+        node.config,
+        None,
+        vec![([127, 0, 0, 1], 0).into()],
+        receiver,
+        node.secret_key,
+    )
+    .unwrap();
+    assert!(runtime.control.is_none());
+    let address = runtime.local_addrs[0];
+    let handle = runtime.handle.clone();
+    (
+        signals,
+        address,
+        handle,
+        thread::spawn(move || runtime.run()),
+    )
+}
+
+#[test]
+// Review of heartwood #1, round 1: the node's shutdown joins its signal
+// watcher even while the host still holds the signal sender.
+fn test_node_without_control_socket_joins_its_signal_watcher() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (signals, address, handle, running) = run_with_signals(tmp.path());
+
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+
+    // The watcher has ended, and dropped its receiver.
+    assert!(
+        signals.send(radicle_signals::Signal::Hangup).is_err(),
+        "shutdown returned with its signal watcher still alive"
+    );
+    assert!(
+        std::net::TcpStream::connect_timeout(&address, time::Duration::from_millis(200)).is_err()
+    );
+}
+
+#[test]
+// While the node runs, its signals act as before: a hangup is ignored, and a
+// termination stops it.
+fn test_node_without_control_socket_stops_on_a_termination_signal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (signals, _, _handle, running) = run_with_signals(tmp.path());
+
+    signals.send(radicle_signals::Signal::Hangup).unwrap();
+    thread::sleep(time::Duration::from_millis(600));
+    assert!(!running.is_finished(), "a hangup stopped the node");
+
+    signals.send(radicle_signals::Signal::Terminate).unwrap();
+    let deadline = time::Instant::now() + time::Duration::from_secs(10);
+    while !running.is_finished() {
+        assert!(
+            time::Instant::now() < deadline,
+            "the node didn't stop on its signal"
+        );
+        thread::sleep(time::Duration::from_millis(20));
+    }
+    running.join().unwrap().unwrap();
+}
+
 #[test]
 //
 //     alice -- bob -- eve
