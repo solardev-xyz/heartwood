@@ -2602,6 +2602,7 @@ fn test_dial_its_deadline_holds_after_a_busy_turn() {
 #[test]
 // Review of heartwood #4, round 1: a peer configured by name is resolved at
 // start like any other, not refused because the resolvers weren't ready.
+// Round 2: it is the first dial that connects, not a retry after it failed.
 fn test_dial_a_configured_peer_by_name_at_start() {
     let tmp = tempfile::tempdir().unwrap();
     let bob = Node::init(tmp.path(), config::relay("bob"), 37).spawn();
@@ -2612,22 +2613,39 @@ fn test_dial_a_configured_peer_by_name_at_start() {
     ))]
     .into_iter()
     .collect();
+    let start = localtime::LocalTime::now();
     let alice = alice.spawn_with_gate(std::sync::Arc::new(test_gate(&bob, true)));
 
     let events = alice.handle.events();
-    let connected = alice
-        .handle
-        .sessions()
-        .unwrap()
-        .iter()
-        .any(|s| s.nid == bob.id && s.state.is_connected())
-        || events
-            .wait(
-                |e| matches!(e, Event::PeerConnected { nid } if *nid == bob.id).then_some(()),
-                time::Duration::from_secs(10),
-            )
-            .is_ok();
-    assert!(connected, "alice never connected to bob by name");
+    let since = || {
+        alice
+            .handle
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find_map(|s| match s.state {
+                radicle::node::State::Connected { since, .. } if s.nid == bob.id => Some(since),
+                _ => None,
+            })
+    };
+    let since = since()
+        .or_else(|| {
+            events
+                .wait(
+                    |e| matches!(e, Event::PeerConnected { nid } if *nid == bob.id).then_some(()),
+                    time::Duration::from_secs(10),
+                )
+                .ok()
+                .and_then(|()| since())
+        })
+        .expect("alice never connected to bob by name");
+    // A failed first dial is retried no sooner than the least reconnection
+    // delay after it: a connection made before then is the first dial's.
+    let after = since.duration_since(start);
+    assert!(
+        after < service::MIN_RECONNECTION_DELTA,
+        "alice connected to bob {after} after starting: not on her first dial"
+    );
 }
 
 /// `node`'s runtime, from its own configuration, or the error that refuses it.
@@ -2713,4 +2731,203 @@ fn test_policy_failure_stops_the_node_with_its_error() {
         }
         other => panic!("expected the policy error, got {other:?}"),
     }
+}
+
+/// A gate whose name `online.test` resolves at once, to `online`, and whose
+/// other names wait on `held`. Its dials give up after `timeout`.
+#[derive(Debug)]
+struct PenaltyGate {
+    held: HeldGate,
+    online: std::net::SocketAddr,
+    timeout: time::Duration,
+}
+
+impl radicle::node::dial::Gate for PenaltyGate {
+    fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+        true
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        if host == "online.test" {
+            Ok(vec![self.online])
+        } else {
+            self.held.resolve(host, port)
+        }
+    }
+
+    fn resolve_timeout(&self) -> time::Duration {
+        self.timeout
+    }
+}
+
+/// Alice, online through dan, with two resolvers (two outbound
+/// connections), bob in her address book by name, and a gate that holds
+/// every name but dan's. Returns her, bob, the gate, and her address book.
+fn penalty_fixture(
+    tmp: &std::path::Path,
+    timeout: time::Duration,
+) -> (
+    NodeHandle,
+    NodeHandle,
+    NodeHandle,
+    std::sync::Arc<PenaltyGate>,
+    radicle::node::Database,
+) {
+    use radicle::node::address::{KnownAddress, Source, Store as _};
+
+    let dan = Node::init(tmp, config::relay("dan"), 51).spawn();
+    let bob = Node::init(tmp, config::relay("bob"), 37).spawn();
+    let mut cfg = config::relay("alice");
+    cfg.peers = radicle::node::config::PeerConfig::Static;
+    cfg.limits.connection.outbound = 2.into();
+    let mut node = Node::init(tmp, cfg, 13);
+    node.db
+        .addresses_mut()
+        .insert(
+            &bob.id,
+            1,
+            radicle::node::Features::SEED,
+            &bob.alias,
+            0,
+            &radicle::node::UserAgent::default(),
+            localtime::LocalTime::now().into(),
+            [KnownAddress::new(by_name(&bob), Source::Peer)],
+        )
+        .unwrap();
+    let book = node.home.database_mut(node.config.database).unwrap();
+    let gate = std::sync::Arc::new(PenaltyGate {
+        held: HeldGate::new(vec![bob.addr]),
+        online: dan.addr,
+        timeout,
+    });
+    let alice = node.spawn_with_gate(gate.clone());
+    // Online: a dial that fails is then held against its peer.
+    let online = format!("online.test:{}", dan.addr.port()).parse().unwrap();
+    assert!(matches!(
+        alice
+            .handle
+            .clone()
+            .connect(dan.id, online, connect_options())
+            .unwrap(),
+        ConnectResult::Connected
+    ));
+    (alice, bob, dan, gate, book)
+}
+
+fn connect_options() -> ConnectOptions {
+    ConnectOptions {
+        persistent: false,
+        timeout: time::Duration::from_secs(5),
+    }
+}
+
+/// Bob's penalty in `book`, once alice's reactor has handled what came before.
+fn penalty(
+    alice: &NodeHandle,
+    bob: &NodeHandle,
+    book: &radicle::node::Database,
+) -> radicle::node::Penalty {
+    use radicle::node::address::Store as _;
+
+    alice.handle.sessions().unwrap();
+    book.get(&bob.id).unwrap().unwrap().penalty
+}
+
+/// Holds both of alice's resolvers with names of their own.
+fn hold_resolvers(alice: &NodeHandle, gate: &PenaltyGate) {
+    for i in 0..2u8 {
+        let key = SigningKey::from_seed(radicle::crypto::Seed::new([90 + i; 32]));
+        alice
+            .handle
+            .command(service::Command::Connect(
+                *key.public_key(),
+                format!("held-{i}.test:8776").parse().unwrap(),
+                connect_options(),
+            ))
+            .unwrap();
+    }
+    gate.held.wait_for(2);
+}
+
+#[test]
+// Review of heartwood #4, round 2: a dial refused because alice's resolver
+// queue is full is her own failure, and costs bob nothing: 32 of them would
+// have put him past the threshold of automatic connections.
+fn test_dial_a_full_resolver_queue_costs_the_peer_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice, bob, _dan, gate, book) = penalty_fixture(tmp.path(), time::Duration::from_secs(30));
+    let before = penalty(&alice, &bob, &book);
+    hold_resolvers(&alice, &gate);
+    // And fill the queue.
+    for i in 0..2u8 {
+        let key = SigningKey::from_seed(radicle::crypto::Seed::new([100 + i; 32]));
+        alice
+            .handle
+            .command(service::Command::Connect(
+                *key.public_key(),
+                format!("queued-{i}.test:8776").parse().unwrap(),
+                connect_options(),
+            ))
+            .unwrap();
+    }
+    for _ in 0..32 {
+        let result = alice
+            .handle
+            .clone()
+            .connect(bob.id, by_name(&bob), connect_options())
+            .unwrap();
+        assert!(
+            matches!(&result, ConnectResult::Disconnected { reason } if reason.contains("too many names are being resolved")),
+            "{result:?}"
+        );
+    }
+    let after = penalty(&alice, &bob, &book);
+    gate.held.release();
+    assert_eq!(after, before);
+    assert!(!after.is_connect_threshold_reached());
+}
+
+#[test]
+// Review of heartwood #4, round 2: a name whose dial gives up while it waits
+// in alice's queue was never tried, and costs bob nothing.
+fn test_dial_a_name_left_in_the_queue_costs_the_peer_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice, bob, _dan, gate, book) =
+        penalty_fixture(tmp.path(), time::Duration::from_millis(300));
+    let before = penalty(&alice, &bob, &book);
+    hold_resolvers(&alice, &gate);
+    let result = alice
+        .handle
+        .clone()
+        .connect(bob.id, by_name(&bob), connect_options())
+        .unwrap();
+    assert!(
+        matches!(&result, ConnectResult::Disconnected { reason } if reason.contains("no resolver was free")),
+        "{result:?}"
+    );
+    let after = penalty(&alice, &bob, &book);
+    gate.held.release();
+    assert_eq!(after, before);
+}
+
+#[test]
+// Review of heartwood #4, round 2: a name a resolver tried, and that didn't
+// resolve in time, is bob's, and costs him as a failed dial always has.
+fn test_dial_a_name_too_slow_to_resolve_costs_the_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice, bob, _dan, gate, book) =
+        penalty_fixture(tmp.path(), time::Duration::from_millis(300));
+    let before = penalty(&alice, &bob, &book);
+    let result = alice
+        .handle
+        .clone()
+        .connect(bob.id, by_name(&bob), connect_options())
+        .unwrap();
+    assert!(
+        matches!(&result, ConnectResult::Disconnected { reason } if reason.contains("name resolution timed out")),
+        "{result:?}"
+    );
+    let after = penalty(&alice, &bob, &book);
+    gate.held.release();
+    assert!(after > before, "{after:?} after {before:?}");
 }

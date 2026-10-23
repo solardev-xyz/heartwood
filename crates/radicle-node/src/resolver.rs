@@ -7,6 +7,7 @@
 //! before a worker takes it isn't resolved at all.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{io, net, thread};
 
@@ -25,6 +26,9 @@ pub(crate) struct Job {
     /// When the dial gives up: `None` for a timeout too large to add to the
     /// current time.
     pub deadline: Option<Instant>,
+    /// Set once a worker has taken it to resolve: a dial that gives up before
+    /// then failed for want of a free worker, not for its name.
+    pub taken: Arc<AtomicBool>,
 }
 
 /// Where the wire queues names to resolve.
@@ -112,6 +116,7 @@ fn work(queued: chan::Receiver<Job>, gate: &dyn Gate, controller: Controller) {
         {
             continue;
         }
+        job.taken.store(true, Ordering::Release);
         let answers: io::Result<Vec<net::SocketAddr>> = gate.resolve(&job.host, job.port);
         // The reactor may have stopped: nothing to tell then.
         controller

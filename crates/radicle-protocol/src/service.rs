@@ -1494,7 +1494,8 @@ where
                     }
                 }
                 DisconnectReason::Session(e) => e.severity(),
-                DisconnectReason::Command
+                DisconnectReason::Local(_)
+                | DisconnectReason::Command
                 | DisconnectReason::Conflict
                 | DisconnectReason::Policy
                 | DisconnectReason::SelfConnection => Severity::Low,
@@ -2909,6 +2910,10 @@ pub enum DisconnectReason {
     /// Error while dialing the remote. This error occurs before a connection is
     /// even established. Errors of this kind are usually not transient.
     Dial(Arc<dyn std::error::Error + Sync + Send>),
+    /// The dial failed before the remote was tried, for a reason of this
+    /// node's own: no resolver was free to resolve its name in time. It
+    /// counts against nothing of the remote's.
+    Local(Arc<dyn std::error::Error + Sync + Send>),
     /// Error with an underlying established connection. Sometimes, reconnecting
     /// after such an error is possible.
     Connection(Arc<dyn std::error::Error + Sync + Send>),
@@ -2946,6 +2951,7 @@ impl fmt::Display for DisconnectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Dial(err) => write!(f, "{err}"),
+            Self::Local(err) => write!(f, "{err}"),
             Self::Connection(err) => write!(f, "{err}"),
             Self::Command => write!(f, "command"),
             Self::SelfConnection => write!(f, "self-connection"),

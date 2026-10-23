@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use std::{io, net, time};
@@ -79,6 +80,8 @@ struct Resolving {
     addr: Address,
     /// `None` for a timeout too large to add to the current time.
     deadline: Option<Instant>,
+    /// Set once a worker has taken the name to resolve.
+    taken: Arc<AtomicBool>,
 }
 
 /// Peer session type.
@@ -512,6 +515,15 @@ where
             .disconnected(nid, Link::Outbound, &DisconnectReason::Dial(Arc::new(err)));
     }
 
+    /// Fails the dial of `nid` at `addr` with `err`, a reason of this node's
+    /// own: the remote was never tried, and isn't held to account for it.
+    fn dial_refused(&mut self, nid: NodeId, addr: &Address, err: io::Error) {
+        logger::establish_connection(addr, &err);
+
+        self.service
+            .disconnected(nid, Link::Outbound, &DisconnectReason::Local(Arc::new(err)));
+    }
+
     /// Resolves `host` on a thread of its own, through the gate, and dials
     /// `nid` at `addr` once the answer is back, or fails the dial at the
     /// deadline. The reactor never waits on a resolver.
@@ -520,15 +532,18 @@ where
         self.next_resolution += 1;
         let timeout = self.gate.resolve_timeout();
         let deadline = Instant::now().checked_add(timeout);
+        let taken = Arc::new(AtomicBool::new(false));
         let job = resolver::Job {
             id,
             host,
             port,
             deadline,
+            taken: taken.clone(),
         };
         if self.resolvers.submit(job).is_err() {
-            // Every resolver is busy and the queue is full: fail at once.
-            return self.dial_failed(
+            // Every resolver is busy and the queue is full: fail at once, as
+            // this node's own failure.
+            return self.dial_refused(
                 nid,
                 &addr,
                 io::Error::new(
@@ -543,6 +558,7 @@ where
                 nid,
                 addr,
                 deadline,
+                taken,
             },
         );
         if deadline.is_some() {
@@ -559,6 +575,7 @@ where
             nid,
             addr,
             deadline,
+            ..
         }) = self.resolving.remove(&id)
         else {
             return;
@@ -587,11 +604,29 @@ where
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         for id in expired {
-            if let Some(Resolving { nid, addr, .. }) = self.resolving.remove(&id) {
+            let Some(Resolving {
+                nid, addr, taken, ..
+            }) = self.resolving.remove(&id)
+            else {
+                continue;
+            };
+            if taken.load(Ordering::Acquire) {
+                // A worker resolved the name, and it was too slow.
                 self.dial_failed(
                     nid,
                     &addr,
                     io::Error::new(io::ErrorKind::TimedOut, "name resolution timed out"),
+                );
+            } else {
+                // No worker was free before the deadline: the name was never
+                // tried.
+                self.dial_refused(
+                    nid,
+                    &addr,
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "no resolver was free before the dial's deadline",
+                    ),
                 );
             }
         }
