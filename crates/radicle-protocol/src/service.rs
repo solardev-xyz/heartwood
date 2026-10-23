@@ -231,6 +231,8 @@ pub enum ConnectError {
     UnsupportedAddress { nid: NodeId, addr: Address },
     #[error("attempted connection with blocked peer {nid}")]
     Blocked { nid: NodeId },
+    #[error("the node has stopped")]
+    Stopped,
 }
 
 /// A store for all node data.
@@ -379,6 +381,10 @@ pub struct Service<D, S> {
     /// Which addresses the node may connect to, asked of announced
     /// addresses before they enter the address book.
     gate: Arc<dyn dial::Gate>,
+    /// Whether the service has stopped: once it has, it does nothing more.
+    stopped: bool,
+    /// The error it stopped with, until the node takes it.
+    fatal: Option<Error>,
     /// Local listening addresses.
     listening: Vec<net::SocketAddr>,
     /// Latest metrics for all nodes connected to since the last start.
@@ -567,6 +573,7 @@ where
         let fetcher = {
             let config = fetcher::Config::new()
                 .with_max_concurrency(
+                    // Nb. The node's `Runtime::init` refuses a zero before it gets here.
                     std::num::NonZeroUsize::new(config.limits.fetch_concurrency.into())
                         .expect("fetch concurrency was zero, must be at least 1"),
                 )
@@ -600,6 +607,8 @@ where
             last_online_at: None, // Updated on initialize.
             emitter,
             gate,
+            stopped: false,
+            fatal: None,
             listening: vec![],
             metrics: Metrics::default(),
         }
@@ -636,13 +645,49 @@ where
             // Nb. This is potentially slow if we have lots of repos. We should probably
             // only re-compute the filter when we've unseeded a certain amount of repos
             // and the filter is really out of date.
-            self.filter = Filter::allowed_by(self.policies.seed_policies()?);
+            //
+            // The policy is already updated, so a failure here keeps the old filter, which
+            // still lets us hear about the repo, rather than failing the unseed.
+            match self.policies.seed_policies() {
+                Ok(policies) => self.filter = Filter::allowed_by(policies),
+                Err(e) => {
+                    warn!(target: "service", "Failed to update the subscription filter after unseed: {e}")
+                }
+            }
             // Update and announce new inventory.
             if let Err(e) = self.remove_inventory(id) {
                 warn!(target: "service", "Failed to update inventory after unseed: {e}");
             }
         }
         Ok(updated)
+    }
+
+    /// Stop the node with `error`, a failure the service can't go on from. The
+    /// caller returns at once, leaving the work it was doing undone.
+    fn stop(&mut self, error: impl Into<Error>) {
+        let error = error.into();
+        error!(target: "service", "Stopping the node: {error}");
+        if !self.stopped {
+            self.stopped = true;
+            self.fatal = Some(error);
+        }
+    }
+
+    /// Whether the service has stopped: once it has, every entry point
+    /// returns at once, and the node is to stop before handing it anything
+    /// more.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// The error the service stopped with, if it has.
+    pub fn fatal(&self) -> Option<&Error> {
+        self.fatal.as_ref()
+    }
+
+    /// Takes the error the service stopped with, if it has. It stays stopped.
+    pub fn take_fatal(&mut self) -> Option<Error> {
+        self.fatal.take()
     }
 
     /// Find the closest `n` peers by proximity in seeding graphs.
@@ -720,6 +765,9 @@ where
     }
 
     pub fn tick(&mut self, now: LocalTime, metrics: &Metrics) {
+        if self.stopped {
+            return;
+        }
         trace!(
             target: "service",
             "Tick +{}",
@@ -740,6 +788,9 @@ where
     }
 
     pub fn wake(&mut self) {
+        if self.stopped {
+            return;
+        }
         let now = self.clock;
 
         trace!(
@@ -807,6 +858,10 @@ where
     }
 
     pub fn command(&mut self, cmd: Command) {
+        if self.stopped {
+            // Its responder is dropped: the caller learns the node has stopped.
+            return;
+        }
         info!(target: "service", "Received command {cmd:?}");
 
         match cmd {
@@ -864,9 +919,13 @@ where
             }
             Command::Seed(rid, scope, resp) => {
                 // Update our seeding policy.
-                let seeded = self
-                    .seed(&rid, scope)
-                    .expect("Service::command: error seeding repository");
+                let seeded = match self.seed(&rid, scope) {
+                    Ok(seeded) => seeded,
+                    Err(e) => {
+                        resp.err(e).ok();
+                        return;
+                    }
+                };
                 resp.ok(seeded).ok();
 
                 // Let all our peers know that we're interested in this repo from now on.
@@ -876,30 +935,31 @@ where
                 );
             }
             Command::Unseed(id, resp) => {
-                let updated = self
-                    .unseed(&id)
-                    .expect("Service::command: error unseeding repository");
-                resp.ok(updated).ok();
+                match self.unseed(&id) {
+                    Ok(updated) => resp.ok(updated).ok(),
+                    Err(e) => resp.err(e).ok(),
+                };
             }
             Command::Follow(id, alias, resp) => {
-                let seeded = self
-                    .policies
-                    .follow(&id, alias.as_ref())
-                    .expect("Service::command: error following node");
-                resp.ok(seeded).ok();
+                match self.policies.follow(&id, alias.as_ref()) {
+                    Ok(seeded) => resp.ok(seeded).ok(),
+                    Err(e) => resp.err(e).ok(),
+                };
             }
             Command::Unfollow(id, resp) => {
-                let updated = self
-                    .policies
-                    .unfollow(&id)
-                    .expect("Service::command: error unfollowing node");
-                resp.ok(updated).ok();
+                match self.policies.unfollow(&id) {
+                    Ok(updated) => resp.ok(updated).ok(),
+                    Err(e) => resp.err(e).ok(),
+                };
             }
             Command::Block(id, resp) => {
-                let updated = self
-                    .policies
-                    .set_follow_policy(&id, policy::Policy::Block)
-                    .expect("Service::command: error blocking node");
+                let updated = match self.policies.set_follow_policy(&id, policy::Policy::Block) {
+                    Ok(updated) => updated,
+                    Err(e) => {
+                        resp.err(e).ok();
+                        return;
+                    }
+                };
                 if updated {
                     self.outbox.disconnect(id, DisconnectReason::Policy);
                 }
@@ -977,6 +1037,15 @@ where
                     self.fetch(rid, from, status.want, config, None);
                     return true;
                 }
+            }
+            // A policy that can't be read stops the node, as the first read does.
+            Err(Error::Namespaces(e))
+                if matches!(
+                    *e,
+                    NamespacesError::FailedPolicy { .. } | NamespacesError::FailedNodes { .. }
+                ) =>
+            {
+                self.stop(Error::Namespaces(e));
             }
             Err(e) => {
                 warn!(target: "service", "Failed to get the refs status of {rid}: {e}");
@@ -1060,6 +1129,9 @@ where
         from: NodeId,
         result: Result<crate::worker::fetch::FetchResult, crate::worker::FetchError>,
     ) {
+        if self.stopped {
+            return;
+        }
         let cmd = fetcher::state::command::Fetched { from, rid };
         let fetcher::service::FetchCompleted { event, subscribers } = self.fetcher.fetched(cmd);
 
@@ -1185,10 +1257,13 @@ where
             };
 
             // Check seeding policy
-            let repo_entry = self
-                .policies
-                .seed_policy(&rid)
-                .expect("error accessing repo seeding configuration");
+            let repo_entry = match self.policies.seed_policy(&rid) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    self.stop(e);
+                    return;
+                }
+            };
 
             let SeedingPolicy::Allow { scope } = repo_entry.policy else {
                 debug!(target: "service", "Repository {} no longer seeded, skipping", rid);
@@ -1212,6 +1287,9 @@ where
 
     /// Inbound connection attempt.
     pub fn accepted(&mut self, ip: IpAddr) -> bool {
+        if self.stopped {
+            return false;
+        }
         // Always accept localhost connections, even if we already reached
         // our inbound connection limit.
         if ip.is_loopback() || ip.is_unspecified() {
@@ -1241,6 +1319,9 @@ where
     }
 
     pub fn attempted(&mut self, nid: NodeId, addr: Address) {
+        if self.stopped {
+            return;
+        }
         debug!(target: "service", "Attempted connection to {nid} ({addr})");
 
         if let Some(sess) = self.sessions.get_mut(&nid) {
@@ -1258,7 +1339,18 @@ where
     }
 
     pub fn connected(&mut self, remote: NodeId, addr: Address, link: Link) {
-        if let Ok(true) = self.policies.is_blocked(&remote) {
+        if self.stopped {
+            return;
+        }
+        let blocked = match self.policies.is_blocked(&remote) {
+            Ok(blocked) => blocked,
+            Err(e) => {
+                // An unreadable block policy never lets a connection through.
+                self.stop(e);
+                return;
+            }
+        };
+        if blocked {
             self.emitter.emit(Event::PeerDisconnected {
                 nid: remote,
                 reason: format!("{remote} is blocked"),
@@ -1323,6 +1415,9 @@ where
     }
 
     pub fn disconnected(&mut self, remote: NodeId, link: Link, reason: &DisconnectReason) {
+        if self.stopped {
+            return;
+        }
         let since = self.local_time();
         let Some(session) = self.sessions.get_mut(&remote) else {
             // Since we sometimes disconnect the service eagerly, it's not unusual to get a second
@@ -1422,6 +1517,9 @@ where
     }
 
     pub fn received_message(&mut self, remote: NodeId, message: Message) {
+        if self.stopped {
+            return;
+        }
         if let Err(err) = self.handle_message(&remote, message) {
             // If there's an error, stop processing messages from this peer.
             // However, we still relay messages returned up to this point.
@@ -1559,9 +1657,14 @@ where
 
                         // If we're seeding and connected to the announcer, and we don't have
                         // the inventory, fetch it from the announcer.
-                        if self.policies.is_seeding(id).expect(
-                            "Service::handle_announcement: error accessing seeding configuration",
-                        ) {
+                        let seeding = match self.policies.is_seeding(id) {
+                            Ok(seeding) => seeding,
+                            Err(e) => {
+                                self.stop(e);
+                                return Ok(None);
+                            }
+                        };
+                        if seeding {
                             // Only if we do not have the repository locally do we fetch here.
                             // If we do have it, only fetch after receiving a ref announcement.
                             match self.db.routing().entry(id, &nid) {
@@ -1644,9 +1747,13 @@ where
                         }
                     }
                 }
-                let repo_entry = self.policies.seed_policy(&message.rid).expect(
-                    "Service::handle_announcement: error accessing repo seeding configuration",
-                );
+                let repo_entry = match self.policies.seed_policy(&message.rid) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        self.stop(e);
+                        return Ok(None);
+                    }
+                };
                 let SeedingPolicy::Allow { scope } = repo_entry.policy else {
                     debug!(
                         target: "service",
@@ -1677,6 +1784,9 @@ where
                 };
                 // Finally, start the fetch.
                 self.fetch_refs_at(message.rid, remote.id, refs, scope, self.fetch_config());
+                if self.stopped {
+                    return Ok(None);
+                }
 
                 return Ok(relay);
             }
@@ -2073,14 +2183,8 @@ where
                     debug!(target: "service", "Routing table updated for {rid} with seed {from}");
                     events.push(Event::SeedDiscovered { rid, nid: from });
 
-                    if self
-                        .policies
-                        .is_seeding(&rid)
-                        .expect("Service::process_inventory: error accessing seeding configuration")
-                    {
-                        // TODO: We should fetch here if we're already connected, case this seed has
-                        // refs we don't have.
-                    }
+                    // TODO: If we're seeding `rid`, we should fetch here if we're already
+                    // connected, case this seed has refs we don't have.
                     synced.added.push(rid);
                 }
                 InsertResult::TimeUpdated => {
@@ -2233,8 +2337,14 @@ where
         if nid == *self.nid() {
             return Err(ConnectError::SelfConnection);
         }
-        if let Ok(true) = self.policies.is_blocked(&nid) {
-            return Err(ConnectError::Blocked { nid });
+        match self.policies.is_blocked(&nid) {
+            Ok(false) => {}
+            Ok(true) => return Err(ConnectError::Blocked { nid }),
+            Err(e) => {
+                // An unreadable block policy never lets a connection through.
+                self.stop(e);
+                return Err(ConnectError::Stopped);
+            }
         }
         if !self.is_supported_address(&addr) {
             return Err(ConnectError::UnsupportedAddress { nid, addr });
@@ -2460,7 +2570,8 @@ where
 
     /// Get a list of peers available to connect to, sorted by lowest penalty.
     fn available_peers(&mut self) -> Vec<Peer> {
-        match self.db.addresses().entries() {
+        let mut unreadable = None;
+        let peers = match self.db.addresses().entries() {
             Ok(entries) => {
                 // Nb. we don't want to connect to any peers that already have a session with us,
                 // even if it's in a disconnected state. Those sessions are re-attempted automatically.
@@ -2469,7 +2580,14 @@ where
                     .filter(|entry| !entry.address.banned)
                     .filter(|entry| !entry.penalty.is_connect_threshold_reached())
                     .filter(|entry| !self.sessions.contains_key(&entry.node))
-                    .filter(|entry| !self.policies.is_blocked(&entry.node).unwrap_or(false))
+                    // An unreadable block policy never lets a connection through.
+                    .filter(|entry| match self.policies.is_blocked(&entry.node) {
+                        Ok(blocked) => !blocked,
+                        Err(e) => {
+                            unreadable.get_or_insert(e);
+                            false
+                        }
+                    })
                     .filter(|entry| !self.config.external_addresses.contains(&entry.address.addr))
                     .filter(|entry| &entry.node != self.nid())
                     .filter(|entry| self.is_supported_address(&entry.address.addr))
@@ -2492,7 +2610,12 @@ where
                 warn!(target: "service", "Unable to lookup available peers in address book: {e}");
                 Vec::new()
             }
+        };
+        if let Some(e) = unreadable {
+            self.stop(e);
+            return Vec::new();
         }
+        peers
     }
 
     /// Fetch all repositories that are seeded but missing from storage.
@@ -2634,11 +2757,18 @@ where
 
         let now = self.local_time();
         let mut reconnect = Vec::new();
+        let mut unreadable = None;
 
         for (nid, session) in self.sessions.iter_mut() {
             if self.config.is_persistent(nid) {
-                if self.policies.is_blocked(nid).unwrap_or(false) {
-                    continue;
+                match self.policies.is_blocked(nid) {
+                    Ok(false) => {}
+                    Ok(true) => continue,
+                    Err(e) => {
+                        // An unreadable block policy never lets a connection through.
+                        unreadable = Some(e);
+                        break;
+                    }
                 }
                 if let session::State::Disconnected { retry_at, .. } = &mut session.state {
                     // TODO: Try to reconnect only if the peer was attempted. A disconnect without
@@ -2649,6 +2779,10 @@ where
                     }
                 }
             }
+        }
+        if let Some(e) = unreadable {
+            self.stop(e);
+            return;
         }
 
         for (nid, addr, attempts) in reconnect {

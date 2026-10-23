@@ -184,6 +184,13 @@ pub trait ReactionHandler: Send + Iterator<Item = Action<Self::Listener, Self::T
     /// Method called by the reactor on the start of each event loop once the poll has returned.
     fn tick(&mut self);
 
+    /// Whether the handler has stopped, so that the reactor must end at once: asked after
+    /// every call into the handler, before any further event, controller message or action
+    /// is handed to it. The reactor then ends as a shutdown through its controller does.
+    fn stopped(&mut self) -> bool {
+        false
+    }
+
     /// Method called by the reactor when a previously set timeout is fired.
     ///
     /// Related: [`Action::SetTimer`].
@@ -378,11 +385,17 @@ impl<H: ReactionHandler> Runtime<H> {
 
             // Inform the service that time has advanced.
             self.service.tick();
+            if self.service.stopped() {
+                return self.handle_shutdown();
+            }
 
             // Inform the service about errors during polling.
             if let Err(err) = res {
                 log::warn!(target: "reactor", "Failure during polling: {err}");
                 self.service.handle_error(Error::Poll(err));
+                if self.service.stopped() {
+                    return self.handle_shutdown();
+                }
             }
 
             // Inform the service that some timers have reacted.
@@ -393,16 +406,27 @@ impl<H: ReactionHandler> Runtime<H> {
             if timers_fired > 0 {
                 log::trace!(target: "reactor", "Timer has fired");
                 self.service.timer_reacted();
+                if self.service.stopped() {
+                    return self.handle_shutdown();
+                }
             }
 
-            if self.handle_events(tick, events) {
+            let Some(awoken) = self.handle_events(tick, events) else {
+                return self.handle_shutdown();
+            };
+            if awoken {
                 // If a wake event was emitted, eagerly consume all control messages.
                 loop {
                     use ControlMessage::*;
                     use TryRecvError::*;
 
                     match self.receiver.try_recv() {
-                        Ok(Command(cmd)) => self.service.handle_command(*cmd),
+                        Ok(Command(cmd)) => {
+                            self.service.handle_command(*cmd);
+                            if self.service.stopped() {
+                                return self.handle_shutdown();
+                            }
+                        }
                         Ok(Shutdown) => return self.handle_shutdown(),
                         Err(Empty) => break,
                         Err(Disconnected) => panic!("control channel disconnected unexpectedly"),
@@ -416,13 +440,17 @@ impl<H: ReactionHandler> Runtime<H> {
             }
 
             self.handle_actions(tick);
+            if self.service.stopped() {
+                return self.handle_shutdown();
+            }
         }
     }
 
     /// # Returns
     ///
-    /// Whether one of the events was originated from the waker.
-    fn handle_events(&mut self, instant: Instant, events: Events) -> bool {
+    /// Whether one of the events was originated from the waker, or `None` once the handler
+    /// has stopped: the events after it aren't handed to it.
+    fn handle_events(&mut self, instant: Instant, events: Events) -> Option<bool> {
         log::trace!(target: "reactor", "Handling events");
         let mut awoken = false;
         let mut deregistered = Vec::new();
@@ -440,18 +468,21 @@ impl<H: ReactionHandler> Runtime<H> {
                         .listeners
                         .get_mut(&token)
                         .expect("resource disappeared");
-                    listener
-                        .handle(event)
-                        .into_iter()
-                        .for_each(|service_event| {
-                            self.service.listener_reacted(token, service_event, instant);
-                        });
+                    for service_event in listener.handle(event) {
+                        self.service.listener_reacted(token, service_event, instant);
+                        if self.service.stopped() {
+                            return None;
+                        }
+                    }
                 } else {
                     let listener = self.deregister_listener(token).unwrap_or_else(|| {
                         panic!("listener with token {} has disappeared", token.0)
                     });
                     self.service
                         .handle_error(Error::ListenerDisconnect(token, listener));
+                    if self.service.stopped() {
+                        return None;
+                    }
                     deregistered.push(token);
                 }
             } else if self.transports.contains_key(&token) {
@@ -461,19 +492,22 @@ impl<H: ReactionHandler> Runtime<H> {
                         .transports
                         .get_mut(&token)
                         .expect("resource disappeared");
-                    transport
-                        .handle(event)
-                        .into_iter()
-                        .for_each(|service_event| {
-                            self.service
-                                .transport_reacted(token, service_event, instant);
-                        });
+                    for service_event in transport.handle(event) {
+                        self.service
+                            .transport_reacted(token, service_event, instant);
+                        if self.service.stopped() {
+                            return None;
+                        }
+                    }
                 } else {
                     let transport = self.deregister_transport(token).unwrap_or_else(|| {
                         panic!("transport with token {} has disappeared", token.0)
                     });
                     self.service
                         .handle_error(Error::TransportDisconnect(token, transport));
+                    if self.service.stopped() {
+                        return None;
+                    }
                     deregistered.push(token);
                 }
             } else if !deregistered.contains(&token) {
@@ -481,7 +515,7 @@ impl<H: ReactionHandler> Runtime<H> {
             }
         }
 
-        awoken
+        Some(awoken)
     }
 
     fn handle_actions(&mut self, instant: Instant) {
@@ -587,5 +621,115 @@ impl<H: ReactionHandler> Runtime<H> {
         }
 
         Some(source)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    type TestTransport = Transport<crate::wire::WireSession>;
+
+    /// A handler whose first tick waits at `barrier`, then stops.
+    struct Stopping {
+        barrier: Arc<Barrier>,
+        stopped: bool,
+        commands: Arc<AtomicBool>,
+    }
+
+    impl Iterator for Stopping {
+        type Item = Action<Listener, TestTransport>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            None
+        }
+    }
+
+    impl ReactionHandler for Stopping {
+        type Listener = Listener;
+        type Transport = TestTransport;
+
+        fn tick(&mut self) {
+            if !self.stopped {
+                self.barrier.wait();
+                self.stopped = true;
+            }
+        }
+
+        fn stopped(&mut self) -> bool {
+            self.stopped
+        }
+
+        fn timer_reacted(&mut self) {}
+
+        fn listener_reacted(
+            &mut self,
+            _: Token,
+            _: <Listener as EventHandler>::Reaction,
+            _: Instant,
+        ) {
+        }
+
+        fn transport_reacted(
+            &mut self,
+            _: Token,
+            _: <TestTransport as EventHandler>::Reaction,
+            _: Instant,
+        ) {
+        }
+
+        fn listener_registered(&mut self, _: Token, _: &Listener) {}
+
+        fn transport_registered(&mut self, _: Token, _: &TestTransport) {}
+
+        fn handle_command(&mut self, _: wire::Control) {
+            self.commands.store(true, Ordering::SeqCst);
+        }
+
+        fn handle_error(&mut self, _: Error<Listener, TestTransport>) {}
+
+        fn handover_listener(&mut self, _: Token, _: Listener) {}
+
+        fn handover_transport(&mut self, _: Token, _: TestTransport) {}
+    }
+
+    // heartwood#12, review round 1: once the handler has stopped, the reactor
+    // hands it nothing more, a command queued before it stopped included,
+    // and a shutdown queued behind that command doesn't take the stop's
+    // place.
+    #[test]
+    fn a_stopped_handler_gets_no_queued_command() {
+        for shutdown in [false, true] {
+            let barrier = Arc::new(Barrier::new(2));
+            let commands = Arc::new(AtomicBool::new(false));
+            let reactor = Reactor::new(
+                Stopping {
+                    barrier: barrier.clone(),
+                    stopped: false,
+                    commands: commands.clone(),
+                },
+                "test".to_owned(),
+            )
+            .unwrap();
+            let controller = reactor.controller();
+            controller
+                .cmd(wire::Control::User(
+                    protocol::service::Command::AnnounceInventory,
+                ))
+                .unwrap();
+            if shutdown {
+                controller.clone().shutdown().ok();
+            }
+            // The first tick goes on, and the handler stops.
+            barrier.wait();
+            reactor.join().unwrap();
+            assert!(
+                !commands.load(Ordering::SeqCst),
+                "a queued command ran after the handler had stopped (shutdown queued: {shutdown})"
+            );
+        }
     }
 }

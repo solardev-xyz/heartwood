@@ -2629,3 +2629,88 @@ fn test_dial_a_configured_peer_by_name_at_start() {
             .is_ok();
     assert!(connected, "alice never connected to bob by name");
 }
+
+/// `node`'s runtime, from its own configuration, or the error that refuses it.
+fn init(node: crate::test::node::Node) -> Result<crate::runtime::Runtime, crate::runtime::Error> {
+    let (_, signals) = std::sync::mpsc::sync_channel(1);
+    crate::runtime::Runtime::init(
+        node.home.clone(),
+        node.config,
+        Some(node.home.socket_default()),
+        vec![([127, 0, 0, 1], 0).into()],
+        signals,
+        node.secret_key,
+        std::sync::Arc::new(radicle::node::dial::Open),
+    )
+}
+
+#[test]
+// heartwood#12 (freedom-core design 0008): configuration checks at start are
+// errors from `Runtime::init`, not panics.
+fn test_init_refuses_a_zero_fetch_concurrency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut node = Node::init(tmp.path(), config::relay("alice"), 13);
+    node.config.limits.fetch_concurrency = 0.into();
+    assert!(matches!(
+        init(node),
+        Err(crate::runtime::Error::ZeroFetchConcurrency)
+    ));
+}
+
+#[test]
+fn test_init_refuses_too_many_external_addresses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut node = Node::init(tmp.path(), config::relay("alice"), 13);
+    node.config.external_addresses = (0..=service::ADDRESS_LIMIT as u16)
+        .map(|port| std::net::SocketAddr::from(([192, 0, 2, 1], 8000 + port)).into())
+        .collect();
+    match init(node) {
+        Err(crate::runtime::Error::TooManyAddresses(e)) => {
+            assert_eq!(e.0, service::ADDRESS_LIMIT + 1)
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+        Ok(_) => panic!("a node with too many external addresses started"),
+    }
+}
+
+#[test]
+//
+//     alice -- bob
+//
+// heartwood#12: a policy read that fails while the node handles a message
+// stops it, and its runtime returns that error.
+fn test_policy_failure_stops_the_node_with_its_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let rid = bob.project("bob", "");
+    let mut alice = alice.spawn();
+    let bob = bob.spawn();
+
+    // Alice seeds bob's repository, so that his refs announcements reach her.
+    alice.handle.seed(rid, Scope::All).unwrap();
+    alice.connect(&bob);
+
+    // Her policy tables are dropped behind her back. The first read after it
+    // finds no policy; the ones after it fail.
+    let mut db = sqlite::open(alice.home.node().join(radicle::node::POLICIES_DB_FILE)).unwrap();
+    // Alice's node may hold the database for a moment: wait for it.
+    db.set_busy_timeout(10_000).unwrap();
+    db.execute(r#"DROP TABLE "seeding"; DROP TABLE "following";"#)
+        .unwrap();
+
+    // Bob announces his refs until alice, reading her policy for them, stops.
+    let mut bob_handle = bob.handle.clone();
+    let deadline = time::Instant::now() + time::Duration::from_secs(30);
+    while !alice.thread.is_finished() {
+        assert!(time::Instant::now() < deadline, "alice never stopped");
+        bob_handle.announce_refs_for(rid, [bob.id]).ok();
+        thread::sleep(time::Duration::from_millis(200));
+    }
+    match alice.stopped(time::Duration::from_secs(1)) {
+        Err(crate::runtime::Error::Service(e)) => {
+            assert!(matches!(*e, service::Error::Policy(_)), "{e}")
+        }
+        other => panic!("expected the policy error, got {other:?}"),
+    }
+}
