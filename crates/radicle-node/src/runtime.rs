@@ -26,6 +26,7 @@ use radicle::node::address;
 use radicle::node::address::Store as _;
 use radicle::node::dial::Gate;
 use radicle::node::events::Emitter;
+use radicle::node::gate::RepoGate;
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
 use radicle::node::{NodeId, routing};
@@ -38,6 +39,7 @@ use crate::control;
 use crate::reactor;
 use crate::reactor::Reactor;
 use crate::resolver;
+use crate::wire;
 use crate::wire::{Stopped, Wire};
 use crate::worker;
 
@@ -158,6 +160,7 @@ impl Runtime {
     /// for it ([`radicle::node::dial::Open`] keeps the node's own behaviour).
     ///
     /// This function spawns threads.
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         home: Home,
         config: radicle::node::Config,
@@ -166,6 +169,7 @@ impl Runtime {
         signals: mpsc::Receiver<Signal>,
         secret_key: SigningKey,
         gate: Arc<dyn Gate>,
+        repositories: RepoGate,
     ) -> Result<Runtime, Error> {
         let id = NodeId::from(*secret_key.public_key());
         let alias = config.alias.clone();
@@ -251,7 +255,8 @@ impl Runtime {
             announcement,
             emitter.clone(),
             gate.clone(),
-        );
+        )
+        .with_repositories(repositories.clone());
         service.initialize(clock)?;
 
         let (worker_send, worker_recv) =
@@ -272,6 +277,14 @@ impl Runtime {
         let mut resolvers = None;
         let reactor = Reactor::with(
             |controller| {
+                // The gate tells the service of every change of a
+                // repository's state, through the reactor.
+                let gated = controller.clone();
+                repositories.listen(move |rid, state| {
+                    gated
+                        .cmd(wire::Control::User(service::Command::Gate(rid, state)))
+                        .ok();
+                });
                 let (queue, workers) = resolver::spawn(
                     gate.clone(),
                     controller,
@@ -315,6 +328,7 @@ impl Runtime {
                 fetch,
                 policy,
                 policies_db: home.node().join(node::POLICIES_DB_FILE),
+                repositories,
             },
         )?;
         let control = socket.map(Self::bind).transpose()?;

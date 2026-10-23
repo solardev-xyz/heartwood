@@ -122,6 +122,7 @@ fn run_with_signals(
         receiver,
         node.secret_key,
         std::sync::Arc::new(radicle::node::dial::Open),
+        radicle::node::gate::RepoGate::new(),
     )
     .unwrap();
     assert!(runtime.control.is_none());
@@ -2659,6 +2660,7 @@ fn init(node: crate::test::node::Node) -> Result<crate::runtime::Runtime, crate:
         signals,
         node.secret_key,
         std::sync::Arc::new(radicle::node::dial::Open),
+        radicle::node::gate::RepoGate::new(),
     )
 }
 
@@ -2930,4 +2932,86 @@ fn test_dial_a_name_too_slow_to_resolve_costs_the_peer() {
     let after = penalty(&alice, &bob, &book);
     gate.held.release();
     assert!(after > before, "{after:?} after {before:?}");
+}
+
+#[test]
+// heartwood#14 (freedom-core design 0008): a fetch of a repository being
+// repaired waits, through the runtime, until the host opens it again.
+fn test_gate_a_fetch_waits_for_the_repair() {
+    use radicle::node::gate::{RepoGate, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    let gate = RepoGate::new();
+    let mut alice = alice.spawn_with_repositories(gate.clone());
+    let bob = bob.spawn();
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+    alice.handle.seed(acme, Scope::All).unwrap();
+
+    gate.close(acme, RepoState::Repairing, time::Duration::from_secs(5))
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut handle = alice.handle.clone();
+    let fetching = thread::spawn(move || {
+        tx.send(handle.fetch(acme, bob.id, DEFAULT_TIMEOUT, None))
+            .unwrap();
+    });
+    // While it is being repaired, nothing of it is fetched.
+    assert!(rx.recv_timeout(time::Duration::from_millis(500)).is_err());
+    assert!(alice.storage.repository(acme).is_err());
+
+    gate.open(acme);
+    let result = rx
+        .recv_timeout(time::Duration::from_secs(20))
+        .unwrap()
+        .unwrap();
+    assert!(result.is_success(), "{result:?}");
+    assert!(alice.storage.repository(acme).is_ok());
+    fetching.join().unwrap();
+}
+
+#[test]
+// heartwood#14: a repository quarantined for a namespace isn't served; one
+// quarantined for its cache is.
+fn test_gate_a_namespace_quarantine_isnt_served() {
+    use radicle::node::gate::{Quarantine, RepoGate, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    let gate = RepoGate::new();
+    let mut alice = alice.spawn();
+    let bob = bob.spawn_with_repositories(gate.clone());
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+    alice.handle.seed(acme, Scope::All).unwrap();
+
+    gate.close(
+        acme,
+        RepoState::Quarantined(Quarantine::Namespace),
+        time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let result = alice
+        .handle
+        .fetch(acme, bob.id, DEFAULT_TIMEOUT, None)
+        .unwrap();
+    assert!(!result.is_success(), "{result:?}");
+    assert!(alice.storage.repository(acme).is_err());
+
+    gate.close(
+        acme,
+        RepoState::Quarantined(Quarantine::Cache),
+        time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let result = alice
+        .handle
+        .fetch(acme, bob.id, DEFAULT_TIMEOUT, None)
+        .unwrap();
+    assert!(result.is_success(), "{result:?}");
 }

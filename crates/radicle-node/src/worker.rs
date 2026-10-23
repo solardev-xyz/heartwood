@@ -14,6 +14,7 @@ use crossbeam_channel as chan;
 use protocol::wire::StreamId;
 use protocol::worker::{AuthorizationError, FetchError, FetchRequest, FetchResult, UploadError};
 use radicle::identity::RepoId;
+use radicle::node::gate::RepoGate;
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
 use radicle::node::policy::config::SeedingPolicy;
@@ -36,6 +37,8 @@ pub struct Config {
     pub policy: SeedingPolicy,
     /// Path to the policies database.
     pub policies_db: PathBuf,
+    /// The repository gate: which repositories may be fetched and served.
+    pub repositories: RepoGate,
 }
 
 /// Task to be accomplished on a worker thread.
@@ -73,6 +76,7 @@ struct Worker {
     notifications: notifications::StoreWriter,
     cache: cob::cache::StoreWriter,
     db: radicle::node::Database,
+    repositories: RepoGate,
 }
 
 impl Worker {
@@ -241,6 +245,11 @@ impl Worker {
     }
 
     fn is_authorized(&self, remote: NodeId, rid: RepoId) -> Result<(), AuthorizationError> {
+        // A repository quarantined for a namespace isn't served.
+        let state = self.repositories.state(&rid);
+        if !state.serves() {
+            return Err(AuthorizationError::Gated(rid, state));
+        }
         let policy = self.policies.seed_policy(&rid)?.policy;
         // Check policy first, since if we're blocking then we likely don't have
         // the repository.
@@ -266,6 +275,14 @@ impl Worker {
         channels: channels::ChannelsFlush,
         notifs: notifications::StoreWriter,
     ) -> Result<protocol::worker::fetch::FetchResult, FetchError> {
+        // The repository gate's pass, held until the fetch and its cache
+        // update are done: closing the repository waits for it.
+        let Some(_pass) = self.repositories.enter(rid) else {
+            return Err(FetchError::Closed {
+                rid,
+                state: self.repositories.state(&rid),
+            });
+        };
         let FetchConfig { local, expiry } = &self.fetch_config;
         // N.b. if the `rid` is blocked this will return an error, so
         // we won't continue with any further set up of the fetch.
@@ -332,6 +349,7 @@ impl Pool {
                 notifications: notifications.clone(),
                 cache: cache.clone(),
                 db: db.clone(),
+                repositories: config.repositories.clone(),
             };
             let thread = thread::spawn(&nid, format!("worker#{i}"), || worker.run());
 

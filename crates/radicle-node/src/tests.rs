@@ -2498,3 +2498,206 @@ fn a_stopped_service_does_nothing_more() {
         "a stopped service stored an announcement"
     );
 }
+
+/// A peer whose storage holds three repositories of its own, signed with
+/// its own key.
+fn gated_peer(tmp: &std::path::Path) -> Peer<Storage> {
+    let signer = SigningKey::mock(AMY as usize);
+    let storage = fixtures::storage(tmp.join("amy"), &signer).unwrap();
+    Peer::with_storage("amy", AMY, storage)
+}
+
+#[test]
+// heartwood#14 (freedom-core design 0008): a fetch of a repository being
+// repaired waits for it to open again, then runs.
+fn gate_defers_a_fetch_until_the_repository_opens() {
+    let storage = arbitrary::nonempty_storage(1);
+    let rid = *storage.repos.keys().next().unwrap();
+    let doc = storage.repos.get(&rid).unwrap().doc.clone();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+
+    gate.close(rid, node::gate::RepoState::Repairing, time::Duration::ZERO)
+        .unwrap();
+    let (cmd, result) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_matches!(amy.fetches().next(), None);
+    assert!(result.try_recv().is_err(), "it waits");
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, node::gate::RepoState::Open));
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    amy.fetched(rid, *bob.nid(), Ok(FetchResult::new(doc)));
+    assert_matches!(result.try_recv(), Ok(Ok(node::FetchResult::Success { .. })));
+}
+
+#[test]
+// heartwood#14: a fetch that reached a worker after its repository closed for
+// repair waits for it to open again, then runs.
+fn gate_defers_a_fetch_a_worker_found_closed() {
+    let storage = arbitrary::nonempty_storage(1);
+    let rid = *storage.repos.keys().next().unwrap();
+    let doc = storage.repos.get(&rid).unwrap().doc.clone();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+
+    let (cmd, result) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    let repairing = node::gate::RepoState::Repairing;
+    gate.close(rid, repairing, time::Duration::ZERO).unwrap();
+    amy.fetched(
+        rid,
+        *bob.nid(),
+        Err(protocol::worker::FetchError::Closed {
+            rid,
+            state: repairing,
+        }),
+    );
+    assert!(result.try_recv().is_err(), "it waits");
+    assert_matches!(amy.fetches().next(), None);
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, node::gate::RepoState::Open));
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    amy.fetched(rid, *bob.nid(), Ok(FetchResult::new(doc)));
+    assert_matches!(result.try_recv(), Ok(Ok(node::FetchResult::Success { .. })));
+}
+
+#[test]
+// heartwood#14: a fetch of a quarantined repository is refused, and fetches
+// waiting for its repair fail once it is quarantined.
+fn gate_refuses_a_fetch_of_a_quarantined_repository() {
+    use node::gate::{Quarantine, RepoState};
+
+    let storage = arbitrary::nonempty_storage(1);
+    let rid = *storage.repos.keys().next().unwrap();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+
+    gate.close(rid, RepoState::Repairing, time::Duration::ZERO)
+        .unwrap();
+    let (cmd, waiting) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    let quarantined = RepoState::Quarantined(Quarantine::Cache);
+    gate.close(rid, quarantined, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, quarantined));
+    assert_matches!(
+        waiting.try_recv(),
+        Ok(Ok(node::FetchResult::Failed { reason })) if reason.contains("quarantined")
+    );
+
+    let (cmd, refused) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_matches!(
+        refused.try_recv(),
+        Ok(Ok(node::FetchResult::Failed { reason })) if reason.contains("quarantined")
+    );
+    assert_matches!(amy.fetches().next(), None);
+}
+
+#[test]
+// heartwood#14: refs of a repository being repaired are announced once it
+// opens again, not before; a repository quarantined for its cache is still
+// announced, and one quarantined for a namespace isn't.
+fn gate_holds_back_refs_announcements() {
+    use node::gate::{Quarantine, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let bob = Peer::bob();
+    let rid = *amy.inventory().iter().next().unwrap();
+    amy.connect_to(&bob);
+    // Bob takes every announcement.
+    amy.receive(*bob.nid(), Message::Subscribe(Subscribe::all()));
+    amy.messages(*bob.nid()).for_each(drop);
+    let gate = amy.repositories().clone();
+    let refs = |amy: &mut Peer<Storage>| {
+        amy.messages(*bob.nid())
+            .filter(|m| {
+                matches!(
+                    m,
+                    Message::Announcement(Announcement {
+                        message: AnnouncementMessage::Refs(RefsAnnouncement { rid: r, .. }),
+                        ..
+                    }) if *r == rid
+                )
+            })
+            .count()
+    };
+    let announce = |amy: &mut Peer<Storage>| {
+        let (cmd, result) = Command::announce_refs(rid, [*amy.nid()].into());
+        amy.command(cmd);
+        result.try_recv().unwrap()
+    };
+
+    gate.close(rid, RepoState::Repairing, time::Duration::ZERO)
+        .unwrap();
+    assert!(announce(&mut amy).is_err());
+    assert_eq!(refs(&mut amy), 0);
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    assert_eq!(refs(&mut amy), 1, "announced once it opened");
+
+    let cache = RepoState::Quarantined(Quarantine::Cache);
+    gate.close(rid, cache, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, cache));
+    assert!(announce(&mut amy).is_ok());
+    assert_eq!(refs(&mut amy), 1);
+
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, namespace, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, namespace));
+    assert!(announce(&mut amy).is_err());
+    assert_eq!(refs(&mut amy), 0);
+}
+
+#[test]
+// heartwood#14: a repository quarantined for a namespace leaves the
+// inventory, and comes back once it opens.
+fn gate_leaves_a_namespace_quarantine_out_of_the_inventory() {
+    use node::gate::{Quarantine, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let bob = Peer::bob();
+    let rid = *amy.inventory().iter().next().unwrap();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+    let last = |amy: &mut Peer<Storage>| {
+        amy.inventory_announcements(*bob.nid())
+            .filter_map(|m| match m {
+                Message::Announcement(Announcement {
+                    message: AnnouncementMessage::Inventory(InventoryAnnouncement { inventory, .. }),
+                    ..
+                }) => Some(inventory.iter().copied().collect::<BTreeSet<_>>()),
+                _ => None,
+            })
+            .last()
+    };
+    assert!(amy.inventory().contains(&rid));
+
+    // Being repaired, or quarantined for its cache, it stays in.
+    for state in [
+        RepoState::Repairing,
+        RepoState::Quarantined(Quarantine::Cache),
+    ] {
+        gate.close(rid, state, time::Duration::ZERO).unwrap();
+        amy.command(Command::Gate(rid, state));
+        assert_eq!(last(&mut amy), None, "{state}: no new inventory");
+    }
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, namespace, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, namespace));
+    assert!(!last(&mut amy).unwrap().contains(&rid));
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    assert!(last(&mut amy).unwrap().contains(&rid));
+}
