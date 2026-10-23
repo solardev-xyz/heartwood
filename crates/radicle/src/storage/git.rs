@@ -2,6 +2,7 @@
 pub mod cob;
 pub mod transport;
 
+pub mod reconcile;
 pub mod temp;
 pub use temp::TempRepository;
 
