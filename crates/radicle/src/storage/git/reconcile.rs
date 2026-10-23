@@ -327,7 +327,7 @@ mod tests {
             })
         };
         // The walk that resolved `refs/` again by its path followed the link
-        // within the first few thousand calls.
+        // within its first calls, in well under a second.
         for _ in 0..100_000 {
             let _ = remove_ref_locks(repo.path());
             if !victim.exists() {
