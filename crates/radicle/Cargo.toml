@@ -60,6 +60,8 @@ unicode-normalization = { version = "0.1" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# Handle-relative directory walks for `storage::git::reconcile`.
+rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 uds_windows = { workspace = true }

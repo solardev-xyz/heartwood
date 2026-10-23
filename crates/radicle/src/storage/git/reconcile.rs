@@ -4,14 +4,22 @@
 //! Each function is one unit of that repair: idempotent, and safe to run
 //! again after a kill at any point. Run them only while no node runs on the
 //! storage, since they remove what a live operation would still be using.
+//!
+//! A unit follows the root it is given, the storage or a repository, even
+//! a link: that path is the host's own choice, and a home may be linked
+//! elsewhere. It follows no link under that root (see `dir`).
 
-use std::ffi::OsString;
+mod dir;
+
+use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::Path;
-use std::{fs, io};
 
 use crate::prelude::RepoId;
 
 use super::TempRepository;
+
+use dir::{Dir, Kind};
 
 /// The extension the storage once gave temporary clones.
 const LEGACY_TEMP_EXT: &str = "lock";
@@ -34,14 +42,15 @@ pub struct TemporaryClones {
 /// names them, or `<RID>.lock`, as the storage once did, where `<RID>`
 /// parses as a repository ID.
 ///
-/// An entry is removed only once `lstat` shows a real directory, and the
-/// removal follows no symbolic links. Any other entry with an extension,
-/// a symbolic link with a clone's name included, is left alone and
-/// counted.
+/// A clone is removed only if it is a directory itself, and its removal
+/// follows no links. Any other entry with an extension, a link with a
+/// clone's name included, is left alone and counted. `storage` itself is
+/// followed if it is a link, as every unit's root is.
 pub fn remove_temporary_clones(storage: &Path) -> io::Result<TemporaryClones> {
     let mut done = TemporaryClones::default();
-    for entry in fs::read_dir(storage)? {
-        let path = entry?.path();
+    let root = Dir::open_root(storage)?;
+    for name in root.names()? {
+        let path = Path::new(&name);
         let Some(ext) = path.extension() else {
             continue;
         };
@@ -53,13 +62,10 @@ pub fn remove_temporary_clones(storage: &Path) -> io::Result<TemporaryClones> {
             done.left += 1;
             continue;
         };
-        if !fs::symlink_metadata(&path)?.file_type().is_dir() {
+        if !root.remove_tree(&name)? {
             done.left += 1;
             continue;
         }
-        // Follows no symbolic links: one found inside is removed, not its
-        // target, and so is the clone's own path if it was swapped for one.
-        fs::remove_dir_all(&path)?;
         done.removed.push(rid);
     }
     Ok(done)
@@ -72,46 +78,39 @@ pub fn remove_temporary_clones(storage: &Path) -> io::Result<TemporaryClones> {
 /// refuses a ref name any of whose components ends in `.lock`, so no file
 /// removed under `refs/` is a ref.
 ///
-/// Symbolic links are neither followed nor removed. Returns how many lock
-/// files were removed.
+/// Links are never followed, and a link already there is left. `repo`
+/// itself is followed if it is a link, as every unit's root is. Returns how
+/// many lock files were removed.
 pub fn remove_ref_locks(repo: &Path) -> io::Result<usize> {
+    let root = Dir::open_root(repo)?;
     let mut removed = 0;
     for name in ROOT_LOCKS {
-        let path = repo.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_file() => {
-                fs::remove_file(&path)?;
-                removed += 1;
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+        let name = OsStr::new(name);
+        if root.kind(name)? == Some(Kind::File) && root.remove_file(name)? {
+            removed += 1;
         }
     }
-    let refs = repo.join("refs");
-    match fs::symlink_metadata(&refs) {
-        Ok(meta) if meta.file_type().is_dir() => removed += remove_locks_under(&refs)?,
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    if let Some(refs) = root.open_dir(OsStr::new("refs"))? {
+        removed += remove_locks_under(&refs)?;
     }
     Ok(removed)
 }
 
 /// Removes the regular files named `*.lock` in `dir` and the directories
-/// under it, descending into real directories only.
-fn remove_locks_under(dir: &Path) -> io::Result<usize> {
+/// under it, entering directories themselves only.
+fn remove_locks_under(dir: &Dir) -> io::Result<usize> {
     let mut removed = 0;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        // Doesn't follow a symbolic link.
-        let kind = entry.file_type()?;
-        let path = entry.path();
-        if kind.is_dir() {
-            removed += remove_locks_under(&path)?;
-        } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "lock") {
-            fs::remove_file(&path)?;
-            removed += 1;
+    for name in dir.names()? {
+        match dir.kind(&name)? {
+            Some(Kind::Dir) => {
+                if let Some(sub) = dir.open_dir(&name)? {
+                    removed += remove_locks_under(&sub)?;
+                }
+            }
+            Some(Kind::File) if Path::new(&name).extension() == Some(OsStr::new("lock")) => {
+                removed += usize::from(dir.remove_file(&name)?);
+            }
+            _ => {}
         }
     }
     Ok(removed)
@@ -120,6 +119,8 @@ fn remove_locks_under(dir: &Path) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs;
 
     use crate::test::arbitrary;
 
@@ -287,5 +288,141 @@ mod tests {
         assert!(elsewhere.exists());
         assert!(outside.path().join("dir/inner.lock").exists());
         assert!(fs::symlink_metadata(root.join("refs/heads/main.lock")).is_ok());
+    }
+
+    // Review of heartwood #5, round 1: a `refs/` directory swapped for a link
+    // to elsewhere while the walk runs is never followed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refs_directory_swapped_for_a_link_is_never_followed() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let refs = repo.path().join("refs");
+        let spare = repo.path().join("spare");
+        fs::create_dir(&refs).unwrap();
+        symlink(outside.path(), &spare).unwrap();
+        let victim = outside.path().join("victim.lock");
+        file(&victim);
+        // `RENAME_EXCHANGE` needs a filesystem that has it.
+        if let Err(e) = renameat_with(CWD, &refs, CWD, &spare, RenameFlags::EXCHANGE) {
+            eprintln!("skipped: the filesystem can't exchange names: {e}");
+            return;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swaps = Arc::new(AtomicUsize::new(0));
+        let swapper = {
+            let (stop, swaps) = (stop.clone(), swaps.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    renameat_with(CWD, &refs, CWD, &spare, RenameFlags::EXCHANGE).unwrap();
+                    swaps.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        // The walk that resolved `refs/` again by its path followed the link
+        // within the first few thousand calls.
+        for _ in 0..100_000 {
+            let _ = remove_ref_locks(repo.path());
+            if !victim.exists() {
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert!(swaps.load(Ordering::Relaxed) > 0);
+        assert!(
+            victim.exists(),
+            "a lock file outside the repository was removed"
+        );
+    }
+
+    // Review of heartwood #5, round 1: a unit's root is followed, by design.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_root_is_followed() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let clone = rid();
+        file(
+            &outside
+                .path()
+                .join(format!("{}.tmp/objects/x", clone.canonical())),
+        );
+        file(&outside.path().join("repo/refs/heads/main.lock"));
+        let storage = parent.path().join("storage");
+        symlink(outside.path(), &storage).unwrap();
+
+        let done = remove_temporary_clones(&storage).unwrap();
+        assert_eq!(
+            done,
+            TemporaryClones {
+                removed: vec![clone],
+                left: 0
+            }
+        );
+        assert!(
+            !outside
+                .path()
+                .join(format!("{}.tmp", clone.canonical()))
+                .exists()
+        );
+        assert_eq!(remove_ref_locks(&storage.join("repo")).unwrap(), 1);
+        assert!(!outside.path().join("repo/refs/heads/main.lock").exists());
+    }
+
+    /// A junction at `link` to the directory `target`, as `mklink /J` makes
+    /// one, with no privilege.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J {}", link.display());
+    }
+
+    // Review of heartwood #5, round 1: a junction is never followed, on
+    // Windows.
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_never_followed() {
+        let storage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        file(&outside.path().join("kept.lock"));
+        file(&outside.path().join("dir/inner.lock"));
+        let linked = rid();
+        junction(
+            &storage.path().join(format!("{}.tmp", linked.canonical())),
+            outside.path(),
+        );
+        let repo = storage.path().join("repo");
+        fs::create_dir_all(repo.join("refs/heads")).unwrap();
+        junction(&repo.join("refs/linked"), &outside.path().join("dir"));
+        junction(&repo.join("HEAD.lock"), &outside.path().join("dir"));
+
+        let done = remove_temporary_clones(storage.path()).unwrap();
+        assert_eq!(
+            done,
+            TemporaryClones {
+                removed: vec![],
+                left: 1
+            }
+        );
+        assert_eq!(remove_ref_locks(&repo).unwrap(), 0);
+        assert!(outside.path().join("kept.lock").exists());
+        assert!(outside.path().join("dir/inner.lock").exists());
     }
 }
