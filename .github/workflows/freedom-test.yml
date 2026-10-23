@@ -6,7 +6,6 @@ name: freedom-test
 # `no-gc`. It runs for pull requests into, and pushes to,
 # `integration/rust-core` only. Upstream's build.yml is left as it is.
 on:
-  workflow_dispatch:
   pull_request:
     branches: [integration/rust-core]
   push:
