@@ -28,6 +28,7 @@ use crate::prelude::{NodeId, RepoId};
 use crate::sql::transaction;
 use crate::storage::git::Repository;
 
+use super::cache;
 use super::namespace::{Authority, Checkpoint};
 
 /// How long a write waits for the database's lock.
@@ -91,6 +92,17 @@ fn authority(authority: Authority) -> &'static str {
         Authority::Owner => "owner",
         Authority::None => "none",
     }
+}
+
+/// How a rebuilt cache is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publication {
+    /// At a start, before the node runs: the repair's progress is kept, until
+    /// the whole run clears it.
+    Start,
+    /// Online, while the node runs: the repository's progress is deleted with
+    /// it.
+    Online,
 }
 
 /// A unit of work: the repository, its kind, and its position, such as the
@@ -325,6 +337,123 @@ impl State {
         Ok(())
     }
 
+    /// The checkpoint of `rid`'s cache rebuild, if one was recorded at its
+    /// `version`: otherwise the rebuild starts over.
+    pub fn cache_checkpoint(
+        &self,
+        rid: &RepoId,
+        version: Oid,
+    ) -> Result<Option<cache::Checkpoint>, Error> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT version, kind, after FROM reconcile_cache WHERE rid = ?1")?;
+        stmt.bind((1, rid))?;
+        let Some(row) = stmt.into_iter().next() else {
+            return Ok(None);
+        };
+        let row = row?;
+        if row.try_read::<&str, _>("version")? != version.to_string() {
+            return Ok(None);
+        }
+        let kind = row
+            .try_read::<&str, _>("kind")?
+            .parse::<cache::Kind>()
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let after = row
+            .try_read::<Option<&str>, _>("after")?
+            .map(|after| {
+                after
+                    .parse::<crate::cob::ObjectId>()
+                    .map_err(|e| Error::Invalid(e.to_string()))
+            })
+            .transpose()?;
+        Ok(Some(cache::Checkpoint { kind, after }))
+    }
+
+    /// Stages `rows` for `rid`'s cache rebuild at its `version`, with the
+    /// checkpoint `next`, in one durable transaction: a batch is staged with
+    /// its checkpoint, or not at all.
+    pub fn stage(
+        &mut self,
+        rid: &RepoId,
+        version: Oid,
+        rows: &[cache::Row],
+        next: &cache::Checkpoint,
+    ) -> Result<(), Error> {
+        transaction(&self.db, |db| {
+            for row in rows {
+                let mut stmt = db.prepare(
+                    "INSERT INTO rebuild_staging (rid, kind, id, json) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (rid, kind, id) DO UPDATE SET json = excluded.json",
+                )?;
+                stmt.bind((1, rid))?;
+                stmt.bind((2, row.kind.as_str()))?;
+                stmt.bind((3, row.id.to_string().as_str()))?;
+                stmt.bind((4, row.json.as_str()))?;
+                stmt.next()?;
+            }
+            let mut stmt = db.prepare(
+                "INSERT INTO reconcile_cache (rid, version, kind, after) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (rid) DO UPDATE SET
+                   version = excluded.version, kind = excluded.kind, after = excluded.after",
+            )?;
+            stmt.bind((1, rid))?;
+            stmt.bind((2, version.to_string().as_str()))?;
+            stmt.bind((3, next.kind.as_str()))?;
+            stmt.bind((4, next.after.map(|after| after.to_string()).as_deref()))?;
+            stmt.next()?;
+            Ok(())
+        })
+    }
+
+    /// Publishes `rid`'s rebuilt cache, once every COB is staged: its live
+    /// rows are swapped for the staged ones, and its staging cleared, in one
+    /// durable transaction. At a start, its `Cache` step is recorded finished
+    /// in the same transaction; online, its progress is deleted with it, so a
+    /// finished repair can't be reused once new mutations begin.
+    pub fn publish(&mut self, rid: &RepoId, publication: Publication) -> Result<(), Error> {
+        transaction(&self.db, |db| {
+            for kind in cache::Kind::ALL {
+                let (table, column) = kind.table();
+                let mut stmt = db.prepare(format!("DELETE FROM {table} WHERE repo = ?1"))?;
+                stmt.bind((1, rid))?;
+                stmt.next()?;
+                let mut stmt = db.prepare(format!(
+                    "INSERT INTO {table} (id, repo, {column})
+                     SELECT id, rid, json FROM rebuild_staging WHERE rid = ?1 AND kind = ?2"
+                ))?;
+                stmt.bind((1, rid))?;
+                stmt.bind((2, kind.as_str()))?;
+                stmt.next()?;
+            }
+            for table in ["rebuild_staging", "reconcile_cache"] {
+                let mut stmt = db.prepare(format!("DELETE FROM {table} WHERE rid = ?1"))?;
+                stmt.bind((1, rid))?;
+                stmt.next()?;
+            }
+            match publication {
+                Publication::Start => {
+                    let mut stmt =
+                        db.prepare("SELECT steps FROM reconcile_repository WHERE rid = ?1")?;
+                    stmt.bind((1, rid))?;
+                    let Some(row) = stmt.into_iter().next() else {
+                        return Err(Error::Invalid(format!("no repair of {rid} has begun")));
+                    };
+                    let mut done = steps(row?.try_read::<&str, _>("steps")?)?;
+                    done.insert(Step::Cache);
+                    let text = done.iter().map(Step::as_str).collect::<Vec<_>>().join(",");
+                    let mut stmt =
+                        db.prepare("UPDATE reconcile_repository SET steps = ?2 WHERE rid = ?1")?;
+                    stmt.bind((1, rid))?;
+                    stmt.bind((2, text.as_str()))?;
+                    stmt.next()?;
+                }
+                Publication::Online => discard(db, rid)?,
+            }
+            Ok(())
+        })
+    }
+
     /// Discards the progress of `rid`'s repair.
     pub fn clear_repository(&mut self, rid: &RepoId) -> Result<(), Error> {
         transaction(&self.db, |db| discard(db, rid))
@@ -337,7 +466,9 @@ impl State {
             db.execute(
                 "DELETE FROM reconcile_namespace;
                  DELETE FROM reconcile_repository;
-                 DELETE FROM reconcile_unit;",
+                 DELETE FROM reconcile_unit;
+                 DELETE FROM rebuild_staging;
+                 DELETE FROM reconcile_cache;",
             )?;
             Ok(())
         })
@@ -351,9 +482,15 @@ fn steps(text: &str) -> Result<BTreeSet<Step>, Error> {
         .collect()
 }
 
-/// Deletes `rid`'s progress: its steps and its checkpoints.
+/// Deletes `rid`'s progress: its steps, its checkpoints, and its staged
+/// cache rebuild.
 fn discard(db: &sql::Connection, rid: &RepoId) -> Result<(), Error> {
-    for table in ["reconcile_namespace", "reconcile_repository"] {
+    for table in [
+        "reconcile_namespace",
+        "reconcile_repository",
+        "rebuild_staging",
+        "reconcile_cache",
+    ] {
         let mut stmt = db.prepare(format!("DELETE FROM {table} WHERE rid = ?1"))?;
         stmt.bind((1, rid))?;
         stmt.next()?;

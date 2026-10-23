@@ -9,6 +9,7 @@
 //! a link: that path is the host's own choice, and a home may be linked
 //! elsewhere. It follows no link under that root (see `dir`).
 
+pub mod cache;
 mod dir;
 pub mod namespace;
 pub mod quarantine;

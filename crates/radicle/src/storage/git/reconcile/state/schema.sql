@@ -32,3 +32,23 @@ create table if not exists "reconcile_unit" (
   "position"      text      not null,
   "attempts"      integer   not null
 ) strict;
+
+-- A cache rebuild's staged COBs: the rows publication swaps in.
+create table if not exists "rebuild_staging" (
+  "rid"           text      not null,
+  -- `issue` or `patch`.
+  "kind"          text      not null,
+  "id"            text      not null,
+  -- The COB as the cache writes it.
+  "json"          text      not null,
+  primary key ("rid", "kind", "id")
+) strict;
+
+-- A cache rebuild's checkpoint: the kind it is at, and the last COB of it
+-- staged. Bound to the repository's version.
+create table if not exists "reconcile_cache" (
+  "rid"           text      primary key not null,
+  "version"       text      not null,
+  "kind"          text      not null,
+  "after"         text
+) strict;
