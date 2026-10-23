@@ -2129,3 +2129,173 @@ fn announcement_message_amplification() {
     assert!(amp < 2., "Amplification factor of {amp} is too high");
     assert!(amp >= 1., "Amplification can't be lower than 1");
 }
+
+/// Makes every read and write of `peer`'s policies fail, as a damaged policy
+/// database would: its tables are dropped behind the service's back.
+fn fail_policies<S>(peer: &Peer<S>)
+where
+    S: radicle::storage::WriteStorage + 'static,
+{
+    let db = sqlite::open(peer.policies_path()).unwrap();
+    db.execute(r#"DROP TABLE "seeding"; DROP TABLE "following";"#)
+        .unwrap();
+    // The service's connection still has the old schema. Its next statement
+    // finds out and reloads it (the store reads that as no policy); from then
+    // on every statement fails to prepare, which the store reports.
+    let rid: RepoId = arbitrary::r#gen(1);
+    let _ = peer.policies().seed_policy(&rid);
+    assert!(
+        peer.policies().seed_policy(&rid).is_err(),
+        "the policy store still reads"
+    );
+}
+
+/// Drains `peer`'s outbox: the error it stopped with, if it stopped, and
+/// whether anything was fetched.
+fn stop_and_fetches<S>(peer: &mut Peer<S>) -> (Option<service::Error>, usize)
+where
+    S: radicle::storage::WriteStorage + 'static,
+{
+    let mut stopped = None;
+    let mut fetches = 0;
+    for io in peer.outbox() {
+        match io {
+            Io::Stop(error) => {
+                assert!(stopped.is_none(), "a second stop");
+                stopped = Some(error);
+            }
+            Io::Fetch { .. } => fetches += 1,
+            _ => {}
+        }
+    }
+    (stopped, fetches)
+}
+
+// heartwood#12 (freedom-core design 0008): a policy read that fails while a
+// queued fetch is dequeued stops the node, and the fetch isn't started.
+#[test]
+fn a_policy_failure_dequeuing_a_fetch_stops_the_node() {
+    let storage = arbitrary::nonempty_storage(2);
+    let mut repo_keys = storage.repos.keys();
+    let rid1 = *repo_keys.next().unwrap();
+    let rid2 = *repo_keys.next().unwrap();
+    let doc = storage.repos.get(&rid1).unwrap().doc.clone();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+
+    let (cmd, _recv1) = Command::fetch(rid1, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    let (cmd, _recv2) = Command::fetch(rid2, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_matches!(amy.fetches().next(), Some((rid, _)) if rid == rid1);
+
+    fail_policies(&amy);
+    amy.fetched(rid1, *bob.nid(), Ok(FetchResult::new(doc)));
+
+    let (stopped, fetches) = stop_and_fetches(&mut amy);
+    assert_matches!(stopped, Some(service::Error::Policy(_)));
+    assert_eq!(fetches, 0, "the queued fetch was started");
+}
+
+// A policy read that fails on a connected peer's inventory stops the node:
+// nothing is fetched, and the announcement isn't relayed.
+#[test]
+fn a_policy_failure_on_an_inventory_announcement_stops_the_node() {
+    let mut amy = Peer::amy();
+    let bob = Peer::with_storage("bob", BOB, arbitrary::nonempty_storage(2));
+    amy.connect_to(&bob);
+    let _ = stop_and_fetches(&mut amy);
+
+    fail_policies(&amy);
+    let relayed = amy
+        .handle_announcement(
+            bob.nid(),
+            &bob.address(),
+            &match bob.inventory_announcement() {
+                Message::Announcement(ann) => ann,
+                other => panic!("not an announcement: {other:?}"),
+            },
+        )
+        .expect("a valid announcement");
+
+    assert!(relayed.is_none(), "the announcement is relayed");
+    let (stopped, fetches) = stop_and_fetches(&mut amy);
+    assert_matches!(stopped, Some(service::Error::Policy(_)));
+    assert_eq!(fetches, 0);
+}
+
+// A policy read that fails on a refs announcement stops the node: nothing is
+// fetched, and the announcement isn't relayed.
+#[test]
+fn a_policy_failure_on_a_refs_announcement_stops_the_node() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = Peer::amy();
+    let bob = {
+        let secret_key = SigningKey::mock(BOB as usize);
+        let storage = fixtures::storage(tmp.path().join("bob"), &secret_key).unwrap();
+        Peer::with_storage("bob", BOB, storage)
+    };
+    let rid = *bob.inventory().iter().next().unwrap();
+    amy.seed(&rid, policy::Scope::All).unwrap();
+    amy.connect_to(&bob);
+    let _ = stop_and_fetches(&mut amy);
+
+    fail_policies(&amy);
+    let relayed = amy
+        .handle_announcement(
+            bob.nid(),
+            &bob.address(),
+            &match bob.refs_announcement(rid) {
+                Message::Announcement(ann) => ann,
+                other => panic!("not an announcement: {other:?}"),
+            },
+        )
+        .expect("a valid announcement");
+
+    assert!(relayed.is_none(), "the announcement is relayed");
+    let (stopped, fetches) = stop_and_fetches(&mut amy);
+    assert_matches!(stopped, Some(service::Error::Policy(_)));
+    assert_eq!(fetches, 0);
+}
+
+// A policy write that fails answers its command with the error, applies
+// nothing else, and doesn't stop the node.
+#[test]
+fn a_policy_failure_answers_its_command() {
+    let mut amy = Peer::amy();
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    amy.receive(*bob.nid(), Message::Subscribe(Subscribe::all()));
+    let _ = amy.messages(*bob.nid()).count();
+    let _ = stop_and_fetches(&mut amy);
+    fail_policies(&amy);
+
+    let rid: RepoId = arbitrary::r#gen(1);
+    let (cmd, seeded) = Command::seed(rid, policy::Scope::default());
+    amy.command(cmd);
+    assert!(seeded.recv().unwrap().is_err());
+    let (cmd, unseeded) = Command::unseed(rid);
+    amy.command(cmd);
+    assert!(unseeded.recv().unwrap().is_err());
+
+    let (follow, followed) = command::Responder::oneshot();
+    amy.command(Command::Follow(*bob.nid(), None, follow));
+    assert!(followed.recv().unwrap().is_err());
+    let (unfollow, unfollowed) = command::Responder::oneshot();
+    amy.command(Command::Unfollow(*bob.nid(), unfollow));
+    assert!(unfollowed.recv().unwrap().is_err());
+    let (block, blocked) = command::Responder::oneshot();
+    amy.command(Command::Block(*bob.nid(), block));
+    assert!(blocked.recv().unwrap().is_err());
+
+    // No subscription went out for the failed seed, no one was disconnected
+    // for the failed block, and the node runs on.
+    assert_eq!(amy.messages(*bob.nid()).count(), 0);
+    for io in amy.outbox() {
+        assert!(
+            !matches!(io, Io::Stop(_) | Io::Disconnect(..)),
+            "unexpected {io:?}"
+        );
+    }
+}

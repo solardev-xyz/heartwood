@@ -567,6 +567,9 @@ where
                     },
                 );
             }
+            Io::Stop(error) => {
+                panic!("{node} stopped: {error}");
+            }
             Io::Wakeup(duration) => {
                 let time = self.time + duration;
 

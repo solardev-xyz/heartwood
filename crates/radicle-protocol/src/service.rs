@@ -562,6 +562,7 @@ where
         let fetcher = {
             let config = fetcher::Config::new()
                 .with_max_concurrency(
+                    // Nb. The node's `Runtime::init` refuses a zero before it gets here.
                     std::num::NonZeroUsize::new(config.limits.fetch_concurrency.into())
                         .expect("fetch concurrency was zero, must be at least 1"),
                 )
@@ -630,13 +631,29 @@ where
             // Nb. This is potentially slow if we have lots of repos. We should probably
             // only re-compute the filter when we've unseeded a certain amount of repos
             // and the filter is really out of date.
-            self.filter = Filter::allowed_by(self.policies.seed_policies()?);
+            //
+            // The policy is already updated, so a failure here keeps the old filter, which
+            // still lets us hear about the repo, rather than failing the unseed.
+            match self.policies.seed_policies() {
+                Ok(policies) => self.filter = Filter::allowed_by(policies),
+                Err(e) => {
+                    warn!(target: "service", "Failed to update the subscription filter after unseed: {e}")
+                }
+            }
             // Update and announce new inventory.
             if let Err(e) = self.remove_inventory(id) {
                 warn!(target: "service", "Failed to update inventory after unseed: {e}");
             }
         }
         Ok(updated)
+    }
+
+    /// Stop the node with `error`, a failure the service can't go on from. The
+    /// caller returns at once, leaving the work it was doing undone.
+    fn stop(&mut self, error: impl Into<Error>) {
+        let error = error.into();
+        error!(target: "service", "Stopping the node: {error}");
+        self.outbox.stop(error);
     }
 
     /// Find the closest `n` peers by proximity in seeding graphs.
@@ -858,9 +875,13 @@ where
             }
             Command::Seed(rid, scope, resp) => {
                 // Update our seeding policy.
-                let seeded = self
-                    .seed(&rid, scope)
-                    .expect("Service::command: error seeding repository");
+                let seeded = match self.seed(&rid, scope) {
+                    Ok(seeded) => seeded,
+                    Err(e) => {
+                        resp.err(e).ok();
+                        return;
+                    }
+                };
                 resp.ok(seeded).ok();
 
                 // Let all our peers know that we're interested in this repo from now on.
@@ -870,30 +891,31 @@ where
                 );
             }
             Command::Unseed(id, resp) => {
-                let updated = self
-                    .unseed(&id)
-                    .expect("Service::command: error unseeding repository");
-                resp.ok(updated).ok();
+                match self.unseed(&id) {
+                    Ok(updated) => resp.ok(updated).ok(),
+                    Err(e) => resp.err(e).ok(),
+                };
             }
             Command::Follow(id, alias, resp) => {
-                let seeded = self
-                    .policies
-                    .follow(&id, alias.as_ref())
-                    .expect("Service::command: error following node");
-                resp.ok(seeded).ok();
+                match self.policies.follow(&id, alias.as_ref()) {
+                    Ok(seeded) => resp.ok(seeded).ok(),
+                    Err(e) => resp.err(e).ok(),
+                };
             }
             Command::Unfollow(id, resp) => {
-                let updated = self
-                    .policies
-                    .unfollow(&id)
-                    .expect("Service::command: error unfollowing node");
-                resp.ok(updated).ok();
+                match self.policies.unfollow(&id) {
+                    Ok(updated) => resp.ok(updated).ok(),
+                    Err(e) => resp.err(e).ok(),
+                };
             }
             Command::Block(id, resp) => {
-                let updated = self
-                    .policies
-                    .set_follow_policy(&id, policy::Policy::Block)
-                    .expect("Service::command: error blocking node");
+                let updated = match self.policies.set_follow_policy(&id, policy::Policy::Block) {
+                    Ok(updated) => updated,
+                    Err(e) => {
+                        resp.err(e).ok();
+                        return;
+                    }
+                };
                 if updated {
                     self.outbox.disconnect(id, DisconnectReason::Policy);
                 }
@@ -1179,10 +1201,13 @@ where
             };
 
             // Check seeding policy
-            let repo_entry = self
-                .policies
-                .seed_policy(&rid)
-                .expect("error accessing repo seeding configuration");
+            let repo_entry = match self.policies.seed_policy(&rid) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    self.stop(e);
+                    return;
+                }
+            };
 
             let SeedingPolicy::Allow { scope } = repo_entry.policy else {
                 debug!(target: "service", "Repository {} no longer seeded, skipping", rid);
@@ -1553,9 +1578,14 @@ where
 
                         // If we're seeding and connected to the announcer, and we don't have
                         // the inventory, fetch it from the announcer.
-                        if self.policies.is_seeding(id).expect(
-                            "Service::handle_announcement: error accessing seeding configuration",
-                        ) {
+                        let seeding = match self.policies.is_seeding(id) {
+                            Ok(seeding) => seeding,
+                            Err(e) => {
+                                self.stop(e);
+                                return Ok(None);
+                            }
+                        };
+                        if seeding {
                             // Only if we do not have the repository locally do we fetch here.
                             // If we do have it, only fetch after receiving a ref announcement.
                             match self.db.routing().entry(id, &nid) {
@@ -1638,9 +1668,13 @@ where
                         }
                     }
                 }
-                let repo_entry = self.policies.seed_policy(&message.rid).expect(
-                    "Service::handle_announcement: error accessing repo seeding configuration",
-                );
+                let repo_entry = match self.policies.seed_policy(&message.rid) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        self.stop(e);
+                        return Ok(None);
+                    }
+                };
                 let SeedingPolicy::Allow { scope } = repo_entry.policy else {
                     debug!(
                         target: "service",
@@ -2060,14 +2094,8 @@ where
                     debug!(target: "service", "Routing table updated for {rid} with seed {from}");
                     events.push(Event::SeedDiscovered { rid, nid: from });
 
-                    if self
-                        .policies
-                        .is_seeding(&rid)
-                        .expect("Service::process_inventory: error accessing seeding configuration")
-                    {
-                        // TODO: We should fetch here if we're already connected, case this seed has
-                        // refs we don't have.
-                    }
+                    // TODO: If we're seeding `rid`, we should fetch here if we're already
+                    // connected, case this seed has refs we don't have.
                     synced.added.push(rid);
                 }
                 InsertResult::TimeUpdated => {

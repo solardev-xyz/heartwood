@@ -136,6 +136,26 @@ impl NodeHandle {
         drop(self)
     }
 
+    /// Waits up to `timeout` for a node to stop by itself, without being asked,
+    /// and returns how its runtime ended.
+    pub fn stopped(self, timeout: Duration) -> Result<(), runtime::Error> {
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.thread.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node {} didn't stop by itself",
+                self.id
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so the thread and the handle are
+        // taken here, once. The rest of its fields are left to leak.
+        let thread = unsafe { ManuallyDrop::take(&mut this.thread) };
+        unsafe { ManuallyDrop::drop(&mut this.handle) };
+        thread.join().unwrap()
+    }
+
     /// Get the full address of this node.
     pub fn address(&self) -> ConnectAddress {
         (self.id, node::Address::from(self.addr)).into()

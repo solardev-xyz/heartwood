@@ -130,6 +130,10 @@ pub enum Action<L, T> {
     /// When the timer elapses, the reactor will timeout from poll and call
     /// [`ReactionHandler::timer_reacted`].
     SetTimer(Duration),
+
+    /// Stop the reactor, as a shutdown through its `Controller` does: the
+    /// handler can't go on. Actions after it are not handled.
+    Shutdown,
 }
 
 impl<L: EventHandler, T: EventHandler> Display for Action<L, T> {
@@ -162,6 +166,7 @@ impl<L: EventHandler, T: EventHandler> Display for Action<L, T> {
                 .debug_struct("SetTimer")
                 .field("duration", duration)
                 .finish(),
+            Action::Shutdown => f.write_str("Shutdown"),
         }
     }
 }
@@ -400,7 +405,9 @@ impl<H: ReactionHandler> Runtime<H> {
                 log::debug!(target: "reactor", "Service was busy {:?} which exceeds the timeout of {:?}", duration, LAG_TIMEOUT);
             }
 
-            self.handle_actions(tick);
+            if self.handle_actions(tick) {
+                return self.handle_shutdown();
+            }
         }
     }
 
@@ -469,9 +476,16 @@ impl<H: ReactionHandler> Runtime<H> {
         awoken
     }
 
-    fn handle_actions(&mut self, instant: Instant) {
+    /// # Returns
+    ///
+    /// Whether the service asked the reactor to stop ([`Action::Shutdown`]).
+    fn handle_actions(&mut self, instant: Instant) -> bool {
         while let Some(action) = self.service.next() {
             log::trace!(target: "reactor", "Handling action {action} from the service");
+
+            if let Action::Shutdown = action {
+                return true;
+            }
 
             // Deadlock may happen here if the service will generate events over and over
             // in the handle_* calls we may never get out of this loop
@@ -480,6 +494,7 @@ impl<H: ReactionHandler> Runtime<H> {
                 self.service.handle_error(err);
             }
         }
+        false
     }
 
     fn handle_action(
@@ -540,6 +555,8 @@ impl<H: ReactionHandler> Runtime<H> {
 
                 self.timeouts.set_timeout(duration, instant);
             }
+            // Handled by `handle_actions`, which stops at it.
+            Action::Shutdown => {}
         }
         Ok(())
     }
