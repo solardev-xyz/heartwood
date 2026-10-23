@@ -1,0 +1,47 @@
+name: freedom-test
+
+# `cargo test` for the crates Freedom's fork changes: radicle, radicle-node,
+# radicle-protocol and radicle-signals, on Linux, macOS and Windows. Then
+# radicle-node again as libradicle builds it, with `serve-in-process` and
+# `no-gc`. It runs for pull requests into, and pushes to,
+# `integration/rust-core` only. Upstream's build.yml is left as it is.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [integration/rust-core]
+  push:
+    branches: [integration/rust-core]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: freedom-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+      # One test at a time on Windows, as upstream's build.yml runs them there.
+      - name: cargo test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then export RUST_TEST_THREADS=1; fi
+          cargo test --locked -p radicle -p radicle-node -p radicle-protocol -p radicle-signals
+      - name: cargo test (radicle-node, as libradicle builds it)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then export RUST_TEST_THREADS=1; fi
+          cargo test --locked -p radicle-node --features serve-in-process,no-gc
