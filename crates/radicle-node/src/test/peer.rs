@@ -122,6 +122,7 @@ pub struct Config {
     pub(crate) local_time: LocalTime,
     pub(crate) policy: SeedingPolicy,
     pub(crate) secret_key: SigningKey,
+    pub(crate) gate: std::sync::Arc<dyn radicle::node::dial::Gate>,
 }
 
 impl Config {
@@ -133,6 +134,7 @@ impl Config {
             local_time: LocalTime::now(),
             policy: SeedingPolicy::default(),
             secret_key: SigningKey::mock(id),
+            gate: std::sync::Arc::new(radicle::node::dial::Open),
         }
     }
 }
@@ -221,6 +223,7 @@ where
             fastrand::Rng::with_seed(id as u64),
             announcement,
             emitter,
+            config.gate,
         );
 
         info!(

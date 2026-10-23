@@ -2077,3 +2077,172 @@ fn test_fetch_emits_canonical_ref_update_partial_glob() {
         )
         .unwrap();
 }
+
+/// A gate for the dial tests: it resolves `name` to `answers`, waiting on
+/// `hold` first if there is one, and allows only `allowed`.
+#[derive(Debug)]
+struct TestGate {
+    name: String,
+    answers: Vec<std::net::SocketAddr>,
+    allowed: Vec<std::net::IpAddr>,
+    hold: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    timeout: time::Duration,
+}
+
+impl radicle::node::dial::Gate for TestGate {
+    fn allows(&self, _target: &radicle::node::Address, addr: &std::net::SocketAddr) -> bool {
+        self.allowed.contains(&addr.ip())
+    }
+
+    fn resolve(&self, host: &str, _port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        if let Some(hold) = &self.hold {
+            hold.lock().unwrap().recv().ok();
+        }
+        if host == self.name {
+            Ok(self.answers.clone())
+        } else {
+            Err(std::io::ErrorKind::NotFound.into())
+        }
+    }
+
+    fn resolve_timeout(&self) -> time::Duration {
+        self.timeout
+    }
+}
+
+fn test_gate(bob: &NodeHandle, allowed: bool) -> TestGate {
+    TestGate {
+        name: "bob.test".to_owned(),
+        answers: vec![bob.addr],
+        allowed: if allowed { vec![bob.addr.ip()] } else { vec![] },
+        hold: None,
+        timeout: time::Duration::from_secs(10),
+    }
+}
+
+fn by_name(bob: &NodeHandle) -> radicle::node::Address {
+    format!("bob.test:{}", bob.addr.port()).parse().unwrap()
+}
+
+fn connect(
+    alice: &mut NodeHandle,
+    bob: &NodeHandle,
+    addr: radicle::node::Address,
+) -> ConnectResult {
+    alice
+        .handle
+        .connect(
+            bob.id,
+            addr,
+            ConnectOptions {
+                persistent: false,
+                timeout: time::Duration::from_secs(10),
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+// heartwood#11 (freedom-core design 0008): a name is resolved through the
+// node's gate, and the node connects to the address it checked.
+fn test_dial_resolves_a_name_through_the_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bob = Node::init(tmp.path(), config::relay("bob"), 37).spawn();
+    let mut alice = Node::init(tmp.path(), config::relay("alice"), 13)
+        .spawn_with_gate(std::sync::Arc::new(test_gate(&bob, true)));
+
+    let result = connect(&mut alice, &bob, by_name(&bob));
+    assert!(matches!(result, ConnectResult::Connected), "{result:?}");
+}
+
+#[test]
+// An address the gate refuses isn't dialled, given directly or resolved from
+// a name.
+fn test_dial_refused_by_the_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bob = Node::init(tmp.path(), config::relay("bob"), 37).spawn();
+    let mut alice = Node::init(tmp.path(), config::relay("alice"), 13)
+        .spawn_with_gate(std::sync::Arc::new(test_gate(&bob, false)));
+
+    let direct = connect(&mut alice, &bob, bob.addr.into());
+    assert!(
+        matches!(direct, ConnectResult::Disconnected { .. }),
+        "{direct:?}"
+    );
+    let named = connect(&mut alice, &bob, by_name(&bob));
+    assert!(
+        matches!(named, ConnectResult::Disconnected { .. }),
+        "{named:?}"
+    );
+}
+
+#[test]
+// A resolver that doesn't answer fails its dial at the gate's deadline, and
+// holds up nothing else: the node answers its handle meanwhile, and the late
+// answer is dropped.
+fn test_dial_a_resolver_that_hangs_fails_its_dial_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bob = Node::init(tmp.path(), config::relay("bob"), 37).spawn();
+    let (release, hold) = std::sync::mpsc::channel();
+    let gate = TestGate {
+        hold: Some(std::sync::Mutex::new(hold)),
+        timeout: time::Duration::from_millis(300),
+        ..test_gate(&bob, true)
+    };
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13)
+        .spawn_with_gate(std::sync::Arc::new(gate));
+
+    // The resolver is let go after 2 s, well past its dial's deadline.
+    let releaser = thread::spawn(move || {
+        thread::sleep(time::Duration::from_secs(2));
+        release.send(()).ok();
+    });
+    let started = time::Instant::now();
+    let mut handle = alice.handle.clone();
+    let (bob_id, addr) = (bob.id, by_name(&bob));
+    let dialling = thread::spawn(move || {
+        handle
+            .connect(
+                bob_id,
+                addr,
+                ConnectOptions {
+                    persistent: false,
+                    timeout: time::Duration::from_secs(10),
+                },
+            )
+            .unwrap()
+    });
+    // While the resolver hangs, the node answers at once.
+    thread::sleep(time::Duration::from_millis(100));
+    let asked = time::Instant::now();
+    assert!(alice.handle.sessions().is_ok());
+    assert!(
+        asked.elapsed() < time::Duration::from_millis(500),
+        "the node waited on its resolver"
+    );
+    let result = dialling.join().unwrap();
+    assert!(
+        matches!(result, ConnectResult::Disconnected { .. }),
+        "{result:?}"
+    );
+    assert!(
+        started.elapsed() < time::Duration::from_secs(2),
+        "the dial waited for its resolver past the deadline"
+    );
+
+    // The answer, once it comes, is too late: nothing is dialled.
+    let events = alice.handle.events();
+    releaser.join().unwrap();
+    let connected = events.wait(
+        |e| matches!(e, Event::PeerConnected { nid } if nid == &bob.id).then_some(()),
+        time::Duration::from_secs(1),
+    );
+    assert!(connected.is_err(), "a late answer was dialled");
+    let sessions = alice.handle.sessions().unwrap();
+    assert!(
+        !sessions
+            .iter()
+            .any(|s| s.nid == bob.id && s.state.is_connected()),
+        "a late answer connected"
+    );
+}

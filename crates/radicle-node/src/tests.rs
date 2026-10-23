@@ -2129,3 +2129,71 @@ fn announcement_message_amplification() {
     assert!(amp < 2., "Amplification factor of {amp} is too high");
     assert!(amp >= 1., "Amplification can't be lower than 1");
 }
+
+/// A gate that allows only the IP addresses it names.
+#[derive(Debug)]
+struct OnlyAllows(Vec<std::net::IpAddr>);
+
+impl node::dial::Gate for OnlyAllows {
+    fn allows(&self, _target: &node::Address, addr: &std::net::SocketAddr) -> bool {
+        self.0.contains(&addr.ip())
+    }
+
+    fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
+        Ok(vec![])
+    }
+}
+
+// heartwood#11 (freedom-core design 0008): an announced IP address the
+// gate refuses doesn't enter the address book; a name does, to be checked
+// when it is dialled.
+#[test]
+fn announced_addresses_the_gate_refuses_stay_out_of_the_address_book() {
+    let allowed = std::net::IpAddr::from([8, 8, 8, 8]);
+    let mut amy = Peer::new_with("amy", AMY, MockStorage::empty(), |config| {
+        config.gate = Arc::new(OnlyAllows(vec![allowed]));
+    });
+    let bob = Peer::bob();
+    let cid = Peer::cid();
+    amy.connect_to(&bob);
+
+    let addresses: Vec<node::Address> = vec![
+        std::net::SocketAddr::from((allowed, 8776)).into(),
+        std::net::SocketAddr::from(([9, 9, 9, 9], 8776)).into(),
+        "seed.example:8776".parse().unwrap(),
+    ];
+    let ann = match Message::node(
+        NodeAnnouncement {
+            version: node::PROTOCOL_VERSION,
+            features: node::Features::SEED,
+            timestamp: Timestamp::from(*amy.clock()),
+            alias: node::Alias::new("cid"),
+            addresses: addresses.try_into().unwrap(),
+            nonce: 0,
+            agent: node::UserAgent::default(),
+        }
+        .solve(0)
+        .unwrap(),
+        cid.secret_key(),
+    ) {
+        Message::Announcement(ann) => ann,
+        other => panic!("not an announcement: {other:?}"),
+    };
+    amy.handle_announcement(bob.nid(), &bob.address(), &ann)
+        .unwrap();
+
+    let known = amy
+        .database()
+        .addresses()
+        .get(cid.nid())
+        .unwrap()
+        .expect("cid is in the address book")
+        .addrs
+        .into_iter()
+        .map(|known| known.addr.to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        known,
+        BTreeSet::from(["8.8.8.8:8776".to_owned(), "seed.example:8776".to_owned()])
+    );
+}

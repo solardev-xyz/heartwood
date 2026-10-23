@@ -29,6 +29,7 @@ use radicle::node::address;
 use radicle::node::address::Store as _;
 use radicle::node::address::{AddressBook, AddressType, KnownAddress};
 use radicle::node::config::{PeerConfig, RateLimit};
+use radicle::node::dial;
 use radicle::node::refs::Store as _;
 use radicle::node::routing::Store as _;
 use radicle::node::seed;
@@ -375,6 +376,9 @@ pub struct Service<D, S> {
     last_online_at: Option<LocalTime>,
     /// Publishes events to subscribers.
     emitter: Emitter<Event>,
+    /// Which addresses the node may connect to, asked of announced
+    /// addresses before they enter the address book.
+    gate: Arc<dyn dial::Gate>,
     /// Local listening addresses.
     listening: Vec<net::SocketAddr>,
     /// Latest metrics for all nodes connected to since the last start.
@@ -553,6 +557,7 @@ where
         rng: Rng,
         node: NodeAnnouncement,
         emitter: Emitter<Event>,
+        gate: Arc<dyn dial::Gate>,
     ) -> Self {
         let sessions = Sessions::new(rng.clone());
         let limiter = RateLimiter::new(config.peers());
@@ -594,6 +599,7 @@ where
             started_at: None,     // Updated on initialize.
             last_online_at: None, // Updated on initialize.
             emitter,
+            gate,
             listening: vec![],
             metrics: Metrics::default(),
         }
@@ -1694,6 +1700,7 @@ where
                     return Ok(relay);
                 }
 
+                let gate = self.gate.clone();
                 match self.db.addresses_mut().insert(
                     announcer,
                     ann.version,
@@ -1707,6 +1714,12 @@ where
                         // Ignore non-routable addresses unless received from a local network
                         // peer. This allows the node to function in a local network.
                         .filter(|a| a.is_routable() || relayer_addr.is_local())
+                        // An IP address the node may not dial isn't kept. A name is checked
+                        // when it is dialled, on every address it resolves to.
+                        .filter(|a| match a.host {
+                            HostName::Ip(ip) => gate.allows(a, &net::SocketAddr::new(ip, a.port)),
+                            _ => true,
+                        })
                         .map(|a| KnownAddress::new(a.clone(), address::Source::Peer)),
                 ) {
                     Ok(updated) => {

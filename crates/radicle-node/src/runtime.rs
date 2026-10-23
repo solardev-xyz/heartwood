@@ -4,7 +4,7 @@ pub mod thread;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::str::FromStr as _;
-use std::sync::mpsc;
+use std::sync::{Arc, OnceLock, mpsc};
 use std::{fs, io, net};
 
 #[cfg(unix)]
@@ -23,6 +23,7 @@ use radicle::node::Event;
 use radicle::node::UserAgent;
 use radicle::node::address;
 use radicle::node::address::Store as _;
+use radicle::node::dial::Gate;
 use radicle::node::events::Emitter;
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
@@ -119,6 +120,9 @@ pub struct Runtime {
 impl Runtime {
     /// Initialize the runtime.
     ///
+    /// `gate` decides which addresses the node may dial, and resolves names
+    /// for it ([`radicle::node::dial::Open`] keeps the node's own behaviour).
+    ///
     /// This function spawns threads.
     pub fn init(
         home: Home,
@@ -127,6 +131,7 @@ impl Runtime {
         listen: Vec<net::SocketAddr>,
         signals: mpsc::Receiver<Signal>,
         secret_key: SigningKey,
+        gate: Arc<dyn Gate>,
     ) -> Result<Runtime, Error> {
         let id = NodeId::from(*secret_key.public_key());
         let alias = config.alias.clone();
@@ -208,12 +213,20 @@ impl Runtime {
             rng,
             announcement,
             emitter.clone(),
+            gate.clone(),
         );
         service.initialize(clock)?;
 
         let (worker_send, worker_recv) =
             crossbeam_channel::bounded::<worker::Task>(MAX_PENDING_TASKS);
-        let mut wire = Wire::new(service, worker_send, secret_key.clone());
+        let controller = Arc::new(OnceLock::new());
+        let mut wire = Wire::new(
+            service,
+            worker_send,
+            secret_key.clone(),
+            gate,
+            controller.clone(),
+        );
         let mut local_addrs = Vec::new();
 
         for addr in listen {
@@ -224,6 +237,8 @@ impl Runtime {
             wire.listen(listener);
         }
         let reactor = Reactor::new(wire, thread::name(&id, "service"))?;
+        // Resolver threads hand their answers back through it.
+        controller.set(reactor.controller()).ok();
         let handle = Handle::new(home.clone(), socket.clone(), reactor.controller(), emitter);
 
         let nid = NodeId::from(*secret_key.public_key());

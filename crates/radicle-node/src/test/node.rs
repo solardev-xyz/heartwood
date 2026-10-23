@@ -470,6 +470,14 @@ impl Node {
 impl Node {
     /// Spawn a node in its own thread.
     pub fn spawn(self) -> NodeHandle {
+        self.spawn_with_gate(std::sync::Arc::new(radicle::node::dial::Open))
+    }
+
+    /// Spawn a node in its own thread, dialling through `gate`.
+    pub fn spawn_with_gate(
+        self,
+        gate: std::sync::Arc<dyn radicle::node::dial::Gate>,
+    ) -> NodeHandle {
         let alias = self.config.alias.clone();
 
         let listen = vec![(Ipv4Addr::LOCALHOST, 0).into()];
@@ -481,6 +489,7 @@ impl Node {
             listen,
             signals,
             self.secret_key.clone(),
+            gate,
         )
         .unwrap();
 
