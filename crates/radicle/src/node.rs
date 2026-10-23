@@ -6,6 +6,7 @@ use address::AddressType;
 pub mod command;
 pub mod config;
 pub mod db;
+pub mod dial;
 pub mod events;
 pub mod notifications;
 pub mod policy;

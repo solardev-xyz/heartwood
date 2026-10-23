@@ -4,9 +4,8 @@ pub mod thread;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::str::FromStr as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{PoisonError, mpsc};
+use std::sync::{Arc, PoisonError, mpsc};
 use std::{fs, io, net, time};
 
 #[cfg(unix)]
@@ -25,6 +24,7 @@ use radicle::node::Event;
 use radicle::node::UserAgent;
 use radicle::node::address;
 use radicle::node::address::Store as _;
+use radicle::node::dial::Gate;
 use radicle::node::events::Emitter;
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
@@ -37,11 +37,20 @@ use thiserror::Error;
 use crate::control;
 use crate::reactor;
 use crate::reactor::Reactor;
+use crate::resolver;
 use crate::wire::{Stopped, Wire};
 use crate::worker;
 
 /// Maximum pending worker tasks allowed.
 pub const MAX_PENDING_TASKS: usize = 1024;
+
+/// The most resolver threads a node runs: fewer when its outbound connection
+/// limit is lower, so that names never resolve faster than they can be
+/// dialled.
+pub const MAX_RESOLVER_THREADS: usize = 4;
+
+/// How long a node's shutdown waits for a resolver thread still in a call.
+pub const RESOLVER_JOIN_LIMIT: time::Duration = time::Duration::from_secs(1);
 
 /// How long the signal watcher waits for a signal before it checks whether
 /// the node has stopped. A host may keep its signal sender after the node
@@ -131,6 +140,8 @@ pub struct Runtime {
     pub pool: worker::Pool,
     pub local_addrs: Vec<net::SocketAddr>,
     pub signals: mpsc::Receiver<Signal>,
+    /// The resolver threads, joined once the reactor has ended.
+    resolvers: resolver::Workers,
     /// The error the service stopped the node with, once it has.
     stopped: Stopped,
 }
@@ -143,6 +154,9 @@ impl Runtime {
     /// and only its [`Handle`] controls it: an embedding host that drives the
     /// node in-process needs no socket on disk.
     ///
+    /// `gate` decides which addresses the node may dial, and resolves names
+    /// for it ([`radicle::node::dial::Open`] keeps the node's own behaviour).
+    ///
     /// This function spawns threads.
     pub fn init(
         home: Home,
@@ -151,6 +165,7 @@ impl Runtime {
         listen: Vec<net::SocketAddr>,
         signals: mpsc::Receiver<Signal>,
         secret_key: SigningKey,
+        gate: Arc<dyn Gate>,
     ) -> Result<Runtime, Error> {
         let id = NodeId::from(*secret_key.public_key());
         let alias = config.alias.clone();
@@ -235,23 +250,51 @@ impl Runtime {
             rng,
             announcement,
             emitter.clone(),
+            gate.clone(),
         );
         service.initialize(clock)?;
 
         let (worker_send, worker_recv) =
             crossbeam_channel::bounded::<worker::Task>(MAX_PENDING_TASKS);
         let stopped = Stopped::default();
-        let mut wire = Wire::new(service, worker_send, secret_key.clone(), stopped.clone());
         let mut local_addrs = Vec::new();
+        let mut listeners = Vec::new();
 
         for addr in listen {
             let listener = reactor::Listener::bind(addr)?;
-            let local_addr = listener.local_addr();
-
-            local_addrs.push(local_addr);
-            wire.listen(listener);
+            local_addrs.push(listener.local_addr());
+            listeners.push(listener);
         }
-        let reactor = Reactor::new(wire, thread::name(&id, "service"))?;
+        // The resolver pool hands its answers back through the reactor's
+        // controller, which it has before the reactor's first event: a name
+        // dialled at start resolves like any other.
+        let outbound = usize::from(config.limits.connection.outbound).max(1);
+        let mut resolvers = None;
+        let reactor = Reactor::with(
+            |controller| {
+                let (queue, workers) = resolver::spawn(
+                    gate.clone(),
+                    controller,
+                    outbound.min(MAX_RESOLVER_THREADS),
+                    outbound,
+                )?;
+                resolvers = Some(workers);
+                let mut wire = Wire::new(
+                    service,
+                    worker_send,
+                    secret_key.clone(),
+                    gate,
+                    queue,
+                    stopped.clone(),
+                );
+                for listener in listeners {
+                    wire.listen(listener);
+                }
+                Ok(wire)
+            },
+            thread::name(&id, "service"),
+        )?;
+        let resolvers = resolvers.ok_or_else(|| io::Error::other("no resolver pool"))?;
         let handle = Handle::new(home.clone(), socket.clone(), reactor.controller(), emitter);
 
         let nid = NodeId::from(*secret_key.public_key());
@@ -286,6 +329,7 @@ impl Runtime {
             pool,
             signals,
             local_addrs,
+            resolvers,
             stopped,
         })
     }
@@ -340,6 +384,9 @@ impl Runtime {
 
         self.pool.run().unwrap();
         self.reactor.join().unwrap();
+        // The reactor is gone, and the wire with it, so the resolvers' queue
+        // has closed: each ends once its current call returns.
+        self.resolvers.join_within(RESOLVER_JOIN_LIMIT);
 
         // The node has stopped: the signal watcher ends at its next check,
         // whether or not the host still holds its signal sender.
