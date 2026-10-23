@@ -74,4 +74,6 @@ radicle-log = { workspace = true, features = ["test"] }
 radicle-protocol = { workspace = true, features = ["test"] }
 radicle-crypto = { workspace = true, features = ["test", "cyphernet"] }
 snapbox = { workspace = true }
+# To damage a policy database behind a node's back, in the fatal-error tests.
+sqlite = { workspace = true, features = ["bundled"] }
 test-log = "0.2.19"
