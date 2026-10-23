@@ -2278,7 +2278,9 @@ fn test_policy_failure_stops_the_node_with_its_error() {
 
     // Her policy tables are dropped behind her back. The first read after it
     // finds no policy; the ones after it fail.
-    let db = sqlite::open(alice.home.node().join(radicle::node::POLICIES_DB_FILE)).unwrap();
+    let mut db = sqlite::open(alice.home.node().join(radicle::node::POLICIES_DB_FILE)).unwrap();
+    // Alice's node may hold the database for a moment: wait for it.
+    db.set_busy_timeout(10_000).unwrap();
     db.execute(r#"DROP TABLE "seeding"; DROP TABLE "following";"#)
         .unwrap();
 

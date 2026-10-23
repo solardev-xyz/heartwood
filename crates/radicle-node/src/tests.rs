@@ -2135,7 +2135,8 @@ fn announcement_message_amplification() {
 /// and reloads the schema (the store reads that as no policy); every one
 /// after it fails.
 fn drop_policy_tables<S>(peer: &Peer<S>) {
-    let db = sqlite::open(peer.policies_path()).unwrap();
+    let mut db = sqlite::open(peer.policies_path()).unwrap();
+    db.set_busy_timeout(10_000).unwrap();
     db.execute(r#"DROP TABLE "seeding"; DROP TABLE "following";"#)
         .unwrap();
 }
