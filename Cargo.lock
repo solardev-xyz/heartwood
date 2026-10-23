@@ -2807,6 +2807,7 @@ dependencies = [
  "indexmap",
  "jsonschema",
  "libc",
+ "libgit2-sys",
  "log",
  "multibase",
  "nonempty 0.9.0",

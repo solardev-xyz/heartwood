@@ -37,6 +37,9 @@ fast-glob = { version = "0.3.2" }
 fastrand = { workspace = true, features = ["std"] }
 git2 = { workspace = true, features = ["vendored-libgit2"] }
 indexmap = { workspace = true, features = ["serde"] }
+# The libgit2 `git2` builds on, for its one option `git2` doesn't wrap: fsync
+# (`storage::git::reconcile::enable_fsync`).
+libgit2-sys = "0.18"
 log = { workspace = true, features = ["std"] }
 multibase = { workspace = true, features = ["std"] }
 nonempty = { workspace = true, features = ["serialize"] }
