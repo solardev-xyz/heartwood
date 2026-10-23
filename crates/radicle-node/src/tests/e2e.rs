@@ -3260,6 +3260,14 @@ fn test_gate_closing_waits_for_a_fetch_under_way() {
     alice.handle.seed(acme, Scope::All).unwrap();
 
     seams::hold(acme);
+    // Let go however the test ends, so that alice can stop.
+    struct Release(radicle::identity::RepoId);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            seams::release(self.0);
+        }
+    }
+    let _release = Release(acme);
     let mut handle = alice.handle.clone();
     let fetching =
         thread::spawn(move || handle.fetch(acme, bob.id, DEFAULT_TIMEOUT, None).unwrap());
