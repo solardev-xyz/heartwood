@@ -155,6 +155,38 @@ fn test_node_without_control_socket_joins_its_signal_watcher() {
 }
 
 #[test]
+// Review of heartwood #1, round 2: a stream of ignored signals doesn't keep
+// the watcher from ending once the node has stopped.
+fn test_node_without_control_socket_stops_while_signals_keep_coming() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (signals, _, handle, running) = run_with_signals(tmp.path());
+    let producing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let producer = thread::spawn({
+        let producing = producing.clone();
+        move || {
+            while producing.load(std::sync::atomic::Ordering::SeqCst) {
+                signals.send(radicle_signals::Signal::WindowChanged).ok();
+                thread::sleep(time::Duration::from_millis(1));
+            }
+        }
+    });
+
+    handle.shutdown().unwrap();
+    let deadline = time::Instant::now() + time::Duration::from_secs(5);
+    while !running.is_finished() && time::Instant::now() < deadline {
+        thread::sleep(time::Duration::from_millis(20));
+    }
+    let finished = running.is_finished();
+    producing.store(false, std::sync::atomic::Ordering::SeqCst);
+    producer.join().unwrap();
+    assert!(
+        finished,
+        "ignored signals kept the node's run from returning"
+    );
+    running.join().unwrap().unwrap();
+}
+
+#[test]
 // While the node runs, its signals act as before: a hangup is ignored, and a
 // termination stops it.
 fn test_node_without_control_socket_stops_on_a_termination_signal() {

@@ -298,6 +298,11 @@ impl Runtime {
                 loop {
                     use radicle::node::Handle as _;
 
+                    // Checked on every turn, so that a stream of ignored signals can't keep
+                    // the watcher from seeing that the node has stopped.
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
                     match self.signals.recv_timeout(SIGNAL_WATCH_INTERVAL) {
                         Ok(Signal::Terminate | Signal::Interrupt) => {
                             log::info!(target: "node", "Termination signal received; shutting down..");
@@ -307,12 +312,7 @@ impl Runtime {
                         Ok(Signal::Hangup) => {
                             log::debug!(target: "node", "Hangup signal (SIGHUP) received; ignoring..");
                         }
-                        Ok(Signal::WindowChanged) => {}
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if stopped.load(Ordering::Acquire) {
-                                break;
-                            }
-                        }
+                        Ok(Signal::WindowChanged) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(e @ mpsc::RecvTimeoutError::Disconnected) => {
                             log::warn!(target: "node", "Signal notifications channel error: {e}");
                             break;
@@ -333,7 +333,9 @@ impl Runtime {
         }
 
         // Nb. We don't join the control thread here, as we have no way of notifying it that the
-        // node is shutting down.
+        // node is shutting down. With a control socket, its listener thread, and any thread
+        // serving a command, outlive `run`, as they always have; the binary exits once `run`
+        // returns. Without one, every thread `run` starts has been joined by now.
 
         // Remove control socket file, but don't freak out if it's not there anymore.
         remove.map(|path| fs::remove_file(path).ok());
