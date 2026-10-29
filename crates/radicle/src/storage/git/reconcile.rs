@@ -11,6 +11,8 @@
 
 mod dir;
 pub mod namespace;
+pub mod quarantine;
+pub mod state;
 
 use std::ffi::{OsStr, OsString, c_int};
 use std::io;
