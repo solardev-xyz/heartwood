@@ -445,6 +445,173 @@ impl State {
         Ok(Some(cache::Checkpoint { kind, after }))
     }
 
+    /// The scan of `rid`'s remotes for its cache rebuild, if one was recorded
+    /// at its `version`: otherwise the scan starts over.
+    pub fn scan(&self, rid: &RepoId, version: Oid) -> Result<Option<cache::Scan>, Error> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT version, after, complete FROM rebuild_scan WHERE rid = ?1")?;
+        stmt.bind((1, rid))?;
+        let Some(row) = stmt.into_iter().next() else {
+            return Ok(None);
+        };
+        let row = row?;
+        if row.try_read::<&str, _>("version")? != version.to_string() {
+            return Ok(None);
+        }
+        let after = row
+            .try_read::<Option<&str>, _>("after")?
+            .map(|after| {
+                after
+                    .parse::<NodeId>()
+                    .map_err(|e| Error::Invalid(e.to_string()))
+            })
+            .transpose()?;
+        let complete = row.try_read::<i64, _>("complete")? != 0;
+        Ok(Some(cache::Scan { after, complete }))
+    }
+
+    /// Adds the COB tips of `remote`, scanned whole, to `rid`'s worklist at
+    /// its `version`, and moves its scan past `remote`, in one durable
+    /// transaction: a remote is in the worklist whole, or not at all. A
+    /// `complete` scan has no remote left; one with no remote at all is
+    /// recorded with none.
+    pub fn scanned(
+        &mut self,
+        rid: &RepoId,
+        version: Oid,
+        remote: Option<&NodeId>,
+        tips: &[cache::Tip],
+        complete: bool,
+    ) -> Result<(), Error> {
+        transaction(&self.db, |db| {
+            if let Some(remote) = remote {
+                let remote = remote.to_string();
+                for tip in tips {
+                    let mut stmt = db.prepare(
+                        "INSERT INTO rebuild_worklist (rid, kind, id, remote, tip)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT (rid, kind, id, remote) DO UPDATE SET tip = excluded.tip",
+                    )?;
+                    stmt.bind((1, rid))?;
+                    stmt.bind((2, tip.kind.as_str()))?;
+                    stmt.bind((3, tip.id.to_string().as_str()))?;
+                    stmt.bind((4, remote.as_str()))?;
+                    stmt.bind((5, tip.oid.to_string().as_str()))?;
+                    stmt.next()?;
+                }
+            }
+            let mut stmt = db.prepare(
+                "INSERT INTO rebuild_scan (rid, version, after, complete) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (rid) DO UPDATE SET
+                   version = excluded.version, after = excluded.after,
+                   complete = excluded.complete",
+            )?;
+            stmt.bind((1, rid))?;
+            stmt.bind((2, version.to_string().as_str()))?;
+            stmt.bind((3, remote.map(|remote| remote.to_string()).as_deref()))?;
+            stmt.bind((4, i64::from(complete)))?;
+            stmt.next()?;
+            Ok(())
+        })
+    }
+
+    /// The next COBs of `kind` in `rid`'s worklist after `after`, at most
+    /// `limit`, in the order of their IDs, and whether more remain.
+    pub fn worklist(
+        &self,
+        rid: &RepoId,
+        kind: cache::Kind,
+        after: Option<&crate::cob::ObjectId>,
+        limit: usize,
+    ) -> Result<(Vec<crate::cob::ObjectId>, bool), Error> {
+        let mut stmt = self.db.prepare(
+            "SELECT DISTINCT id FROM rebuild_worklist
+             WHERE rid = ?1 AND kind = ?2 AND id > ?3 ORDER BY id LIMIT ?4",
+        )?;
+        stmt.bind((1, rid))?;
+        stmt.bind((2, kind.as_str()))?;
+        stmt.bind((
+            3,
+            after
+                .map(|after| after.to_string())
+                .unwrap_or_default()
+                .as_str(),
+        ))?;
+        stmt.bind((
+            4,
+            i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
+        ))?;
+        let mut ids = Vec::with_capacity(limit.min(cache::BATCH_COBS) + 1);
+        for row in stmt.into_iter() {
+            let id = row?
+                .try_read::<&str, _>("id")?
+                .parse::<crate::cob::ObjectId>()
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            ids.push(id);
+        }
+        let more = ids.len() > limit;
+        ids.truncate(limit);
+        Ok((ids, more))
+    }
+
+    /// The tips of the COB `id` of `kind` in `rid`'s worklist: one for each
+    /// remote that signed refs for it.
+    pub fn tips(
+        &self,
+        rid: &RepoId,
+        kind: cache::Kind,
+        id: &crate::cob::ObjectId,
+    ) -> Result<Vec<Oid>, Error> {
+        let mut stmt = self.db.prepare(
+            "SELECT tip FROM rebuild_worklist WHERE rid = ?1 AND kind = ?2 AND id = ?3
+             ORDER BY remote",
+        )?;
+        stmt.bind((1, rid))?;
+        stmt.bind((2, kind.as_str()))?;
+        stmt.bind((3, id.to_string().as_str()))?;
+        let mut tips = Vec::new();
+        for row in stmt.into_iter() {
+            let tip = row?
+                .try_read::<&str, _>("tip")?
+                .parse::<Oid>()
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            tips.push(tip);
+        }
+        Ok(tips)
+    }
+
+    /// Stages `row` for `rid`'s cache rebuild, in a durable transaction of
+    /// its own: a batch's rows are staged as each is made, so that none is
+    /// held for long. The batch's checkpoint follows them
+    /// ([`State::save_cache_checkpoint`]). A row staged past the checkpoint,
+    /// by a batch cut off, is staged again by the next.
+    pub fn stage_row(&mut self, rid: &RepoId, row: &cache::Row) -> Result<(), Error> {
+        transaction(&self.db, |db| {
+            let mut stmt = db.prepare(
+                "INSERT INTO rebuild_staging (rid, kind, id, json) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (rid, kind, id) DO UPDATE SET json = excluded.json",
+            )?;
+            stmt.bind((1, rid))?;
+            stmt.bind((2, row.kind.as_str()))?;
+            stmt.bind((3, row.id.to_string().as_str()))?;
+            stmt.bind((4, row.json.as_str()))?;
+            stmt.next()?;
+            Ok(())
+        })
+    }
+
+    /// Records `next` as the checkpoint of `rid`'s cache rebuild at its
+    /// `version`, durably.
+    pub fn save_cache_checkpoint(
+        &mut self,
+        rid: &RepoId,
+        version: Oid,
+        next: &cache::Checkpoint,
+    ) -> Result<(), Error> {
+        self.stage(rid, version, &[], next)
+    }
+
     /// Stages `rows` for `rid`'s cache rebuild at its `version`, with the
     /// checkpoint `next`, in one durable transaction: a batch is staged with
     /// its checkpoint, or not at all.
@@ -501,7 +668,12 @@ impl State {
                 stmt.bind((2, kind.as_str()))?;
                 stmt.next()?;
             }
-            for table in ["rebuild_staging", "reconcile_cache"] {
+            for table in [
+                "rebuild_staging",
+                "reconcile_cache",
+                "rebuild_worklist",
+                "rebuild_scan",
+            ] {
                 let mut stmt = db.prepare(format!("DELETE FROM {table} WHERE rid = ?1"))?;
                 stmt.bind((1, rid))?;
                 stmt.next()?;
@@ -543,7 +715,9 @@ impl State {
                  DELETE FROM reconcile_repository;
                  DELETE FROM reconcile_unit;
                  DELETE FROM rebuild_staging;
-                 DELETE FROM reconcile_cache;",
+                 DELETE FROM reconcile_cache;
+                 DELETE FROM rebuild_worklist;
+                 DELETE FROM rebuild_scan;",
             )?;
             Ok::<_, Error>(())
         })?;
@@ -584,6 +758,8 @@ fn discard(db: &sql::Connection, rid: &RepoId) -> Result<(), Error> {
         "reconcile_repository",
         "rebuild_staging",
         "reconcile_cache",
+        "rebuild_worklist",
+        "rebuild_scan",
     ] {
         let mut stmt = db.prepare(format!("DELETE FROM {table} WHERE rid = ?1"))?;
         stmt.bind((1, rid))?;
