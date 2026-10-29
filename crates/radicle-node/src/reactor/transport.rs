@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{fmt, io};
 
 use mio::event::{Event, Source};
@@ -11,6 +11,11 @@ use crate::reactor::EventHandler;
 use crate::reactor::session::Session;
 
 const READ_BUFFER_SIZE: usize = u16::MAX as usize;
+
+/// The most reads one readiness event takes: the reactor re-registers every
+/// transport each turn, so data left in the socket is read on the next one.
+/// So what a turn hands the handler is bounded, whatever the socket holds.
+const READS_PER_TURN: usize = 4;
 
 /// An event happening for a [`Transport`] network transport and delivered to
 /// a [`ReactionHandler`].
@@ -66,6 +71,9 @@ pub struct Transport<S: Session> {
     /// How many bytes `write_buffer` holds, shared with the handler, so that
     /// it can hold back what it would add to a buffer already full.
     buffered: Arc<AtomicUsize>,
+    /// Whether it reads from its session, set by the handler: cleared while
+    /// the handler can't take more from it, so that the peer waits.
+    reading: Arc<AtomicBool>,
 }
 
 impl<S: Session> std::fmt::Debug for Transport<S> {
@@ -137,7 +145,34 @@ impl<S: Session> Transport<S> {
             read_buffer: Box::new([0u8; READ_BUFFER_SIZE]),
             write_buffer: VecDeque::new(),
             buffered: Arc::default(),
+            reading: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// What it is to be registered for.
+    fn wanted(&self) -> Option<Interest> {
+        use TransportState::*;
+        use mio::Interest;
+
+        // While the handler has paused reading, only writes are of interest
+        // (a registration needs one interest: writable is the one that costs
+        // nothing on an idle socket).
+        let reading = self.reading.load(Ordering::Relaxed);
+        match self.state {
+            Init => Some(Interest::WRITABLE),
+            Active if !reading => Some(Interest::WRITABLE),
+            Active | Handshake if self.write_intent => {
+                Some(Interest::READABLE | Interest::WRITABLE)
+            }
+            Active | Handshake => Some(Interest::READABLE),
+            Terminated => None,
+        }
+    }
+
+    /// Whether it reads from its session: the handler clears it to stop
+    /// reading, and sets it again to resume.
+    pub fn reading(&self) -> Arc<AtomicBool> {
+        self.reading.clone()
     }
 
     /// How many bytes its write buffer holds, as it changes: what is buffered
@@ -307,11 +342,17 @@ impl<S: Session> Transport<S> {
     fn handle_readable(&mut self, events: &mut Vec<SessionEvent<S>>) {
         use io::ErrorKind::*;
 
+        let mut reads = 0;
         loop {
+            // Paused, or done for this turn: what is left waits in the socket.
+            if !self.reading.load(Ordering::Relaxed) || reads >= READS_PER_TURN {
+                return;
+            }
             match self.session.read(self.read_buffer.as_mut()) {
                 Ok(0) => {}
                 Ok(len) => {
                     events.push(SessionEvent::Data(self.read_buffer[..len].to_vec()));
+                    reads += 1;
                     continue;
                 }
                 Err(err) if err.kind() == Interrupted => continue,
@@ -329,17 +370,7 @@ impl<S: Session + Source> EventHandler for Transport<S> {
     type Reaction = SessionEvent<S>;
 
     fn interests(&self) -> Option<Interest> {
-        use TransportState::*;
-        use mio::Interest;
-
-        match self.state {
-            Init => Some(Interest::WRITABLE),
-            Active | Handshake if self.write_intent => {
-                Some(Interest::READABLE | Interest::WRITABLE)
-            }
-            Active | Handshake => Some(Interest::READABLE),
-            Terminated => None,
-        }
+        self.wanted()
     }
 
     fn handle(&mut self, event: &Event) -> Vec<Self::Reaction> {
@@ -423,6 +454,60 @@ mod test {
         fn artifact(&self) -> Option<String> {
             Some("slow".to_owned())
         }
+    }
+
+    /// A session that always has bytes to read, and counts the reads.
+    struct Endless {
+        reads: usize,
+    }
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            buf.fill(7);
+            Ok(buf.len())
+        }
+    }
+
+    impl Write for Endless {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Session for Endless {
+        type Artifact = String;
+
+        fn artifact(&self) -> Option<String> {
+            Some("endless".to_owned())
+        }
+    }
+
+    // Security R-10: a turn reads a bounded amount, whatever the socket holds,
+    // and none while the handler has paused reading; then only writes are of
+    // interest.
+    #[test]
+    fn its_reads_are_bounded_a_turn_and_pause_at_the_handler_s_word() {
+        let mut transport = Transport::with_session(Endless { reads: 0 }).unwrap();
+        let mut events = Vec::new();
+        transport.handle_readable(&mut events);
+        assert_eq!(transport.session.reads, READS_PER_TURN);
+        assert_eq!(events.len(), READS_PER_TURN);
+
+        let reading = transport.reading();
+        reading.store(false, Ordering::Relaxed);
+        transport.handle_readable(&mut events);
+        assert_eq!(transport.session.reads, READS_PER_TURN);
+        assert_eq!(transport.wanted(), Some(Interest::WRITABLE));
+
+        reading.store(true, Ordering::Relaxed);
+        assert!(transport.wanted().unwrap().is_readable());
+        transport.handle_readable(&mut events);
+        assert_eq!(transport.session.reads, 2 * READS_PER_TURN);
     }
 
     // Security R-10: the handler sees how much a transport has buffered, as

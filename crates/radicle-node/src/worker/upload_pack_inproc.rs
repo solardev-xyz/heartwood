@@ -75,6 +75,19 @@ pub const MAX_COMMAND_LINES: usize = 1 << 17;
 /// The most bytes one command's lines may hold together.
 pub const MAX_COMMAND_BYTES: usize = 16 << 20;
 
+/// The most objects one command may walk: refs advertised, commits walked,
+/// and the trees, blobs and tags visited, for its wants and haves together.
+/// A command that needs more is refused. So what one upload holds is bounded
+/// whatever the repository's size.
+pub const MAX_WALK: usize = 1 << 20;
+
+/// How long one command's walk may take.
+const WALK_TIME: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The largest commit, tree or tag body a walk reads. The pack's own limit
+/// applies too: it reads none past the smaller.
+pub const MAX_METADATA_OBJECT: usize = 32 << 20;
+
 /// A parsed `command=…` request: its name plus every data line that followed
 /// (both the capability lines and, after the `0001` delimiter, the argument
 /// lines — we scan them uniformly).
@@ -130,12 +143,7 @@ where
     let mut iter = StreamingPeekableIter::new(&mut recv, DELIMITERS, false);
     while let Some(cmd) = read_command(&mut iter)? {
         match cmd.name.as_str() {
-            "ls-refs" => {
-                let mut out = Vec::new();
-                handle_ls_refs(&repo, &cmd, &mut out)?;
-                send.write_all(&out)?;
-                send.flush()?;
-            }
+            "ls-refs" => handle_ls_refs(&repo, &cmd, &mut send)?,
             "fetch" => {
                 if let Err(e) = handle_fetch(&repo, &cmd, &mut send, rid, remote, emitter, limit) {
                     emitter.emit(
@@ -237,8 +245,10 @@ fn read_command<R: Read>(iter: &mut StreamingPeekableIter<R>) -> io::Result<Opti
 
 /// Answer `ls-refs`: advertise every reference (the client re-filters, but we
 /// honour `ref-prefix` as the spec's optimization), with optional `symrefs`
-/// and `peel` annotations, terminated by a flush.
-fn handle_ls_refs(repo: &Repository, cmd: &Command, out: &mut Vec<u8>) -> io::Result<()> {
+/// and `peel` annotations, terminated by a flush. The advertisement is
+/// written as it is made, a write's worth at a time, whatever the number of
+/// refs.
+fn handle_ls_refs<W: Write>(repo: &Repository, cmd: &Command, send: &mut W) -> io::Result<()> {
     let mut want_symrefs = false;
     let mut want_peel = false;
     let mut prefixes: Vec<String> = Vec::new();
@@ -254,6 +264,8 @@ fn handle_ls_refs(repo: &Repository, cmd: &Command, out: &mut Vec<u8>) -> io::Re
         }
     }
 
+    let walk = Walk::new(repo, MAX_WALK, MAX_METADATA_OBJECT)?;
+    let mut out = Vec::with_capacity(WRITE_FLUSH_THRESHOLD + 1024);
     let refs = repo.references().map_err(git_err)?;
     for r in refs {
         let r = r.map_err(git_err)?;
@@ -284,16 +296,19 @@ fn handle_ls_refs(repo: &Repository, cmd: &Command, out: &mut Vec<u8>) -> io::Re
         if want_symrefs && let Some(target) = symref_target {
             line.push_str(&format!(" symref-target:{target}"));
         }
-        if want_peel
-            && let Ok(obj) = repo.find_object(oid, None)
-            && obj.kind() == Some(git2::ObjectType::Tag)
-            && let Ok(peeled) = obj.peel(git2::ObjectType::Commit)
-        {
-            line.push_str(&format!(" peeled:{}", peeled.id()));
+        if want_peel && let Some(peeled) = walk.peeled(oid)? {
+            line.push_str(&format!(" peeled:{peeled}"));
         }
-        encode::text_to_write(line.as_bytes(), &mut *out)?;
+        encode::text_to_write(line.as_bytes(), &mut out)?;
+        if out.len() >= WRITE_FLUSH_THRESHOLD {
+            send.write_all(&out)?;
+            send.flush()?;
+            out.clear();
+        }
     }
-    encode::flush_to_write(&mut *out)?;
+    encode::flush_to_write(&mut out)?;
+    send.write_all(&out)?;
+    send.flush()?;
     Ok(())
 }
 
@@ -324,23 +339,23 @@ fn handle_fetch<W: Write>(
             haves.push(oid);
         }
     }
-    if let Some(oid) = unadvertised(repo, &wants).map_err(git_err)? {
+    // One walk for the whole command: its checks and its objects share one
+    // allowance, and read no body past the pack's limit.
+    let mut walk = Walk::new(repo, MAX_WALK, allowance(limit))?;
+    if let Some(oid) = unadvertised(&mut walk, &wants)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("not our ref: {oid}"),
         ));
     }
 
-    // Compute the object set: everything reachable from the wants, minus
-    // everything reachable from the haves. Then serialise a self-contained,
-    // non-delta packfile — libgit2's packbuilder only emits `REF_DELTA`,
-    // which the fetch protocol reserves for thin packs (base on the
-    // receiver's side), so a gix client rejects an in-pack REF_DELTA base.
-    // Full objects sidestep the delta-format question entirely.
-    let want_objs = reachable_objects(repo, &wants).map_err(git_err)?;
-    let have_objs = reachable_objects(repo, &haves).map_err(git_err)?;
-    let to_send: Vec<Oid> = want_objs.difference(&have_objs).copied().collect();
-    drop((want_objs, have_objs));
+    // Compute the object set: everything reachable from the wants that the
+    // client doesn't have. Then serialise a self-contained, non-delta
+    // packfile — libgit2's packbuilder only emits `REF_DELTA`, which the
+    // fetch protocol reserves for thin packs (base on the receiver's side),
+    // so a gix client rejects an in-pack REF_DELTA base. Full objects
+    // sidestep the delta-format question entirely.
+    let to_send = objects_to_send(&mut walk, &wants, &haves)?;
 
     // Response: `packfile` section header, then the pack over sideband ch 1,
     // written as it is made.
@@ -353,12 +368,116 @@ fn handle_fetch<W: Write>(
     band.finish()
 }
 
+/// The largest body a walk for a pack of `limit` reads.
+fn allowance(limit: FetchPackSizeLimit) -> usize {
+    usize::try_from(limit.as_u64())
+        .unwrap_or(usize::MAX)
+        .min(MAX_METADATA_OBJECT)
+}
+
+/// What one command may walk, and read: `left` more objects, until its
+/// deadline; and no body larger than its `allowance`. Kinds and sizes come
+/// from the store's headers, without reading the body.
+struct Walk<'r> {
+    repo: &'r Repository,
+    odb: git2::Odb<'r>,
+    left: usize,
+    deadline: std::time::Instant,
+    allowance: usize,
+}
+
+impl<'r> Walk<'r> {
+    fn new(repo: &'r Repository, budget: usize, allowance: usize) -> io::Result<Self> {
+        Ok(Self {
+            repo,
+            odb: repo.odb().map_err(git_err)?,
+            left: budget,
+            deadline: std::time::Instant::now() + WALK_TIME,
+            allowance,
+        })
+    }
+
+    /// Takes one more object of the walk's allowance.
+    fn step(&mut self) -> io::Result<()> {
+        if self.left == 0 {
+            return Err(io::Error::other(format!(
+                "the command needs more than {MAX_WALK} objects walked"
+            )));
+        }
+        self.left -= 1;
+        if self.left.is_multiple_of(1024) && std::time::Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the command's walk took too long",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The kind of `oid`, from its header, without reading it: `None` if the
+    /// store hasn't it.
+    fn kind(&self, oid: Oid) -> io::Result<Option<ObjectType>> {
+        match self.odb.read_header(oid) {
+            Ok((_, kind)) => Ok(Some(kind)),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(git_err(e)),
+        }
+    }
+
+    /// Checks, from its header, that the body of `oid` may be read.
+    fn readable(&self, oid: Oid) -> io::Result<()> {
+        let (size, _) = self.odb.read_header(oid).map_err(git_err)?;
+        if size > self.allowance {
+            return Err(io::Error::other(format!(
+                "the object {oid} is too large to read: {size} bytes"
+            )));
+        }
+        #[cfg(test)]
+        tests::READ.with(|read| read.set(read.get() + size));
+        Ok(())
+    }
+
+    fn commit(&self, oid: Oid) -> io::Result<git2::Commit<'r>> {
+        self.readable(oid)?;
+        self.repo.find_commit(oid).map_err(git_err)
+    }
+
+    fn tree(&self, oid: Oid) -> io::Result<git2::Tree<'r>> {
+        self.readable(oid)?;
+        self.repo.find_tree(oid).map_err(git_err)
+    }
+
+    /// The target of the annotated tag `oid`.
+    fn tag_target(&self, oid: Oid) -> io::Result<Oid> {
+        self.readable(oid)?;
+        let tag = self.repo.find_tag(oid).map_err(git_err)?;
+        Ok(tag.target_id())
+    }
+
+    /// The commit an annotated tag `oid` peels to, if it is one and does.
+    fn peeled(&self, mut oid: Oid) -> io::Result<Option<Oid>> {
+        if self.kind(oid)? != Some(ObjectType::Tag) {
+            return Ok(None);
+        }
+        // A chain of tags, followed in a loop: no deeper than the walk's
+        // allowance, each a body read.
+        for _ in 0..MAX_WALK {
+            match self.kind(oid)? {
+                Some(ObjectType::Tag) => oid = self.tag_target(oid)?,
+                Some(ObjectType::Commit) => return Ok(Some(oid)),
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// The refs `ls-refs` advertises, by their targets: each ref's object, a
 /// symbolic ref's resolved one, and an annotated tag's peeled commit too.
-fn advertised(repo: &Repository) -> Result<HashSet<Oid>, git2::Error> {
+fn advertised(walk: &mut Walk) -> io::Result<HashSet<Oid>> {
     let mut tips = HashSet::new();
-    for r in repo.references()? {
-        let r = r?;
+    for r in walk.repo.references().map_err(git_err)? {
+        let r = r.map_err(git_err)?;
         // `ls-refs` leaves out a name that isn't UTF-8.
         if r.name().is_err() {
             continue;
@@ -370,12 +489,10 @@ fn advertised(repo: &Repository) -> Result<HashSet<Oid>, git2::Error> {
                 None => continue,
             },
         };
+        walk.step()?;
         tips.insert(oid);
-        if let Ok(peeled) = repo
-            .find_object(oid, None)
-            .and_then(|obj| obj.peel(ObjectType::Commit))
-        {
-            tips.insert(peeled.id());
+        if let Some(peeled) = walk.peeled(oid)? {
+            tips.insert(peeled);
         }
     }
     Ok(tips)
@@ -384,9 +501,10 @@ fn advertised(repo: &Repository) -> Result<HashSet<Oid>, git2::Error> {
 /// The first of `wants` that isn't ours to serve, if any: one that is neither
 /// an advertised ref's tip ([`advertised`]) nor a commit reachable from one.
 /// `git upload-pack` allows the same in protocol v2, where `ls-refs` and
-/// `fetch` may come apart; nothing else in the store is served.
-fn unadvertised(repo: &Repository, wants: &[Oid]) -> Result<Option<Oid>, git2::Error> {
-    let tips = advertised(repo)?;
+/// `fetch` may come apart; nothing else in the store is served. Kinds come
+/// from headers: no want's body is read to refuse it.
+fn unadvertised(walk: &mut Walk, wants: &[Oid]) -> io::Result<Option<Oid>> {
+    let tips = advertised(walk)?;
     let mut pending: HashSet<Oid> = wants
         .iter()
         .copied()
@@ -396,20 +514,20 @@ fn unadvertised(repo: &Repository, wants: &[Oid]) -> Result<Option<Oid>, git2::E
         return Ok(None);
     }
     // Only a commit can be reachable without being a tip here.
-    if let Some(want) = pending
-        .iter()
-        .find(|want| repo.find_commit(**want).is_err())
-    {
-        return Ok(Some(*want));
-    }
-    let mut walk = repo.revwalk()?;
-    for tip in &tips {
-        if repo.find_commit(*tip).is_ok() {
-            walk.push(*tip)?;
+    for want in &pending {
+        if walk.kind(*want)? != Some(ObjectType::Commit) {
+            return Ok(Some(*want));
         }
     }
-    for oid in walk {
-        pending.remove(&oid?);
+    let mut revwalk = walk.repo.revwalk().map_err(git_err)?;
+    for tip in &tips {
+        if walk.kind(*tip)? == Some(ObjectType::Commit) {
+            revwalk.push(*tip).map_err(git_err)?;
+        }
+    }
+    for oid in revwalk {
+        walk.step()?;
+        pending.remove(&oid.map_err(git_err)?);
         if pending.is_empty() {
             return Ok(None);
         }
@@ -417,78 +535,141 @@ fn unadvertised(repo: &Repository, wants: &[Oid]) -> Result<Option<Oid>, git2::E
     Ok(pending.into_iter().next())
 }
 
-/// The full set of object ids reachable from `tips`: every commit reachable
-/// from a committish tip, each of their trees walked down to blobs, every
-/// annotated tag on the way to a tip's target, and any tree or blob tip with
-/// its closure. Deduplicated, so shared subtrees are walked once. The walk is
-/// iterative: no tree or tag chain is too deep for it.
-fn reachable_objects(repo: &Repository, tips: &[Oid]) -> Result<HashSet<Oid>, git2::Error> {
-    let mut objs: HashSet<Oid> = HashSet::new();
-    let odb = repo.odb()?;
-
-    // Commits first, via a revwalk (so history is followed). A tag is
-    // collected, and peeled, down to its target.
-    let mut walk = repo.revwalk()?;
-    let mut tree_roots: Vec<Oid> = Vec::new();
-    for tip in tips {
-        if !odb.exists(*tip) {
-            continue; // a `have` we don't actually store — skip it
+/// The objects to send for `wants`, to a client that has `haves`: every
+/// commit reachable from a want but not from a have, the annotated tags on
+/// the way to a want's target, and the trees and blobs under them, less those
+/// the client has.
+///
+/// The client's objects are those under the trees of the commits it has at
+/// the edge of what is sent (the haves that are parents of sent commits), as
+/// `git pack-objects` reckons them, and any tree or blob it names as a have.
+/// So the walk takes a snapshot of the edge, not the client's whole history.
+/// A blob is never read; every body read is checked against the walk's
+/// allowance first, and every object visited counts against its budget. The
+/// walk is iterative: no tree or tag chain is too deep for it.
+fn objects_to_send(walk: &mut Walk, wants: &[Oid], haves: &[Oid]) -> io::Result<Vec<Oid>> {
+    // The client's: commits hidden from the revwalk, and other objects it
+    // names.
+    let mut revwalk = walk.repo.revwalk().map_err(git_err)?;
+    let mut theirs: HashSet<Oid> = HashSet::new();
+    for have in haves {
+        match walk.kind(*have)? {
+            Some(ObjectType::Commit) => revwalk.hide(*have).map_err(git_err)?,
+            Some(_) => {
+                walk.step()?;
+                theirs.insert(*have);
+            }
+            // A `have` we don't actually store — skip it.
+            None => {}
         }
-        let mut oid = *tip;
+    }
+
+    // The wants: a tag is collected, and peeled, down to its target.
+    let mut sent: HashSet<Oid> = HashSet::new();
+    let mut order: Vec<Oid> = Vec::new();
+    let mut roots: Vec<Oid> = Vec::new();
+    for want in wants {
+        let mut oid = *want;
         loop {
-            let obj = repo.find_object(oid, None)?;
-            match obj.kind() {
+            match walk.kind(oid)? {
                 Some(ObjectType::Tag) => {
-                    if !objs.insert(oid) {
+                    if !sent.insert(oid) {
                         break; // its chain is collected already
                     }
-                    match obj.as_tag() {
-                        Some(tag) => oid = tag.target_id(),
-                        None => break,
-                    }
+                    walk.step()?;
+                    order.push(oid);
+                    oid = walk.tag_target(oid)?;
                 }
                 Some(ObjectType::Commit) => {
-                    walk.push(oid)?;
+                    revwalk.push(oid).map_err(git_err)?;
                     break;
                 }
                 Some(ObjectType::Tree) => {
-                    tree_roots.push(oid);
+                    roots.push(oid);
                     break;
                 }
-                _ => {
-                    objs.insert(oid); // a blob, or anything else addressable
+                Some(_) => {
+                    if !theirs.contains(&oid) && sent.insert(oid) {
+                        walk.step()?;
+                        order.push(oid);
+                    }
                     break;
+                }
+                None => {
+                    return Err(io::Error::other(format!("no object {oid} to send")));
                 }
             }
         }
     }
-    for oid in walk {
-        let oid = oid?;
-        if objs.insert(oid) {
-            let commit = repo.find_commit(oid)?;
-            tree_roots.push(commit.tree_id());
+
+    // The commits to send, then the edge: their parents the client has.
+    let mut commits: Vec<Oid> = Vec::new();
+    for oid in revwalk {
+        let oid = oid.map_err(git_err)?;
+        walk.step()?;
+        if sent.insert(oid) {
+            order.push(oid);
+            commits.push(oid);
         }
     }
-    for root in tree_roots {
-        collect_tree(repo, root, &mut objs)?;
+    let mut edge: Vec<Oid> = Vec::new();
+    for commit in &commits {
+        let commit = walk.commit(*commit)?;
+        roots.push(commit.tree_id());
+        for parent in commit.parent_ids() {
+            if !sent.contains(&parent) {
+                edge.push(parent);
+            }
+        }
     }
-    Ok(objs)
+    // What the client has under the edge's trees.
+    for parent in edge {
+        if walk.kind(parent)? != Some(ObjectType::Commit) {
+            continue;
+        }
+        let tree = walk.commit(parent)?.tree_id();
+        collect_tree(walk, tree, &mut theirs, &HashSet::new(), None)?;
+    }
+    // What is sent under the commits' trees, and the wanted trees.
+    for root in roots {
+        collect_tree(walk, root, &mut sent, &theirs, Some(&mut order))?;
+    }
+    Ok(order)
 }
 
-/// Add a tree and everything under it (subtrees and blobs), skipping trees
-/// already visited, with a stack of its own rather than recursion.
-fn collect_tree(repo: &Repository, root: Oid, objs: &mut HashSet<Oid>) -> Result<(), git2::Error> {
+/// Adds the tree `root` and everything under it (subtrees and blobs) to
+/// `seen`, and to `order` if given, but for what `skip` holds and `seen` has
+/// already.
+/// It keeps a stack of its own, rather than recursion; every object counts
+/// against the walk's budget, and no blob is read.
+fn collect_tree(
+    walk: &mut Walk,
+    root: Oid,
+    seen: &mut HashSet<Oid>,
+    skip: &HashSet<Oid>,
+    mut order: Option<&mut Vec<Oid>>,
+) -> io::Result<()> {
     let mut stack = vec![root];
     while let Some(oid) = stack.pop() {
-        if !objs.insert(oid) {
-            continue; // already walked this subtree
+        if skip.contains(&oid) || !seen.insert(oid) {
+            continue; // the client's, or already walked
         }
-        let tree = repo.find_tree(oid)?;
+        walk.step()?;
+        if let Some(order) = order.as_mut() {
+            order.push(oid);
+        }
+        let tree = walk.tree(oid)?;
         for entry in tree.iter() {
             match entry.kind() {
                 Some(ObjectType::Tree) => stack.push(entry.id()),
                 Some(ObjectType::Blob) => {
-                    objs.insert(entry.id());
+                    let blob = entry.id();
+                    if !skip.contains(&blob) && seen.insert(blob) {
+                        walk.step()?;
+                        if let Some(order) = order.as_mut() {
+                            order.push(blob);
+                        }
+                    }
                 }
                 // Gitlink (submodule) commits are not stored here; skip them.
                 _ => {}
@@ -673,7 +854,28 @@ fn git_err(e: git2::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        /// The bytes of the bodies walks chose to read on this thread.
+        pub(super) static READ: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The objects `objects_to_send` gives, with the usual budget.
+    fn to_send(repo: &Repository, wants: &[Oid], haves: &[Oid]) -> HashSet<Oid> {
+        let mut walk = Walk::new(repo, MAX_WALK, MAX_METADATA_OBJECT).unwrap();
+        objects_to_send(&mut walk, wants, haves)
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    fn unadvertised_of(repo: &Repository, wants: &[Oid]) -> Option<Oid> {
+        let mut walk = Walk::new(repo, MAX_WALK, MAX_METADATA_OBJECT).unwrap();
+        unadvertised(&mut walk, wants).unwrap()
+    }
 
     fn sig() -> git2::Signature<'static> {
         git2::Signature::new("t", "t@e", &git2::Time::new(0, 0)).unwrap()
@@ -713,7 +915,7 @@ mod tests {
             )
             .unwrap();
 
-        let objs = reachable_objects(&repo, &[commit]).unwrap();
+        let objs = to_send(&repo, &[commit], &[]);
         assert!(objs.contains(&commit));
         assert!(objs.contains(&tree));
         assert!(objs.contains(&blob));
@@ -754,9 +956,7 @@ mod tests {
             )
             .unwrap();
 
-        let want = reachable_objects(&repo, &[c2]).unwrap();
-        let have = reachable_objects(&repo, &[c1]).unwrap();
-        let to_send: HashSet<Oid> = want.difference(&have).copied().collect();
+        let to_send = to_send(&repo, &[c2], &[c1]);
         // The new commit, its tree, and the new blob are sent…
         assert!(to_send.contains(&c2));
         assert!(to_send.contains(&t2));
@@ -878,10 +1078,7 @@ mod tests {
             )
             .unwrap();
 
-        let objs: Vec<Oid> = reachable_objects(&repo, &[commit])
-            .unwrap()
-            .into_iter()
-            .collect();
+        let objs: Vec<Oid> = to_send(&repo, &[commit], &[]).into_iter().collect();
         let (sink, result) = stream(&repo, &objs, FetchPackSizeLimit::default());
         result.unwrap();
         let pack = demux(&sink.writes.concat());
@@ -902,10 +1099,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init_bare(dir.path()).unwrap();
         let commit = commit_with(&repo, 128, 16 * 1024);
-        let objs: Vec<Oid> = reachable_objects(&repo, &[commit])
-            .unwrap()
-            .into_iter()
-            .collect();
+        let objs: Vec<Oid> = to_send(&repo, &[commit], &[]).into_iter().collect();
         let (sink, result) = stream(&repo, &objs, FetchPackSizeLimit::default());
         result.unwrap();
         let total: usize = sink.writes.iter().map(Vec::len).sum();
@@ -928,10 +1122,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init_bare(dir.path()).unwrap();
         let commit = commit_with(&repo, 32, 16 * 1024);
-        let objs: Vec<Oid> = reachable_objects(&repo, &[commit])
-            .unwrap()
-            .into_iter()
-            .collect();
+        let objs: Vec<Oid> = to_send(&repo, &[commit], &[]).into_iter().collect();
         let limit = FetchPackSizeLimit::kibibytes(128);
         let (sink, result) = stream(&repo, &objs, limit);
         assert!(
@@ -989,10 +1180,10 @@ mod tests {
             .unwrap();
 
         // Tips, and a commit in their history that is none.
-        assert_eq!(unadvertised(&repo, &[c2, c1, tag, c0]).unwrap(), None);
-        assert_eq!(unadvertised(&repo, &[c2, loose]).unwrap(), Some(loose));
-        assert_eq!(unadvertised(&repo, &[blob]).unwrap(), Some(blob));
-        assert_eq!(unadvertised(&repo, &[tree.id()]).unwrap(), Some(tree.id()));
+        assert_eq!(unadvertised_of(&repo, &[c2, c1, tag, c0]), None);
+        assert_eq!(unadvertised_of(&repo, &[c2, loose]), Some(loose));
+        assert_eq!(unadvertised_of(&repo, &[blob]), Some(blob));
+        assert_eq!(unadvertised_of(&repo, &[tree.id()]), Some(tree.id()));
 
         // A fetch that wants one is refused, with nothing sent.
         let fetch = |want: Oid| {
@@ -1048,7 +1239,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let objs = reachable_objects(&repo, &[tag]).unwrap();
+        let objs = to_send(&repo, &[tag], &[]);
         assert!(objs.contains(&tag));
         assert!(objs.contains(&commit));
         assert_eq!(objs.len(), 4);
@@ -1087,7 +1278,7 @@ mod tests {
             .stack_size(256 * 1024)
             .spawn(move || {
                 let repo = git2::Repository::open_bare(path).unwrap();
-                reachable_objects(&repo, &[commit]).unwrap().len()
+                to_send(&repo, &[commit], &[]).len()
             })
             .unwrap()
             .join()
@@ -1113,5 +1304,96 @@ mod tests {
         assert_eq!(command(1_000, 48).unwrap(), Some(1_001));
         assert!(command(MAX_COMMAND_LINES, 8).is_err());
         assert!(command(MAX_COMMAND_BYTES / 60_000 + 1, 60_000).is_err());
+    }
+
+    // Review of heartwood #11, round 1: a walk stops at its budget, before
+    // it holds more objects than that.
+    #[test]
+    fn a_walk_stops_at_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path()).unwrap();
+        let commit = commit_with(&repo, 300, 8);
+        let mut walk = Walk::new(&repo, 100, MAX_METADATA_OBJECT).unwrap();
+        let err = objects_to_send(&mut walk, &[commit], &[]).unwrap_err();
+        assert!(err.to_string().contains("objects walked"), "{err}");
+        assert_eq!(walk.left, 0);
+        // With room, the same walk completes: the commit, its tree, and the
+        // 300 blobs.
+        let mut walk = Walk::new(&repo, 1_000, MAX_METADATA_OBJECT).unwrap();
+        assert_eq!(
+            objects_to_send(&mut walk, &[commit], &[]).unwrap().len(),
+            302
+        );
+    }
+
+    // Review of heartwood #11, round 1: a blob is never read to learn its
+    // kind, whether a client names it as a have or wants it unadvertised;
+    // and no body past the walk's allowance is read.
+    #[test]
+    fn a_walk_reads_no_blob_and_no_body_past_its_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path()).unwrap();
+        let big = repo.blob(&vec![9u8; 4 << 20]).unwrap();
+        let small = repo.blob(b"small").unwrap();
+        let mut tb = repo.treebuilder(None).unwrap();
+        tb.insert("big", big, 0o100644).unwrap();
+        tb.insert("small", small, 0o100644).unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let commit = repo
+            .commit(Some("refs/heads/main"), &sig(), &sig(), "m", &tree, &[])
+            .unwrap();
+
+        // Wanting the commit, with the big blob as a have.
+        READ.with(|read| read.set(0));
+        let mut walk = Walk::new(&repo, MAX_WALK, 1024).unwrap();
+        let sent = objects_to_send(&mut walk, &[commit], &[big]).unwrap();
+        assert!(!sent.contains(&big));
+        assert!(sent.contains(&small));
+        let read = READ.with(Cell::get);
+        assert!(read < 1024, "{read} bytes of bodies read");
+
+        // Wanting the big blob, unadvertised: refused, unread.
+        READ.with(|read| read.set(0));
+        let mut walk = Walk::new(&repo, MAX_WALK, 1024).unwrap();
+        assert_eq!(unadvertised(&mut walk, &[big]).unwrap(), Some(big));
+        assert!(READ.with(Cell::get) < 1024);
+
+        // A tree past the allowance isn't read.
+        let mut walk = Walk::new(&repo, MAX_WALK, 16).unwrap();
+        let err = objects_to_send(&mut walk, &[commit], &[]).unwrap_err();
+        assert!(err.to_string().contains("too large to read"), "{err}");
+    }
+
+    // Review of heartwood #11, round 1: `ls-refs` writes its advertisement as
+    // it makes it, in bounded writes, whatever the number of refs.
+    #[test]
+    fn ls_refs_writes_its_advertisement_in_bounded_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path()).unwrap();
+        let commit = commit_with(&repo, 1, 8);
+        for i in 0..5_000 {
+            repo.reference(&format!("refs/heads/branch-{i:05}"), commit, true, "test")
+                .unwrap();
+        }
+        let cmd = Command {
+            name: "ls-refs".to_owned(),
+            lines: vec![b"command=ls-refs".to_vec(), b"peel".to_vec()],
+        };
+        let mut sink = Sink::default();
+        handle_ls_refs(&repo, &cmd, &mut sink).unwrap();
+        assert!(sink.writes.len() > 1, "{} writes", sink.writes.len());
+        let largest = sink.writes.iter().map(Vec::len).max().unwrap();
+        assert!(
+            largest <= WRITE_FLUSH_THRESHOLD + 1024,
+            "a write of {largest} bytes"
+        );
+        let wire = sink.writes.concat();
+        assert!(wire.ends_with(b"0000"));
+        assert_eq!(
+            String::from_utf8_lossy(&wire)
+                .matches("refs/heads/branch-")
+                .count(),
+            5_000
+        );
     }
 }
