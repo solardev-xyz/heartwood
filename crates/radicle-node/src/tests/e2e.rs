@@ -3251,7 +3251,9 @@ fn test_gate_closing_waits_for_a_fetch_under_way() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = Node::init(tmp.path(), config::relay("alice"), 13);
     let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
-    let acme = bob.project("acme", "");
+    // A repository of its own: the seam is keyed by repository, across the
+    // tests running at once, and other tests' `acme` has the same ID.
+    let acme = bob.project("acme-fetch-seam", "");
     let gate = RepoGate::new();
     let mut alice = alice.spawn_with_repositories(gate.clone());
     let bob = bob.spawn();
@@ -3379,7 +3381,9 @@ fn test_gate_closing_waits_for_an_upload_under_way() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = Node::init(tmp.path(), config::relay("alice"), 13);
     let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
-    let acme = bob.project("acme", "");
+    // A repository of its own: the seam is keyed by repository, across the
+    // tests running at once, and other tests' `acme` has the same ID.
+    let acme = bob.project("acme-serve-seam", "");
     let gate = RepoGate::new();
     let mut alice = alice.spawn();
     let bob = bob.spawn_with_repositories(gate.clone());
