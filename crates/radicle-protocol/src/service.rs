@@ -30,7 +30,7 @@ use radicle::node::address::Store as _;
 use radicle::node::address::{AddressBook, AddressType, KnownAddress};
 use radicle::node::config::{PeerConfig, RateLimit};
 use radicle::node::dial;
-use radicle::node::gate::{Purpose, RepoGate, RepoState};
+use radicle::node::gate::{Passes, Purpose, RepoGate, RepoState};
 use radicle::node::refs::Store as _;
 use radicle::node::routing::Store as _;
 use radicle::node::seed;
@@ -1564,7 +1564,13 @@ where
         info!(target: "service", "Connected to {remote} ({addr}) ({link:?})");
         self.emitter.emit(Event::PeerConnected { nid: remote });
 
-        let msgs = self.initial(link);
+        // The gate's passes for the repositories the inventory holds, kept
+        // until the messages are queued.
+        let (msgs, _inventoried) = self.initial(link);
+        #[cfg(any(test, feature = "test"))]
+        for rid in _inventoried.rids() {
+            seams::at(seams::Point::Inventory, *rid);
+        }
 
         if link.is_outbound() {
             if let Some(peer) = self.sessions.get_mut(&remote) {
@@ -2180,6 +2186,32 @@ where
                             {
                                 continue;
                             }
+                            // Our own announcements are replayed only as the
+                            // repository gate lets them through now, under its
+                            // passes until they are queued: refs while their
+                            // repository announces, and an inventory while it
+                            // holds no repository the gate leaves out. The
+                            // inventory that replaces it reaches the peer once
+                            // the reactor hears of the change.
+                            let _passes = if ann.node == local {
+                                let (rids, purpose) = match &ann.message {
+                                    AnnouncementMessage::Refs(refs) => {
+                                        (vec![refs.rid], Purpose::Announce)
+                                    }
+                                    AnnouncementMessage::Inventory(inventory) => {
+                                        (inventory.inventory.to_vec(), Purpose::Inventory)
+                                    }
+                                    AnnouncementMessage::Node(_) => (vec![], Purpose::Inventory),
+                                };
+                                let passes =
+                                    self.repositories.admit_all(rids.iter().copied(), purpose);
+                                if passes.len() != rids.len() {
+                                    continue;
+                                }
+                                Some(passes)
+                            } else {
+                                None
+                            };
                             // Only send messages if we're a relay, or it's our own messages.
                             if relay || ann.node == local {
                                 self.outbox.write(peer, ann.into());
@@ -2267,8 +2299,10 @@ where
         }
     }
 
-    /// Set of initial messages to send to a peer.
-    fn initial(&mut self, _link: Link) -> Vec<Message> {
+    /// Set of initial messages to send to a peer, and the repository gate's
+    /// passes for the repositories its inventory holds: keep them until the
+    /// messages are queued.
+    fn initial(&mut self, _link: Link) -> (Vec<Message>, Passes) {
         let now = self.clock();
         let filter = self.filter();
 
@@ -2288,11 +2322,38 @@ where
         };
         debug!(target: "service", "Subscribing to messages since timestamp {since}..");
 
-        vec![
-            Message::node(self.node.clone(), &self.secret_key),
-            Message::inventory(self.inventory.clone(), &self.secret_key),
-            Message::subscribe(filter, since, Timestamp::MAX),
-        ]
+        let (inventory, passes, remade) = self.admitted_inventory();
+        if remade {
+            // The peers already connected learn it too.
+            self.announce_inventory();
+        }
+        (
+            vec![
+                Message::node(self.node.clone(), &self.secret_key),
+                Message::inventory(inventory, &self.secret_key),
+                Message::subscribe(filter, since, Timestamp::MAX),
+            ],
+            passes,
+        )
+    }
+
+    /// Our inventory as the repository gate lets it through now, with the
+    /// passes that keep it so until it is queued: a close of one of its
+    /// repositories to a state that leaves it out waits for them.
+    ///
+    /// If the gate has left one out since the inventory was made, before the
+    /// reactor heard of it, the inventory is made again without it, and
+    /// `true` says so: the caller announces it.
+    fn admitted_inventory(&mut self) -> (InventoryAnnouncement, Passes, bool) {
+        let passes = self
+            .repositories
+            .admit_all(self.inventory.inventory.iter().copied(), Purpose::Inventory);
+        if passes.len() == self.inventory.inventory.len() {
+            return (self.inventory.clone(), passes, false);
+        }
+        let now = self.timestamp();
+        self.inventory = gossip::inventory(now, passes.rids().iter().copied());
+        (self.inventory.clone(), passes, true)
     }
 
     /// Try to guess whether we're online or not.
@@ -2511,6 +2572,8 @@ where
             }
             return Err(Error::Gated { rid, state });
         };
+        #[cfg(any(test, feature = "test"))]
+        seams::at(seams::Point::Announce, rid);
         let (ann, refs) = self.refs_announcement_for(rid, remotes)?;
         let timestamp = ann.timestamp();
         let peers = self.sessions.connected().map(|(_, p)| p);
@@ -2725,13 +2788,20 @@ where
 
     /// Announce our inventory to all connected peers, unless it was already announced.
     fn announce_inventory(&mut self) {
-        let timestamp = self.inventory.timestamp.to_local_time();
+        // The gate's passes for the repositories it holds, kept until it is
+        // queued.
+        let (inventory, passes, _) = self.admitted_inventory();
+        #[cfg(any(test, feature = "test"))]
+        for rid in passes.rids() {
+            seams::at(seams::Point::Inventory, *rid);
+        }
+        let timestamp = inventory.timestamp.to_local_time();
 
         if self.last_inventory == timestamp {
-            debug!(target: "service", "Skipping redundant inventory announcement (t={})", self.inventory.timestamp);
+            debug!(target: "service", "Skipping redundant inventory announcement (t={})", inventory.timestamp);
             return;
         }
-        let msg = AnnouncementMessage::from(self.inventory.clone());
+        let msg = AnnouncementMessage::from(inventory);
 
         self.outbox.announce(
             msg.signed(&self.secret_key),
@@ -2739,6 +2809,7 @@ where
             self.db.gossip_mut(),
         );
         self.last_inventory = timestamp;
+        drop(passes);
     }
 
     fn prune_routing_entries(&mut self, now: &LocalTime) -> Result<(), routing::Error> {
@@ -3260,5 +3331,67 @@ impl Deref for Sessions {
 impl DerefMut for Sessions {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// Test seams: work held at a point, with its repository gate passes, until
+/// released, so that a test can close the repository meanwhile.
+#[cfg(any(test, feature = "test"))]
+#[allow(clippy::unwrap_used)]
+pub mod seams {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    use radicle::identity::RepoId;
+
+    /// Where work is held.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Point {
+        /// A refs announcement, with its pass, before it is made.
+        Announce,
+        /// An inventory that holds the repository, with its passes, before it
+        /// is queued: a peer's initial messages, or an announcement.
+        Inventory,
+    }
+
+    #[derive(Default)]
+    struct Seams {
+        /// Work that waits, holding its pass.
+        held: HashMap<(Point, RepoId), bool>,
+        /// Work waiting now.
+        waiting: HashMap<(Point, RepoId), bool>,
+    }
+
+    static SEAMS: LazyLock<(Mutex<Seams>, Condvar)> = LazyLock::new(Default::default);
+
+    /// Work at `point` on `rid` waits with its pass, until [`release`].
+    pub fn hold(point: Point, rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert((point, rid), true);
+    }
+
+    pub fn release(point: Point, rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert((point, rid), false);
+        SEAMS.1.notify_all();
+    }
+
+    /// Whether work at `point` on `rid` waits now, with its pass.
+    pub fn waiting(point: Point, rid: RepoId) -> bool {
+        SEAMS
+            .0
+            .lock()
+            .unwrap()
+            .waiting
+            .get(&(point, rid))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn at(point: Point, rid: RepoId) {
+        let mut seams = SEAMS.0.lock().unwrap();
+        while seams.held.get(&(point, rid)).copied().unwrap_or(false) {
+            seams.waiting.insert((point, rid), true);
+            seams = SEAMS.1.wait(seams).unwrap();
+        }
+        seams.waiting.insert((point, rid), false);
     }
 }

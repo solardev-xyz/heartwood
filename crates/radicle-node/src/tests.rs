@@ -2742,3 +2742,252 @@ fn gate_a_fetch_found_closed_runs_again_once_reopened() {
     assert_matches!(result.try_recv(), Ok(Ok(node::FetchResult::Success { .. })));
     assert!(result.try_recv().is_err(), "answered twice");
 }
+
+/// The repositories of each inventory in `messages`, in order.
+fn inventories(messages: impl Iterator<Item = Message>) -> Vec<BTreeSet<RepoId>> {
+    messages
+        .filter_map(|m| match m {
+            Message::Announcement(Announcement {
+                message: AnnouncementMessage::Inventory(InventoryAnnouncement { inventory, .. }),
+                ..
+            }) => Some(inventory.iter().copied().collect()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many refs announcements of `rid` by `node` are in `messages`.
+fn refs_of(
+    messages: impl Iterator<Item = Message>,
+    rid: RepoId,
+    node: radicle::node::NodeId,
+) -> usize {
+    messages
+        .filter(|m| {
+            matches!(
+                m,
+                Message::Announcement(Announcement {
+                    node: n,
+                    message: AnnouncementMessage::Refs(RefsAnnouncement { rid: r, .. }),
+                    ..
+                }) if *r == rid && *n == node
+            )
+        })
+        .count()
+}
+
+#[test]
+// Review of heartwood #7, round 2: our own stored announcements are replayed
+// to a subscriber only as the gate lets them through when it subscribes. A
+// repository quarantined for its cache is replayed as before; one quarantined
+// for a namespace isn't.
+fn gate_a_namespace_quarantine_s_stored_refs_arent_replayed() {
+    use node::gate::{Quarantine, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let nid = *amy.nid();
+    let rid = *amy.inventory().iter().next().unwrap();
+    let (bob, cid, eve) = (Peer::bob(), Peer::cid(), Peer::eve());
+    let gate = amy.repositories().clone();
+    // Amy's refs of it are stored, while it is open.
+    let (cmd, result) = Command::announce_refs(rid, [nid].into());
+    amy.command(cmd);
+    result.try_recv().unwrap().unwrap();
+    let replayed = |amy: &mut Peer<Storage>, peer: &Peer<MockStorage>| {
+        amy.connect_to(peer);
+        amy.receive(*peer.nid(), Message::Subscribe(Subscribe::all()));
+        refs_of(amy.messages(*peer.nid()), rid, nid)
+    };
+    assert_eq!(replayed(&mut amy, &bob), 1, "open: replayed");
+
+    let cache = RepoState::Quarantined(Quarantine::Cache);
+    gate.close(rid, cache, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, cache));
+    assert_eq!(
+        replayed(&mut amy, &cid),
+        1,
+        "quarantined for its cache: replayed"
+    );
+
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, namespace, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, namespace));
+    assert_eq!(
+        replayed(&mut amy, &eve),
+        0,
+        "quarantined for a namespace: replayed"
+    );
+}
+
+#[test]
+// Review of heartwood #7, round 2: an inventory sent after a close to a
+// namespace quarantine has returned leaves the repository out, even before
+// the reactor hears of the close: a stored inventory replayed to a
+// subscriber, a new peer's initial inventory, and the announcement to the
+// peers already connected. One being repaired stays in.
+fn gate_an_inventory_sent_before_the_reactor_hears_of_a_close_leaves_it_out() {
+    use node::gate::{Quarantine, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let rid = *amy.inventory().iter().next().unwrap();
+    let (bob, cid, eve) = (Peer::bob(), Peer::cid(), Peer::eve());
+    let gate = amy.repositories().clone();
+    // Being repaired, it stays in, as it is still served.
+    gate.close(rid, RepoState::Repairing, time::Duration::ZERO)
+        .unwrap();
+    amy.connected(*cid.nid(), cid.address(), Link::Inbound);
+    assert!(inventories(amy.messages(*cid.nid()))[0].contains(&rid));
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+
+    amy.connect_to(&bob);
+    // Amy's inventory, with it, is stored.
+    amy.command(Command::AnnounceInventory);
+    assert!(inventories(amy.messages(*bob.nid()))[0].contains(&rid));
+
+    // Closed, and the reactor hasn't heard yet.
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, namespace, time::Duration::ZERO).unwrap();
+    amy.receive(*bob.nid(), Message::Subscribe(Subscribe::all()));
+    let replayed = inventories(amy.messages(*bob.nid()));
+    assert!(
+        replayed.iter().all(|inventory| !inventory.contains(&rid)),
+        "a stored inventory with it was replayed: {replayed:?}"
+    );
+    amy.connected(*eve.nid(), eve.address(), Link::Inbound);
+    let initial = inventories(amy.messages(*eve.nid()));
+    assert_eq!(initial.len(), 1);
+    assert!(!initial[0].contains(&rid), "the initial inventory holds it");
+    let announced = inventories(amy.messages(*bob.nid()));
+    assert_eq!(announced.len(), 1);
+    assert!(
+        !announced[0].contains(&rid),
+        "the announced inventory holds it"
+    );
+
+    // Once the reactor hears, there is nothing more to announce, and the
+    // inventory comes back once it opens.
+    amy.command(Command::Gate(rid, namespace));
+    assert!(inventories(amy.messages(*bob.nid())).is_empty());
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    assert!(inventories(amy.messages(*bob.nid()))[0].contains(&rid));
+}
+
+/// Lets work held at `point` go however a test ends.
+struct Release(protocol::service::seams::Point, RepoId);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        protocol::service::seams::release(self.0, self.1);
+    }
+}
+
+/// Holds the work at `point` on `rid` that `trigger` starts: while it waits,
+/// with its pass, closes `rid` for a namespace with a short timeout, and
+/// tries for a pass of `purpose`; then lets it go, and closes again. What
+/// each gave.
+fn close_while_held(
+    amy: &mut Peer<Storage>,
+    point: protocol::service::seams::Point,
+    rid: RepoId,
+    purpose: node::gate::Purpose,
+    trigger: impl FnOnce(&mut Peer<Storage>),
+) -> (
+    Result<(), node::gate::Busy>,
+    bool,
+    Result<(), node::gate::Busy>,
+) {
+    use node::gate::{Quarantine, RepoState};
+    use protocol::service::seams;
+
+    let gate = amy.repositories().clone();
+    seams::hold(point, rid);
+    let _release = Release(point, rid);
+    let closing = std::thread::spawn(move || {
+        let _release = Release(point, rid);
+        let until = time::Instant::now() + time::Duration::from_secs(10);
+        while !seams::waiting(point, rid) {
+            assert!(
+                time::Instant::now() < until,
+                "the work never reached {point:?}"
+            );
+            std::thread::sleep(time::Duration::from_millis(5));
+        }
+        let namespace = RepoState::Quarantined(Quarantine::Namespace);
+        let busy = gate.close(rid, namespace, time::Duration::from_millis(200));
+        let admitted = gate.admit(rid, purpose).is_some();
+        seams::release(point, rid);
+        (
+            busy,
+            admitted,
+            gate.close(rid, namespace, time::Duration::from_secs(10)),
+        )
+    });
+    trigger(amy);
+    closing.join().unwrap()
+}
+
+#[test]
+// Review of heartwood #7, round 2: a refs announcement holds its pass until
+// it is queued. A close to a namespace quarantine while it is under way is
+// busy, and returns once it is done.
+fn gate_closing_waits_for_a_refs_announcement_under_way() {
+    use node::gate::{Busy, Purpose};
+    use protocol::service::seams::Point;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let nid = *amy.nid();
+    let rid = *amy.inventory().iter().next().unwrap();
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    amy.receive(*bob.nid(), Message::Subscribe(Subscribe::all()));
+    amy.messages(*bob.nid()).for_each(drop);
+
+    let (cmd, result) = Command::announce_refs(rid, [nid].into());
+    let (busy, admitted, closed) =
+        close_while_held(&mut amy, Point::Announce, rid, Purpose::Announce, |amy| {
+            amy.command(cmd)
+        });
+    assert_eq!(busy, Err(Busy { rid, passes: 1 }));
+    assert!(!admitted, "a new announcement was admitted");
+    assert_eq!(closed, Ok(()));
+    // Admitted before the close, it was made.
+    assert!(result.try_recv().unwrap().is_ok());
+    assert_eq!(refs_of(amy.messages(*bob.nid()), rid, nid), 1);
+}
+
+#[test]
+// Review of heartwood #7, round 2: an inventory holds its passes until it is
+// queued, both a new peer's initial inventory and an announcement. A close to
+// a namespace quarantine while one is under way is busy, and returns once it
+// is done.
+fn gate_closing_waits_for_an_inventory_under_way() {
+    use node::gate::{Busy, Purpose};
+    use protocol::service::seams::Point;
+
+    let eve = Peer::eve();
+    for announce in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut amy = gated_peer(tmp.path());
+        let rid = *amy.inventory().iter().next().unwrap();
+        let bob = Peer::bob();
+        amy.connect_to(&bob);
+        amy.messages(*bob.nid()).for_each(drop);
+
+        let (busy, admitted, closed) =
+            close_while_held(&mut amy, Point::Inventory, rid, Purpose::Inventory, |amy| {
+                if announce {
+                    amy.command(Command::AnnounceInventory);
+                } else {
+                    amy.connected(*eve.nid(), eve.address(), Link::Inbound);
+                }
+            });
+        assert_eq!(busy, Err(Busy { rid, passes: 1 }), "announce: {announce}");
+        assert!(!admitted, "announce: {announce}");
+        assert_eq!(closed, Ok(()), "announce: {announce}");
+    }
+}

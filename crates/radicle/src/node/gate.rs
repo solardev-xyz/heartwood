@@ -32,7 +32,7 @@ pub enum RepoState {
     #[default]
     Open,
     /// The host is repairing it. Its fetches and refs announcements wait
-    /// until it opens again; it is served.
+    /// until it opens again; it is served, and stays in the inventory.
     Repairing,
     /// The host couldn't repair it. Its fetches are refused. Quarantined for
     /// its cache, it is still announced and served; for a namespace, it is
@@ -49,8 +49,12 @@ pub enum Purpose {
     Mutate,
     /// Serving it to a peer, while its state serves.
     Serve,
-    /// Announcing its refs, while its state announces.
+    /// Announcing its refs, while its state announces: a new announcement,
+    /// or a stored one of our own replayed to a peer.
     Announce,
+    /// Sending an inventory of ours that holds it, while its state keeps it
+    /// in the inventory.
+    Inventory,
 }
 
 impl RepoState {
@@ -60,6 +64,7 @@ impl RepoState {
             Purpose::Mutate => self.fetches(),
             Purpose::Serve => self.serves(),
             Purpose::Announce => self.announces(),
+            Purpose::Inventory => self.inventoried(),
         }
     }
 
@@ -192,6 +197,30 @@ impl RepoGate {
         })
     }
 
+    /// Passes for `purpose` on each of `rids` whose state lets it through,
+    /// taken at once: as [`RepoGate::admit`] for each, under one lock.
+    pub fn admit_all(&self, rids: impl IntoIterator<Item = RepoId>, purpose: Purpose) -> Passes {
+        let mut repositories = self.inner.lock();
+        let mut admitted = Vec::new();
+        for rid in rids {
+            if repositories
+                .states
+                .get(&rid)
+                .copied()
+                .unwrap_or_default()
+                .permits(purpose)
+            {
+                *repositories.passes.entry((rid, purpose)).or_default() += 1;
+                admitted.push(rid);
+            }
+        }
+        Passes {
+            inner: self.inner.clone(),
+            rids: admitted,
+            purpose,
+        }
+    }
+
     /// Closes `rid` with `state`, being repaired or quarantined: from now on,
     /// it lets through only the passes `state` permits. Then waits, up to
     /// `timeout`, for the passes already held that `state` doesn't permit to
@@ -280,15 +309,63 @@ impl fmt::Debug for Pass {
 impl Drop for Pass {
     fn drop(&mut self) {
         let mut repositories = self.inner.lock();
-        let key = (self.rid, self.purpose);
-        if let Some(passes) = repositories.passes.get_mut(&key) {
-            *passes = passes.saturating_sub(1);
-            if *passes == 0 {
-                repositories.passes.remove(&key);
-            }
+        release(&mut repositories, self.rid, self.purpose);
+        drop(repositories);
+        self.inner.released.notify_all();
+    }
+}
+
+/// Passes for one purpose on several repositories, taken at once by
+/// [`RepoGate::admit_all`], and dropped at once.
+pub struct Passes {
+    inner: Arc<Inner>,
+    rids: Vec<RepoId>,
+    purpose: Purpose,
+}
+
+impl Passes {
+    /// The repositories admitted, in the order they were asked for.
+    pub fn rids(&self) -> &[RepoId] {
+        &self.rids
+    }
+
+    /// How many were admitted.
+    pub fn len(&self) -> usize {
+        self.rids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rids.is_empty()
+    }
+}
+
+impl fmt::Debug for Passes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Passes")
+            .field("rids", &self.rids)
+            .field("purpose", &self.purpose)
+            .finish()
+    }
+}
+
+impl Drop for Passes {
+    fn drop(&mut self) {
+        let mut repositories = self.inner.lock();
+        for rid in &self.rids {
+            release(&mut repositories, *rid, self.purpose);
         }
         drop(repositories);
         self.inner.released.notify_all();
+    }
+}
+
+fn release(repositories: &mut Repositories, rid: RepoId, purpose: Purpose) {
+    let key = (rid, purpose);
+    if let Some(passes) = repositories.passes.get_mut(&key) {
+        *passes = passes.saturating_sub(1);
+        if *passes == 0 {
+            repositories.passes.remove(&key);
+        }
     }
 }
 
@@ -346,6 +423,14 @@ mod test {
             assert_eq!(state.announces(), announces, "{state}");
             assert_eq!(state.inventoried(), inventoried, "{state}");
             assert_eq!(state.serves(), serves, "{state}");
+            for (purpose, permitted) in [
+                (Purpose::Mutate, fetches),
+                (Purpose::Announce, announces),
+                (Purpose::Inventory, inventoried),
+                (Purpose::Serve, serves),
+            ] {
+                assert_eq!(state.permits(purpose), permitted, "{state}: {purpose:?}");
+            }
         }
     }
 
@@ -410,6 +495,9 @@ mod test {
         let rid = arbitrary::r#gen::<RepoId>(1);
         let serve = gate.admit(rid, Purpose::Serve).unwrap();
         let announce = gate.admit(rid, Purpose::Announce).unwrap();
+        let other = arbitrary::r#gen::<RepoId>(1);
+        let inventory = gate.admit_all([rid, other], Purpose::Inventory);
+        assert_eq!(inventory.rids(), [rid, other]);
         let zero = Duration::ZERO;
 
         // Quarantined for its cache, it is still served and announced.
@@ -418,23 +506,32 @@ mod test {
         assert!(gate.admit(rid, Purpose::Serve).is_some());
         assert!(gate.admit(rid, Purpose::Announce).is_some());
         assert!(gate.admit(rid, Purpose::Mutate).is_none());
-        // Being repaired, it is served, but not announced.
+        // Being repaired, it is served and stays in the inventory, but isn't
+        // announced.
         assert_eq!(
             gate.close(rid, RepoState::Repairing, zero),
             Err(Busy { rid, passes: 1 })
         );
         assert!(gate.admit(rid, Purpose::Serve).is_some());
         assert!(gate.admit(rid, Purpose::Announce).is_none());
+        assert_eq!(gate.admit_all([rid], Purpose::Inventory).rids(), [rid]);
         drop(announce);
         assert_eq!(gate.close(rid, RepoState::Repairing, zero), Ok(()));
-        // Quarantined for a namespace, it is neither.
+        // Quarantined for a namespace, it is none of these: its close waits for
+        // the inventory that holds it too.
         let namespace = RepoState::Quarantined(Quarantine::Namespace);
+        assert_eq!(
+            gate.close(rid, namespace, zero),
+            Err(Busy { rid, passes: 2 })
+        );
+        assert!(gate.admit(rid, Purpose::Serve).is_none());
+        assert!(gate.admit_all([rid, other], Purpose::Inventory).rids() == [other]);
+        drop(serve);
         assert_eq!(
             gate.close(rid, namespace, zero),
             Err(Busy { rid, passes: 1 })
         );
-        assert!(gate.admit(rid, Purpose::Serve).is_none());
-        drop(serve);
+        drop(inventory);
         assert_eq!(gate.close(rid, namespace, zero), Ok(()));
     }
 }
