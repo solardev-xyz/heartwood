@@ -14,6 +14,7 @@ use crossbeam_channel as chan;
 use protocol::wire::StreamId;
 use protocol::worker::{AuthorizationError, FetchError, FetchRequest, FetchResult, UploadError};
 use radicle::identity::RepoId;
+use radicle::node::gate::{Purpose, RepoGate};
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
 use radicle::node::policy::config::SeedingPolicy;
@@ -36,6 +37,8 @@ pub struct Config {
     pub policy: SeedingPolicy,
     /// Path to the policies database.
     pub policies_db: PathBuf,
+    /// The repository gate: which repositories may be fetched and served.
+    pub repositories: RepoGate,
 }
 
 /// Task to be accomplished on a worker thread.
@@ -73,6 +76,7 @@ struct Worker {
     notifications: notifications::StoreWriter,
     cache: cob::cache::StoreWriter,
     db: radicle::node::Database,
+    repositories: RepoGate,
 }
 
 impl Worker {
@@ -195,12 +199,23 @@ impl Worker {
 
                 log::debug!(target: "worker", "Spawning upload-pack process for {} on stream {stream}..", header.repo);
 
+                // The repository gate's pass, held until the upload is done: a
+                // close to a state that doesn't serve waits for it.
+                let Some(_pass) = self.repositories.admit(header.repo, Purpose::Serve) else {
+                    let state = self.repositories.state(&header.repo);
+                    return FetchResult::Responder {
+                        rid: Some(header.repo),
+                        result: Err(AuthorizationError::Gated(header.repo, state).into()),
+                    };
+                };
                 if let Err(e) = self.is_authorized(remote, header.repo) {
                     return FetchResult::Responder {
                         rid: Some(header.repo),
                         result: Err(e.into()),
                     };
                 }
+                #[cfg(test)]
+                seams::at(seams::Point::Serve, header.repo);
 
                 // Serve the fetch in-process when built for no-spawn hosts,
                 // otherwise spawn `git upload-pack` as before.
@@ -266,6 +281,16 @@ impl Worker {
         channels: channels::ChannelsFlush,
         notifs: notifications::StoreWriter,
     ) -> Result<protocol::worker::fetch::FetchResult, FetchError> {
+        // The repository gate's pass, held until the fetch and its cache
+        // update are done: closing the repository waits for it.
+        let Some(_pass) = self.repositories.enter(rid) else {
+            return Err(FetchError::Closed {
+                rid,
+                state: self.repositories.state(&rid),
+            });
+        };
+        #[cfg(test)]
+        seams::at(seams::Point::Fetch, rid);
         let FetchConfig { local, expiry } = &self.fetch_config;
         // N.b. if the `rid` is blocked this will return an error, so
         // we won't continue with any further set up of the fetch.
@@ -332,6 +357,7 @@ impl Pool {
                 notifications: notifications.clone(),
                 cache: cache.clone(),
                 db: db.clone(),
+                repositories: config.repositories.clone(),
             };
             let thread = thread::spawn(&nid, format!("worker#{i}"), || worker.run());
 
@@ -352,5 +378,66 @@ impl Pool {
         log::debug!(target: "pool", "Worker pool shutting down..");
 
         Ok(())
+    }
+}
+
+/// Test-only seams: work held, with its gate pass, until a test releases it,
+/// per point and repository.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    use radicle::identity::RepoId;
+
+    /// Where work is held.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Point {
+        /// A fetch, with its pass, before it begins.
+        Fetch,
+        /// An upload, with its pass, once it is authorized and before it
+        /// opens the repository.
+        Serve,
+    }
+
+    #[derive(Default)]
+    struct Seams {
+        /// Work that waits, holding its pass.
+        held: HashMap<(Point, RepoId), bool>,
+        /// Work waiting now.
+        waiting: HashMap<(Point, RepoId), bool>,
+    }
+
+    static SEAMS: LazyLock<(Mutex<Seams>, Condvar)> = LazyLock::new(Default::default);
+
+    /// Work at `point` on `rid` waits with its pass, until [`release`].
+    pub fn hold(point: Point, rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert((point, rid), true);
+    }
+
+    pub fn release(point: Point, rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert((point, rid), false);
+        SEAMS.1.notify_all();
+    }
+
+    /// Whether work at `point` on `rid` waits now, with its pass.
+    pub fn waiting(point: Point, rid: RepoId) -> bool {
+        SEAMS
+            .0
+            .lock()
+            .unwrap()
+            .waiting
+            .get(&(point, rid))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn at(point: Point, rid: RepoId) {
+        let mut seams = SEAMS.0.lock().unwrap();
+        while seams.held.get(&(point, rid)).copied().unwrap_or(false) {
+            seams.waiting.insert((point, rid), true);
+            seams = SEAMS.1.wait(seams).unwrap();
+        }
+        seams.waiting.insert((point, rid), false);
     }
 }

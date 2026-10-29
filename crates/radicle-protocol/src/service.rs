@@ -30,6 +30,7 @@ use radicle::node::address::Store as _;
 use radicle::node::address::{AddressBook, AddressType, KnownAddress};
 use radicle::node::config::{PeerConfig, RateLimit};
 use radicle::node::dial;
+use radicle::node::gate::{Passes, Purpose, RepoGate, RepoState};
 use radicle::node::refs::Store as _;
 use radicle::node::routing::Store as _;
 use radicle::node::seed;
@@ -114,6 +115,17 @@ pub const CONNECTION_RETRY_DELTA: LocalDuration = LocalDuration::from_mins(10);
 pub const FETCH_TIMEOUT: time::Duration = time::Duration::from_secs(30);
 /// Target number of peers to maintain connections to.
 pub const TARGET_OUTBOUND_PEERS: usize = 8;
+/// Fetches of one repository that may wait for its repair to end.
+pub const MAX_DEFERRED_FETCHES: usize = 64;
+
+/// A fetch of a repository being repaired, run once it opens again.
+#[derive(Debug)]
+struct DeferredFetch {
+    from: NodeId,
+    refs_at: Vec<RefsAt>,
+    config: fetcher::FetchConfig,
+    channel: Option<command::Responder<FetchResult>>,
+}
 
 /// Maximum external address limit imposed by message size limits.
 pub use message::ADDRESS_LIMIT;
@@ -209,6 +221,9 @@ pub enum Error {
     Repository(#[from] radicle::storage::RepositoryError),
     #[error("namespaces error: {0}")]
     Namespaces(Box<NamespacesError>),
+    /// The repository gate holds the repository back.
+    #[error("repository {rid} is {state}")]
+    Gated { rid: RepoId, state: RepoState },
 }
 
 impl From<NamespacesError> for Error {
@@ -381,6 +396,14 @@ pub struct Service<D, S> {
     /// Which addresses the node may connect to, asked of announced
     /// addresses before they enter the address book.
     gate: Arc<dyn dial::Gate>,
+    /// The repository gate: which repositories the node may fetch, announce
+    /// and serve.
+    repositories: RepoGate,
+    /// Fetches of repositories being repaired, run once they open again.
+    deferred_fetches: HashMap<RepoId, Vec<DeferredFetch>>,
+    /// Refs announcements of repositories being repaired, made once they
+    /// open again: the namespaces, and whether any were our own.
+    deferred_announcements: HashMap<RepoId, (BTreeSet<NodeId>, bool)>,
     /// Whether the service has stopped: once it has, it does nothing more.
     stopped: bool,
     /// The error it stopped with, until the node takes it.
@@ -408,6 +431,19 @@ where
     S: WriteStorage + 'static,
 {
     /// Initialize service with current time. Call this once.
+    /// The service, consulting `repositories`, the repository gate, before it
+    /// fetches, announces or serves a repository. Without it, every
+    /// repository is open.
+    pub fn with_repositories(mut self, repositories: RepoGate) -> Self {
+        self.repositories = repositories;
+        self
+    }
+
+    /// The repository gate the service consults.
+    pub fn repositories(&self) -> &RepoGate {
+        &self.repositories
+    }
+
     pub fn initialize(&mut self, time: LocalTime) -> Result<(), Error> {
         debug!(target: "service", "Init @{}", time.as_millis());
         assert_ne!(time, LocalTime::default());
@@ -449,8 +485,17 @@ where
         let mut private = BTreeSet::new();
 
         for repo in self.storage.repositories()? {
-            let repo = self.upgrade_sigrefs(repo)?;
             let rid = repo.rid;
+            // A repository the gate closes to mutation isn't migrated: it is,
+            // at the next start that finds it open. The migration holds the
+            // gate's pass.
+            let repo = match self.repositories.enter(rid) {
+                Some(_pass) => self.upgrade_sigrefs(repo)?,
+                None => {
+                    debug!(target: "service", "Not migrating {rid}: it is {}", self.repositories.state(&rid));
+                    repo
+                }
+            };
 
             // If we're not seeding this repo, just skip it.
             if !self.policies.is_seeding(&rid)? {
@@ -485,6 +530,15 @@ where
             // If we got here, it likely means a repo was updated while the node was stopped.
             // Therefore, we pre-load a refs announcement for this repo, so that it is included in
             // the historical gossip messages when a node connects and subscribes to this repo.
+            // One the gate holds back isn't: being repaired, it is announced once it opens.
+            let Some(_pass) = self.repositories.admit(rid, Purpose::Announce) else {
+                if self.repositories.state(&rid) == RepoState::Repairing {
+                    let (namespaces, own) = self.deferred_announcements.entry(rid).or_default();
+                    namespaces.insert(nid);
+                    *own = true;
+                }
+                continue;
+            };
             if let Ok((ann, _)) = self.refs_announcement_for(rid, [nid]) {
                 debug!(target: "service", "Adding refs announcement for {rid} to historical gossip messages..");
                 self.db.gossip_mut().announced(&nid, &ann)?;
@@ -494,9 +548,13 @@ where
         // Ensure that our inventory is recorded in our routing table, and we are seeding
         // all of it. It can happen that inventory is not properly seeded if for eg. the
         // user creates a new repository while the node is stopped.
+        //
+        // The routing table keeps every one; the inventory the node announces leaves out
+        // those the repository gate quarantines for a namespace, until they open.
         self.db
             .routing_mut()
             .add_inventory(inventory.iter(), nid, time.into())?;
+        inventory.retain(|rid| self.repositories.state(rid).inventoried());
         self.inventory = gossip::inventory(self.timestamp(), inventory);
 
         // Ensure that private repositories are not in our inventory. It's possible that
@@ -607,6 +665,9 @@ where
             last_online_at: None, // Updated on initialize.
             emitter,
             gate,
+            repositories: RepoGate::new(),
+            deferred_fetches: HashMap::new(),
+            deferred_announcements: HashMap::new(),
             stopped: false,
             fatal: None,
             listening: vec![],
@@ -1016,7 +1077,117 @@ where
             Command::QueryState(query, sender) => {
                 sender.send(query(self)).ok();
             }
+            Command::Gate(rid, state) => self.gate_changed(rid, state),
         }
+    }
+
+    /// `rid`'s state at the repository gate changed to `state`. Opened, the
+    /// fetches and refs announcement of it that waited run now; quarantined,
+    /// they fail. The inventory follows the repositories it leaves out.
+    fn gate_changed(&mut self, rid: RepoId, state: RepoState) {
+        match state {
+            RepoState::Open => {
+                for deferred in self.deferred_fetches.remove(&rid).unwrap_or_default() {
+                    self.fetch(
+                        rid,
+                        deferred.from,
+                        deferred.refs_at,
+                        deferred.config,
+                        deferred.channel,
+                    );
+                }
+                if let Some((namespaces, own)) = self.deferred_announcements.remove(&rid)
+                    && let Err(e) = self.announce_deferred(rid, namespaces, own)
+                {
+                    warn!(target: "service", "Failed to announce the refs of {rid} once it opened: {e}");
+                }
+            }
+            RepoState::Repairing => {}
+            RepoState::Quarantined(_) => {
+                for deferred in self.deferred_fetches.remove(&rid).unwrap_or_default() {
+                    if let Some(channel) = deferred.channel {
+                        channel
+                            .ok(FetchResult::Failed {
+                                reason: format!("repository {rid} is {state}"),
+                            })
+                            .ok();
+                    }
+                }
+                if !state.announces() {
+                    self.deferred_announcements.remove(&rid);
+                }
+            }
+        }
+        // The inventory leaves out a repository quarantined for a namespace.
+        let inventory = match self.inventory() {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                warn!(target: "service", "Failed to read the inventory: {e}");
+                return;
+            }
+        };
+        if inventory
+            != self
+                .inventory
+                .inventory
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+        {
+            let now = self.timestamp();
+            if let Err(e) = self.refresh_and_announce_inventory(now) {
+                warn!(target: "service", "Failed to announce the inventory: {e}");
+            }
+        }
+    }
+
+    /// Announces the refs of `rid` whose announcement waited for it to open:
+    /// of `namespaces`, as our own if any were.
+    fn announce_deferred(
+        &mut self,
+        rid: RepoId,
+        namespaces: BTreeSet<NodeId>,
+        own: bool,
+    ) -> Result<(), Error> {
+        let Some(doc) = self.storage.get(rid)? else {
+            return Ok(());
+        };
+        if own {
+            self.announce_own_refs(rid, doc, namespaces)?;
+        } else {
+            self.announce_refs(rid, doc, namespaces, false)?;
+        }
+        Ok(())
+    }
+
+    /// Keeps a fetch of `rid`, which is being repaired, to run once it opens.
+    /// Past [`MAX_DEFERRED_FETCHES`] for it, the fetch fails instead.
+    fn defer_fetch(
+        &mut self,
+        rid: RepoId,
+        from: NodeId,
+        refs_at: Vec<RefsAt>,
+        config: fetcher::FetchConfig,
+        channel: Option<command::Responder<FetchResult>>,
+    ) {
+        let deferred = self.deferred_fetches.entry(rid).or_default();
+        if deferred.len() >= MAX_DEFERRED_FETCHES {
+            if let Some(channel) = channel {
+                channel
+                    .ok(FetchResult::Failed {
+                        reason: format!("too many fetches of {rid} wait for its repair"),
+                    })
+                    .ok();
+            }
+            return;
+        }
+        debug!(target: "service", "Deferring the fetch of {rid} from {from} until its repair ends");
+        deferred.push(DeferredFetch {
+            from,
+            refs_at,
+            config,
+            channel,
+        });
     }
 
     /// Initiate an outgoing fetch for some repository, based on another node's announcement.
@@ -1063,6 +1234,21 @@ where
         config: fetcher::FetchConfig,
         channel: Option<command::Responder<FetchResult>>,
     ) {
+        match self.repositories.state(&rid) {
+            RepoState::Open => {}
+            RepoState::Repairing => {
+                return self.defer_fetch(rid, from, refs_at, config, channel);
+            }
+            state @ RepoState::Quarantined(_) => {
+                if let Some(c) = channel {
+                    c.ok(FetchResult::Failed {
+                        reason: format!("repository {rid} is {state}"),
+                    })
+                    .ok();
+                }
+                return;
+            }
+        }
         let session = {
             let reason = format!("peer {from} is not connected; cannot initiate fetch");
             let Some(session) = self.sessions.get_mut(&from) else {
@@ -1143,6 +1329,21 @@ where
                 debug!(target: "service", "Unexpected fetch result for {rid} from {from}");
             }
             fetcher::state::event::Fetched::Completed { from, rid, refs: _ } => {
+                // The repository closed after the fetch was sent to a worker:
+                // the fetch goes through the gate again, whatever its state is
+                // by now. Open again, it starts; being repaired, it waits;
+                // quarantined, it fails. Each of its responders is answered
+                // once, by that fetch.
+                if let Err(crate::worker::FetchError::Closed { .. }) = &result {
+                    let config = self.fetch_config();
+                    if subscribers.is_empty() {
+                        self.fetch(rid, from, vec![], config, None);
+                    }
+                    for responder in subscribers {
+                        self.fetch(rid, from, vec![], config, Some(responder));
+                    }
+                    return;
+                }
                 // Notify responders
                 let fetch_result = match &result {
                     Ok(success) => FetchResult::Success {
@@ -1363,7 +1564,13 @@ where
         info!(target: "service", "Connected to {remote} ({addr}) ({link:?})");
         self.emitter.emit(Event::PeerConnected { nid: remote });
 
-        let msgs = self.initial(link);
+        // The gate's passes for the repositories the inventory holds, kept
+        // until the messages are queued.
+        let (msgs, _inventoried) = self.initial(link);
+        #[cfg(any(test, feature = "test"))]
+        for rid in _inventoried.rids() {
+            seams::at(seams::Point::Inventory, *rid);
+        }
 
         if link.is_outbound() {
             if let Some(peer) = self.sessions.get_mut(&remote) {
@@ -1979,6 +2186,32 @@ where
                             {
                                 continue;
                             }
+                            // Our own announcements are replayed only as the
+                            // repository gate lets them through now, under its
+                            // passes until they are queued: refs while their
+                            // repository announces, and an inventory while it
+                            // holds no repository the gate leaves out. The
+                            // inventory that replaces it reaches the peer once
+                            // the reactor hears of the change.
+                            let _passes = if ann.node == local {
+                                let (rids, purpose) = match &ann.message {
+                                    AnnouncementMessage::Refs(refs) => {
+                                        (vec![refs.rid], Purpose::Announce)
+                                    }
+                                    AnnouncementMessage::Inventory(inventory) => {
+                                        (inventory.inventory.to_vec(), Purpose::Inventory)
+                                    }
+                                    AnnouncementMessage::Node(_) => (vec![], Purpose::Inventory),
+                                };
+                                let passes =
+                                    self.repositories.admit_all(rids.iter().copied(), purpose);
+                                if passes.len() != rids.len() {
+                                    continue;
+                                }
+                                Some(passes)
+                            } else {
+                                None
+                            };
                             // Only send messages if we're a relay, or it's our own messages.
                             if relay || ann.node == local {
                                 self.outbox.write(peer, ann.into());
@@ -2066,8 +2299,10 @@ where
         }
     }
 
-    /// Set of initial messages to send to a peer.
-    fn initial(&mut self, _link: Link) -> Vec<Message> {
+    /// Set of initial messages to send to a peer, and the repository gate's
+    /// passes for the repositories its inventory holds: keep them until the
+    /// messages are queued.
+    fn initial(&mut self, _link: Link) -> (Vec<Message>, Passes) {
         let now = self.clock();
         let filter = self.filter();
 
@@ -2087,11 +2322,38 @@ where
         };
         debug!(target: "service", "Subscribing to messages since timestamp {since}..");
 
-        vec![
-            Message::node(self.node.clone(), &self.secret_key),
-            Message::inventory(self.inventory.clone(), &self.secret_key),
-            Message::subscribe(filter, since, Timestamp::MAX),
-        ]
+        let (inventory, passes, remade) = self.admitted_inventory();
+        if remade {
+            // The peers already connected learn it too.
+            self.announce_inventory();
+        }
+        (
+            vec![
+                Message::node(self.node.clone(), &self.secret_key),
+                Message::inventory(inventory, &self.secret_key),
+                Message::subscribe(filter, since, Timestamp::MAX),
+            ],
+            passes,
+        )
+    }
+
+    /// Our inventory as the repository gate lets it through now, with the
+    /// passes that keep it so until it is queued: a close of one of its
+    /// repositories to a state that leaves it out waits for them.
+    ///
+    /// If the gate has left one out since the inventory was made, before the
+    /// reactor heard of it, the inventory is made again without it, and
+    /// `true` says so: the caller announces it.
+    fn admitted_inventory(&mut self) -> (InventoryAnnouncement, Passes, bool) {
+        let passes = self
+            .repositories
+            .admit_all(self.inventory.inventory.iter().copied(), Purpose::Inventory);
+        if passes.len() == self.inventory.inventory.len() {
+            return (self.inventory.clone(), passes, false);
+        }
+        let now = self.timestamp();
+        self.inventory = gossip::inventory(now, passes.rids().iter().copied());
+        (self.inventory.clone(), passes, true)
     }
 
     /// Try to guess whether we're online or not.
@@ -2154,11 +2416,17 @@ where
     ///
     /// When a repository is unseeded, it is also removed from the inventory. Private repositories
     /// are *not* part of a node's inventory.
+    ///
+    /// A repository the repository gate quarantines for a namespace is left
+    /// out.
     fn inventory(&self) -> Result<HashSet<RepoId>, Error> {
-        self.db
+        let mut inventory = self
+            .db
             .routing()
             .get_inventory(self.nid())
-            .map_err(Error::from)
+            .map_err(Error::from)?;
+        inventory.retain(|rid| self.repositories.state(rid).inventoried());
+        Ok(inventory)
     }
 
     /// Process a peer inventory announcement by updating our routing table.
@@ -2292,6 +2560,20 @@ where
         remotes: impl IntoIterator<Item = NodeId>,
         own: bool,
     ) -> Result<(Vec<RefsAt>, Timestamp), Error> {
+        // The repository gate's pass, held until the announcement is queued:
+        // a close to a state that doesn't announce waits for it.
+        let Some(_pass) = self.repositories.admit(rid, Purpose::Announce) else {
+            let state = self.repositories.state(&rid);
+            // Being repaired, it is announced once it opens again.
+            if state == RepoState::Repairing {
+                let (namespaces, any_own) = self.deferred_announcements.entry(rid).or_default();
+                namespaces.extend(remotes);
+                *any_own |= own;
+            }
+            return Err(Error::Gated { rid, state });
+        };
+        #[cfg(any(test, feature = "test"))]
+        seams::at(seams::Point::Announce, rid);
         let (ann, refs) = self.refs_announcement_for(rid, remotes)?;
         let timestamp = ann.timestamp();
         let peers = self.sessions.connected().map(|(_, p)| p);
@@ -2506,13 +2788,20 @@ where
 
     /// Announce our inventory to all connected peers, unless it was already announced.
     fn announce_inventory(&mut self) {
-        let timestamp = self.inventory.timestamp.to_local_time();
+        // The gate's passes for the repositories it holds, kept until it is
+        // queued.
+        let (inventory, passes, _) = self.admitted_inventory();
+        #[cfg(any(test, feature = "test"))]
+        for rid in passes.rids() {
+            seams::at(seams::Point::Inventory, *rid);
+        }
+        let timestamp = inventory.timestamp.to_local_time();
 
         if self.last_inventory == timestamp {
-            debug!(target: "service", "Skipping redundant inventory announcement (t={})", self.inventory.timestamp);
+            debug!(target: "service", "Skipping redundant inventory announcement (t={})", inventory.timestamp);
             return;
         }
-        let msg = AnnouncementMessage::from(self.inventory.clone());
+        let msg = AnnouncementMessage::from(inventory);
 
         self.outbox.announce(
             msg.signed(&self.secret_key),
@@ -2520,6 +2809,7 @@ where
             self.db.gossip_mut(),
         );
         self.last_inventory = timestamp;
+        drop(passes);
     }
 
     fn prune_routing_entries(&mut self, now: &LocalTime) -> Result<(), routing::Error> {
@@ -3041,5 +3331,67 @@ impl Deref for Sessions {
 impl DerefMut for Sessions {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// Test seams: work held at a point, with its repository gate passes, until
+/// released, so that a test can close the repository meanwhile.
+#[cfg(any(test, feature = "test"))]
+#[allow(clippy::unwrap_used)]
+pub mod seams {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    use radicle::identity::RepoId;
+
+    /// Where work is held.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Point {
+        /// A refs announcement, with its pass, before it is made.
+        Announce,
+        /// An inventory that holds the repository, with its passes, before it
+        /// is queued: a peer's initial messages, or an announcement.
+        Inventory,
+    }
+
+    #[derive(Default)]
+    struct Seams {
+        /// Work that waits, holding its pass.
+        held: HashMap<(Point, RepoId), bool>,
+        /// Work waiting now.
+        waiting: HashMap<(Point, RepoId), bool>,
+    }
+
+    static SEAMS: LazyLock<(Mutex<Seams>, Condvar)> = LazyLock::new(Default::default);
+
+    /// Work at `point` on `rid` waits with its pass, until [`release`].
+    pub fn hold(point: Point, rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert((point, rid), true);
+    }
+
+    pub fn release(point: Point, rid: RepoId) {
+        SEAMS.0.lock().unwrap().held.insert((point, rid), false);
+        SEAMS.1.notify_all();
+    }
+
+    /// Whether work at `point` on `rid` waits now, with its pass.
+    pub fn waiting(point: Point, rid: RepoId) -> bool {
+        SEAMS
+            .0
+            .lock()
+            .unwrap()
+            .waiting
+            .get(&(point, rid))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn at(point: Point, rid: RepoId) {
+        let mut seams = SEAMS.0.lock().unwrap();
+        while seams.held.get(&(point, rid)).copied().unwrap_or(false) {
+            seams.waiting.insert((point, rid), true);
+            seams = SEAMS.1.wait(seams).unwrap();
+        }
+        seams.waiting.insert((point, rid), false);
     }
 }

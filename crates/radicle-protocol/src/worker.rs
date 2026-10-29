@@ -29,6 +29,12 @@ pub enum FetchError {
     Policy(#[from] radicle_fetch::policy::error::Policy),
     #[error(transparent)]
     Blocked(#[from] radicle_fetch::policy::error::Blocked),
+    /// The repository gate closed the repository before the fetch began.
+    #[error("repository {rid} is {state}")]
+    Closed {
+        rid: radicle::prelude::RepoId,
+        state: radicle::node::gate::RepoState,
+    },
 }
 
 impl FetchError {
@@ -64,6 +70,9 @@ pub enum AuthorizationError {
     PolicyStore(#[from] radicle::node::policy::store::Error),
     #[error(transparent)]
     Repository(#[from] radicle::storage::RepositoryError),
+    /// The repository gate holds the repository back from peers.
+    #[error("repository {0} is {1}")]
+    Gated(RepoId, radicle::node::gate::RepoState),
 }
 
 /// Fetch job sent to worker thread.
