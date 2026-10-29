@@ -123,40 +123,87 @@ pub struct InProgress {
 }
 
 /// The version of `repo`: a hash over every ref's name and target. Any
-/// change to a ref changes it.
+/// change to a ref changes it, and so does any change to what a symbolic ref
+/// resolves through.
 ///
-/// Each ref is taken as libgit2 stores it, none skipped: its name's bytes,
-/// UTF-8 or not, and its target, an object ID or, for a symbolic ref, the
-/// name it points at, unresolved. Each is length-prefixed, so that no two
-/// sets of refs hash the same text. A ref that is neither direct nor
-/// symbolic, or that libgit2 can't read, is an error.
+/// - **Each ref** is taken as libgit2 stores it, none skipped: its name's
+///   bytes, UTF-8 or not, and its target, an object ID or, for a symbolic
+///   ref, the name it points at, unresolved.
+/// - **What the refs depend on beyond them:** libgit2 iterates `refs/` only.
+///   A symbolic ref that points outside it, at `HEAD` for example, is
+///   followed there, and each ref on the way is taken too, with its own
+///   target: one that is absent is taken as absent.
+///
+/// Each field is length-prefixed, and each entry tagged with its class, so
+/// that no two sets of refs hash the same bytes. A ref that is neither direct
+/// nor symbolic, or that libgit2 can't read, is an error.
 pub fn version(repo: &Repository) -> Result<Oid, Error> {
-    let mut refs = Vec::new();
+    let mut refs = BTreeSet::new();
+    let mut outside = Vec::new();
     for reference in repo.backend.references()? {
         let reference = reference?;
         let name = reference.name_bytes().to_vec();
-        let target = if let Some(oid) = reference.target() {
-            [b"oid ".as_slice(), oid.as_bytes()].concat()
-        } else if let Some(symbolic) = reference.symbolic_target_bytes() {
-            [b"ref ".as_slice(), symbolic].concat()
-        } else {
-            return Err(Error::Invalid(format!(
-                "the ref {:?} has no target",
-                String::from_utf8_lossy(&name)
-            )));
-        };
-        refs.push((name, target));
+        let target = target(&reference, &name)?;
+        if let Some(symbolic) = reference.symbolic_target_bytes()
+            && !symbolic.starts_with(b"refs/")
+        {
+            outside.push(symbolic.to_vec());
+        }
+        refs.insert((b"ref".to_vec(), name, target));
     }
-    refs.sort();
+    // The refs outside `refs/` that symbolic refs resolve through, followed
+    // as far as they go: each is taken once.
+    let mut followed = BTreeSet::new();
+    while let Some(name) = outside.pop() {
+        if !followed.insert(name.clone()) {
+            continue;
+        }
+        let found = match std::str::from_utf8(&name) {
+            Ok(text) => match repo.backend.find_reference(text) {
+                Ok(reference) => Some(reference),
+                Err(e) if e.code() == git::raw::ErrorCode::NotFound => None,
+                Err(e) => return Err(e.into()),
+            },
+            // libgit2 can't look a name up that isn't UTF-8: it can't
+            // resolve through one either.
+            Err(_) => None,
+        };
+        let target = match found {
+            Some(reference) => {
+                if let Some(symbolic) = reference.symbolic_target_bytes()
+                    && !symbolic.starts_with(b"refs/")
+                {
+                    outside.push(symbolic.to_vec());
+                }
+                target(&reference, &name)?
+            }
+            None => b"absent".to_vec(),
+        };
+        refs.insert((b"dep".to_vec(), name, target));
+    }
     let mut bytes = Vec::new();
-    for (name, target) in refs {
-        for field in [name, target] {
+    for (class, name, target) in refs {
+        for field in [class, name, target] {
             bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
             bytes.extend_from_slice(&field);
         }
     }
     let hash = git::raw::Oid::hash_object(git::raw::ObjectType::Blob, &bytes)?;
     Ok(hash.into())
+}
+
+/// A ref's target, tagged: an object ID, or the name it points at.
+fn target(reference: &git::raw::Reference, name: &[u8]) -> Result<Vec<u8>, Error> {
+    if let Some(oid) = reference.target() {
+        Ok([b"oid ".as_slice(), oid.as_bytes()].concat())
+    } else if let Some(symbolic) = reference.symbolic_target_bytes() {
+        Ok([b"ref ".as_slice(), symbolic].concat())
+    } else {
+        Err(Error::Invalid(format!(
+            "the ref {:?} has no target",
+            String::from_utf8_lossy(name)
+        )))
+    }
 }
 
 /// Reconciliation's progress, in `cobs/cache.db`.
@@ -807,5 +854,117 @@ mod tests {
         let dangling = version(&repo).unwrap();
         assert_ne!(dangling, two);
         assert_eq!(version(&repo).unwrap(), dangling);
+    }
+
+    // Review of heartwood #8, round 2: a symbolic ref that resolves through
+    // `HEAD`, outside the refs libgit2 iterates, depends on it. Moving `HEAD`
+    // changes the version, so that a repair's finished steps don't hold.
+    #[test]
+    fn a_symbolic_ref_through_head_changes_the_version_when_head_moves() {
+        use super::super::namespace::{Check, Signed, check};
+        use crate::storage::SignRepository as _;
+
+        let (tmp, repo, nid) = project();
+        let signer = SigningKey::mock(0xb4);
+        let head = repo.backend.head().unwrap().target().unwrap();
+        let parent = repo.backend.find_commit(head).unwrap();
+        let who = git::raw::Signature::now("t", "t@example.com").unwrap();
+        let other = repo
+            .backend
+            .commit(
+                None,
+                &who,
+                &who,
+                "other",
+                &parent.tree().unwrap(),
+                &[&parent],
+            )
+            .unwrap();
+        repo.backend
+            .reference("refs/heads/one", head, true, "test")
+            .unwrap();
+        repo.backend
+            .reference("refs/heads/two", other, true, "test")
+            .unwrap();
+        repo.backend.set_head("refs/heads/one").unwrap();
+        repo.backend
+            .reference_symbolic(
+                &format!("refs/namespaces/{nid}/refs/heads/link"),
+                "HEAD",
+                true,
+                "test",
+            )
+            .unwrap();
+        repo.sign_refs(&signer).unwrap();
+        let checked = || {
+            let signed = Signed::load(&repo, &nid).unwrap();
+            let mut from = Checkpoint::default();
+            loop {
+                match check(&repo, &signed, Authority::None, &from, 1024).unwrap() {
+                    Check::Continue(next) => from = next,
+                    end => return end,
+                }
+            }
+        };
+        assert_eq!(checked(), Check::Clean);
+        let mut state = State::open(tmp.path().join("cache.db")).unwrap();
+        let before = version(&repo).unwrap();
+        state.begin(&repo.id, before).unwrap();
+        state.finish(&repo.id, Step::Namespaces).unwrap();
+
+        // Only `HEAD` moves: the namespace no longer checks clean.
+        repo.backend.set_head("refs/heads/two").unwrap();
+        assert!(matches!(checked(), Check::Quarantine(_)));
+        let after = version(&repo).unwrap();
+        assert_ne!(after, before);
+        assert!(state.begin(&repo.id, after).unwrap().is_empty());
+
+        // `HEAD` itself left dangling is taken as it is, not an error.
+        repo.backend
+            .reference_symbolic("HEAD", "refs/heads/gone", true, "test")
+            .unwrap();
+        assert_ne!(version(&repo).unwrap(), after);
+    }
+
+    // Review of heartwood #8, round 2: a chain of symbolic refs outside
+    // `refs/` is followed to its end.
+    #[test]
+    fn a_chain_of_symbolic_refs_outside_refs_is_followed() {
+        let (_tmp, repo, nid) = project();
+        let head = repo.backend.head().unwrap().target().unwrap();
+        let parent = repo.backend.find_commit(head).unwrap();
+        let who = git::raw::Signature::now("t", "t@example.com").unwrap();
+        let other = repo
+            .backend
+            .commit(
+                None,
+                &who,
+                &who,
+                "other",
+                &parent.tree().unwrap(),
+                &[&parent],
+            )
+            .unwrap();
+        repo.backend
+            .reference("refs/heads/one", head, true, "test")
+            .unwrap();
+        repo.backend
+            .reference("refs/heads/two", other, true, "test")
+            .unwrap();
+        repo.backend.set_head("refs/heads/one").unwrap();
+        repo.backend
+            .reference_symbolic("FIRST_HEAD", "HEAD", true, "test")
+            .unwrap();
+        repo.backend
+            .reference_symbolic(
+                &format!("refs/namespaces/{nid}/refs/heads/link"),
+                "FIRST_HEAD",
+                true,
+                "test",
+            )
+            .unwrap();
+        let before = version(&repo).unwrap();
+        repo.backend.set_head("refs/heads/two").unwrap();
+        assert_ne!(version(&repo).unwrap(), before);
     }
 }
