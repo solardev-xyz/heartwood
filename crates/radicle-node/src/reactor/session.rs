@@ -41,6 +41,12 @@ pub trait StateMachine: Sized + Send {
     fn is_complete(&self) -> bool {
         self.artifact().is_some()
     }
+
+    /// A handshake act, as it is logged: in full, unless the machine's acts
+    /// can carry a secret.
+    fn describe(act: &[u8]) -> String {
+        format!("{act:02x?}")
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -83,7 +89,7 @@ impl<M: StateMachine, S: Session> io::Read for Protocol<M, S> {
         let mut input = vec![0u8; len];
         self.session.read_exact(&mut input)?;
 
-        log::trace!(target: M::NAME, "Received handshake act: {input:02x?}");
+        log::trace!(target: M::NAME, "Received handshake act: {}", M::describe(&input));
 
         if !input.is_empty() {
             let output = self.machine.advance(&input).map_err(|err| {
@@ -92,7 +98,7 @@ impl<M: StateMachine, S: Session> io::Read for Protocol<M, S> {
             })?;
 
             if !output.is_empty() {
-                log::trace!(target: M::NAME, "Sending handshake act on read: {output:02x?}");
+                log::trace!(target: M::NAME, "Sending handshake act on read: {}", M::describe(&output));
                 self.session.write_all(&output)?;
             }
         }
@@ -119,7 +125,7 @@ impl<M: StateMachine, S: Session> Write for Protocol<M, S> {
             })?;
 
             if !act.is_empty() {
-                log::trace!(target: M::NAME, "Sending handshake act on write: {act:02x?}");
+                log::trace!(target: M::NAME, "Sending handshake act on write: {}", M::describe(&act));
                 self.session.write_all(&act)?;
             } else {
                 log::trace!(target: M::NAME, "Handshake complete, passing data to inner session");
@@ -240,6 +246,12 @@ mod impl_socks5 {
         /// session with none.
         fn artifact(&self) -> Option<Self::Artifact> {
             self.target().cloned()
+        }
+
+        /// Its length only: an act can carry RFC 1929 credentials, which are
+        /// never logged.
+        fn describe(act: &[u8]) -> String {
+            format!("{} bytes", act.len())
         }
     }
 }

@@ -3617,6 +3617,85 @@ fn dial_through(
         .collect()
 }
 
+/// The environment variable that names the test a process of its own runs.
+const OWN_PROCESS: &str = "RAD_E2E_OWN_PROCESS";
+
+/// Whether this process is the one of its own that runs the test `name`.
+/// If it isn't, the test runs again in such a process, and fails unless it
+/// passes there: a test that sets what a whole process shares, its logger,
+/// runs its body there.
+fn in_own_process(name: &str) -> bool {
+    if std::env::var(OWN_PROCESS).as_deref() == Ok(name) {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1", "--nocapture"])
+        .env(OWN_PROCESS, name)
+        .env_remove("RUST_LOG")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{name} failed in a process of its own: {status}"
+    );
+    false
+}
+
+/// A logger that keeps every record, at every level.
+struct Captured(std::sync::Mutex<Vec<String>>);
+
+impl log::Log for Captured {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("{} {}", record.target(), record.args()));
+    }
+
+    fn flush(&self) {}
+}
+
+// Not `test_log`'s: this test's process keeps its own logger.
+#[core::prelude::v1::test]
+// Review of heartwood #19, round 1: the SOCKS5 handshake is logged at trace
+// level by its acts' lengths only, so a node's credentials, its derived
+// passwords among them, never reach its logs.
+fn test_a_node_logs_no_socks_credentials() {
+    if !in_own_process("tests::e2e::test_a_node_logs_no_socks_credentials") {
+        return;
+    }
+    static LOGS: std::sync::LazyLock<Captured> =
+        std::sync::LazyLock::new(|| Captured(std::sync::Mutex::new(Vec::new())));
+    log::set_logger(&*LOGS).unwrap();
+    log::set_max_level(log::LevelFilter::Trace);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = dial_through(tmp.path(), true);
+    let logs = LOGS.0.lock().unwrap().join("\n");
+    // The handshake was logged at trace level.
+    assert!(
+        logs.contains("socks5 Sending handshake act on read: "),
+        "{logs}"
+    );
+    for handshake in seen.values() {
+        let (username, password) = handshake.credentials.as_ref().unwrap();
+        let password = String::from_utf8(password.clone()).unwrap();
+        assert!(!logs.contains(&password), "a password was logged");
+        // Nor as the bytes of an act.
+        for secret in [username.as_slice(), password.as_bytes()] {
+            let bytes = format!("{secret:02x?}");
+            assert!(
+                !logs.contains(bytes.trim_matches(['[', ']'])),
+                "credentials were logged as bytes"
+            );
+        }
+    }
+}
+
 #[test]
 // Security R-12, part 4: a node whose gate asks for stream isolation asks
 // its SOCKS5 proxy with username and password only, and with credentials of
