@@ -2502,9 +2502,16 @@ fn a_stopped_service_does_nothing_more() {
 /// A peer whose storage holds three repositories of its own, signed with
 /// its own key.
 fn gated_peer(tmp: &std::path::Path) -> Peer<Storage> {
-    let signer = SigningKey::mock(AMY as usize);
+    gated_peer_as(tmp, AMY)
+}
+
+/// A peer like [`gated_peer`]'s, with the key of `id`, so that its
+/// repositories have IDs of their own. A test that holds work at a seam,
+/// keyed by repository across the tests running at once, needs that.
+fn gated_peer_as(tmp: &std::path::Path, id: u8) -> Peer<Storage> {
+    let signer = SigningKey::mock(id as usize);
     let storage = fixtures::storage(tmp.join("amy"), &signer).unwrap();
-    Peer::with_storage("amy", AMY, storage)
+    Peer::with_storage("amy", id, storage)
 }
 
 #[test]
@@ -2939,7 +2946,7 @@ fn gate_closing_waits_for_a_refs_announcement_under_way() {
     use protocol::service::seams::Point;
 
     let tmp = tempfile::tempdir().unwrap();
-    let mut amy = gated_peer(tmp.path());
+    let mut amy = gated_peer_as(tmp.path(), 201);
     let nid = *amy.nid();
     let rid = *amy.inventory().iter().next().unwrap();
     let bob = Peer::bob();
@@ -2970,9 +2977,9 @@ fn gate_closing_waits_for_an_inventory_under_way() {
     use protocol::service::seams::Point;
 
     let eve = Peer::eve();
-    for announce in [false, true] {
+    for (announce, id) in [(false, 202), (true, 203)] {
         let tmp = tempfile::tempdir().unwrap();
-        let mut amy = gated_peer(tmp.path());
+        let mut amy = gated_peer_as(tmp.path(), id);
         let rid = *amy.inventory().iter().next().unwrap();
         let bob = Peer::bob();
         amy.connect_to(&bob);
