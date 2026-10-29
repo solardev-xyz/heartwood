@@ -1593,6 +1593,39 @@ mod tests {
     }
 
     #[test]
+    fn a_namespace_check_stopped_between_units_resumes_from_its_checkpoint() {
+        let f = fixture();
+        let (rid, nid) = (f.rid(), f.nid());
+        // In its smallest form, one ref a unit, the check takes several units;
+        // shutdown arrives during the second.
+        let unit = Unit {
+            rid,
+            kind: kind::NAMESPACE.to_owned(),
+            position: format!("{nid}:"),
+        };
+        f.cut_off(&unit, 1);
+        let stop = Stop::default();
+        let log = Log::cancelling(&stop, kind::NAMESPACE, 2);
+        let report = f.run(Some(&[nid]), &f.alice.signer, &stop, &log);
+        assert_eq!(report.ending, Ending::Cancelled);
+        let checked = log.positions(kind::NAMESPACE);
+        assert_eq!(checked.len(), 2);
+
+        // The next process resumes after the two refs checked, not from the
+        // start.
+        let log = Log::default();
+        let report = f.run_as_alice(&log);
+        assert_eq!(report.ending, Ending::Done);
+        let resumed = log.positions(kind::NAMESPACE);
+        assert!(!resumed.is_empty());
+        assert!(
+            !checked.contains(&resumed[0]),
+            "{resumed:?} after {checked:?}"
+        );
+        assert_ne!(resumed[0], format!("{nid}:"));
+    }
+
+    #[test]
     fn a_unit_in_progress_when_two_processes_ended_quarantines_its_repository() {
         let f = fixture();
         let rid = f.rid();
