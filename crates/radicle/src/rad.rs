@@ -42,6 +42,10 @@ pub enum InitError {
     Io(#[from] io::Error),
     #[error("storage: {0}")]
     Storage(#[from] storage::Error),
+    /// The working copy's path can't be given to libgit2's local transport,
+    /// which takes a string: it isn't valid Unicode.
+    #[error("the working copy's path {0:?} isn't valid Unicode")]
+    UnrepresentablePath(std::path::PathBuf),
 }
 
 /// Initialize a new Radicle project from a git repository.
@@ -71,10 +75,27 @@ pub fn init(
     })?;
     let doc = identity::Doc::initial(proj, delegate, visibility);
 
+    // The working copy, as libgit2's local transport takes it: by a path
+    // string. One that isn't valid Unicode can't be passed as it is, and a
+    // lossy form could name another repository, so it is refused before
+    // anything is made.
+    let working = dunce::canonicalize(repo.path())?;
+    let Some(working) = working.to_str().map(str::to_owned) else {
+        return Err(InitError::UnrepresentablePath(working));
+    };
+
     let (project, identity) = Repository::init(&doc, storage, signer)?;
     let url = git::Url::from(project.id);
 
-    match init_configure(repo, &project, &default_branch, &url, identity, signer) {
+    match init_configure(
+        repo,
+        &working,
+        &project,
+        &default_branch,
+        &url,
+        identity,
+        signer,
+    ) {
         Ok(signed) => Ok((project.id, doc, signed)),
         Err(err) => {
             if let Err(e) = project.remove() {
@@ -92,6 +113,7 @@ pub fn init(
 
 fn init_configure(
     repo: &git::raw::Repository,
+    working: &str,
     stored: &Repository,
     default_branch: &BranchName,
     url: &git::Url,
@@ -110,7 +132,6 @@ fn init_configure(
         // libgit2's local transport. No `git` process runs: none of the
         // working copy's hooks, nor commands its configuration names, and
         // nothing of the environment reaches one.
-        let working = dunce::canonicalize(repo.path())?.display().to_string();
         let fetchspec = git::fmt::refspec::Refspec {
             src: branch.clone(),
             dst: branch.with_namespace(git::fmt::Component::from(pk)),
@@ -118,7 +139,7 @@ fn init_configure(
         }
         .to_string();
 
-        stored.backend.remote_anonymous(&working)?.fetch(
+        stored.backend.remote_anonymous(working)?.fetch(
             &[fetchspec.as_str()],
             Some(
                 git::raw::FetchOptions::new()
@@ -636,6 +657,66 @@ mod tests {
         assert_eq!(
             refs.head(component!("master")).unwrap(),
             git::Oid::from(head)
+        );
+    }
+
+    // Review of heartwood #13, round 1: a working copy whose path isn't valid
+    // Unicode is refused before anything is made, rather than fetched from a
+    // lossy form of its path, which can name another repository.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn init_refuses_a_working_copy_whose_path_isn_t_unicode() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let signer = SigningKey::mock(73);
+        let storage = Storage::open(tempdir.path().join("storage"), fixtures::user()).unwrap();
+        transport::local::register(storage.clone());
+
+        // A at `work-\xff`, and B at the path a lossy form of A's names.
+        let a = tempdir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"work-\xff"));
+        let b = tempdir.path().join("work-\u{fffd}");
+        let (a, _) = fixtures::repository(&a);
+        let (b, _) = fixtures::repository(&b);
+        let a_head = a.refname_to_id("refs/heads/master").unwrap();
+        let tree = b
+            .find_commit(b.refname_to_id("refs/heads/master").unwrap())
+            .unwrap();
+        let b_head = b
+            .commit(
+                Some("refs/heads/master"),
+                &tree.author(),
+                &tree.committer(),
+                "B's own",
+                &tree.tree().unwrap(),
+                &[&tree],
+            )
+            .unwrap();
+        assert_ne!(a_head, b_head);
+
+        let init = |repo: &git::raw::Repository| {
+            init(
+                repo,
+                "acme".try_into().unwrap(),
+                "Acme's repo",
+                git::fmt::refname!("master"),
+                Visibility::default(),
+                &signer,
+                &storage,
+            )
+        };
+        assert!(matches!(init(&a), Err(InitError::UnrepresentablePath(_))));
+        // Nothing was made: no repository in storage, no `rad` remote.
+        assert_eq!(storage.repositories().unwrap().len(), 0);
+        assert!(a.find_remote("rad").is_err());
+
+        // B, whose path is Unicode, imports its own head.
+        let (_, _, refs) = init(&b).unwrap();
+        assert_eq!(
+            refs.head(component!("master")).unwrap(),
+            git::Oid::from(b_head)
         );
     }
 
