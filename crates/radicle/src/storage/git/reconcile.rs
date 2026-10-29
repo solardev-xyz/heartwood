@@ -11,6 +11,7 @@
 
 pub mod cache;
 mod dir;
+pub mod driver;
 pub mod namespace;
 pub mod quarantine;
 pub mod state;
@@ -107,8 +108,25 @@ pub struct TemporaryClones {
 /// followed if it is a link, as every unit's root is.
 pub fn remove_temporary_clones(storage: &Path) -> io::Result<TemporaryClones> {
     let mut done = TemporaryClones::default();
-    let root = Dir::open_root(storage)?;
-    for name in root.names()? {
+    let (clones, left) = temporary_clones(storage)?;
+    done.left = left;
+    for (rid, name) in clones {
+        if remove_temporary_clone(storage, &name)? {
+            done.removed.push(rid);
+        } else {
+            done.left += 1;
+        }
+    }
+    Ok(done)
+}
+
+/// The temporary clones in `storage`, as [`remove_temporary_clones`] finds
+/// them, by repository and name, and how many entries with an extension are
+/// left alone because they have no clone's name.
+pub fn temporary_clones(storage: &Path) -> io::Result<(Vec<(RepoId, OsString)>, usize)> {
+    let mut clones = Vec::new();
+    let mut left = 0;
+    for name in Dir::open_root(storage)?.names()? {
         let path = Path::new(&name);
         let Some(ext) = path.extension() else {
             continue;
@@ -117,17 +135,39 @@ pub fn remove_temporary_clones(storage: &Path) -> io::Result<TemporaryClones> {
             .then(|| path.file_stem())
             .flatten()
             .and_then(|stem| RepoId::try_from(OsString::from(stem)).ok());
-        let Some(rid) = rid else {
-            done.left += 1;
-            continue;
-        };
-        if !root.remove_tree(&name)? {
-            done.left += 1;
+        match rid {
+            Some(rid) => clones.push((rid, name)),
+            None => left += 1,
+        }
+    }
+    Ok((clones, left))
+}
+
+/// Removes the temporary clone `name` from `storage`, if it is a directory
+/// itself, following no links: whether it did. One unit of the repair.
+pub fn remove_temporary_clone(storage: &Path, name: &OsStr) -> io::Result<bool> {
+    Dir::open_root(storage)?.remove_tree(name)
+}
+
+/// The repositories in `storage`: directories directly under it named by a
+/// repository ID, hidden ones and temporary clones aside, as heartwood's
+/// `Storage::repositories` finds them. None is opened.
+pub fn repositories(storage: &Path) -> io::Result<Vec<RepoId>> {
+    let root = Dir::open_root(storage)?;
+    let mut rids = Vec::new();
+    for name in root.names()? {
+        if name.to_string_lossy().starts_with('.') || Path::new(&name).extension().is_some() {
             continue;
         }
-        done.removed.push(rid);
+        if root.kind(&name)? != Some(Kind::Dir) {
+            continue;
+        }
+        if let Ok(rid) = RepoId::try_from(name) {
+            rids.push(rid);
+        }
     }
-    Ok(done)
+    rids.sort();
+    Ok(rids)
 }
 
 /// Removes the ref lock files a killed update left in the repository at

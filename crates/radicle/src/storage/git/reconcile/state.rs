@@ -156,6 +156,9 @@ pub fn version(repo: &Repository) -> Result<Oid, Error> {
 /// Reconciliation's progress, in `cobs/cache.db`.
 pub struct State {
     db: sql::ConnectionThreadSafe,
+    /// The unit in progress when the last process ended, as this one found
+    /// it, until this one starts it again.
+    interrupted: Option<InProgress>,
 }
 
 impl fmt::Debug for State {
@@ -172,7 +175,12 @@ impl State {
         db.set_busy_timeout(DB_WRITE_TIMEOUT.as_millis() as usize)?;
         db.execute("PRAGMA synchronous = FULL;")?;
         transaction(&db, |db| db.execute(SCHEMA))?;
-        Ok(Self { db })
+        let mut state = Self {
+            db,
+            interrupted: None,
+        };
+        state.interrupted = state.in_progress()?;
+        Ok(state)
     }
 
     /// Begins, or resumes, the repair of `rid` at its `version`: the steps
@@ -282,7 +290,8 @@ impl State {
         Ok(())
     }
 
-    /// The unit in progress when the last process ended, if one was.
+    /// The unit recorded in progress: the one running, or else the one in
+    /// progress when the last process ended, until it runs again.
     pub fn in_progress(&self) -> Result<Option<InProgress>, Error> {
         let stmt = self
             .db
@@ -303,38 +312,41 @@ impl State {
         }))
     }
 
-    /// Records `unit` as in progress, before it starts: how many processes
-    /// have now started it, one more than before if it was already the unit
-    /// in progress.
-    pub fn start(&mut self, unit: &Unit) -> Result<u32, Error> {
-        transaction(&self.db, |db| {
-            let attempts = match self.in_progress()? {
-                Some(InProgress {
-                    unit: recorded,
-                    attempts,
-                }) if recorded == *unit => attempts.saturating_add(1),
-                _ => 1,
-            };
-            let mut stmt = db.prepare(
-                "INSERT INTO reconcile_unit (id, rid, kind, position, attempts)
-                 VALUES (1, ?1, ?2, ?3, ?4)
-                 ON CONFLICT (id) DO UPDATE SET
-                   rid = excluded.rid, kind = excluded.kind,
-                   position = excluded.position, attempts = excluded.attempts",
-            )?;
-            stmt.bind((1, &unit.rid))?;
-            stmt.bind((2, unit.kind.as_str()))?;
-            stmt.bind((3, unit.position.as_str()))?;
-            stmt.bind((4, i64::from(attempts)))?;
-            stmt.next()?;
-            Ok(attempts)
-        })
+    /// The unit in progress when the last process ended, as this one opened
+    /// the state, until this one starts it again.
+    pub fn interrupted(&self) -> Option<&InProgress> {
+        self.interrupted.as_ref()
     }
 
-    /// Records that the unit in progress has ended.
+    /// Records `unit` as in progress, before it starts: how many processes
+    /// have now started it. That is one more than before if it is the unit
+    /// the last process ended during ([`Self::interrupted`]), whatever units
+    /// ran since, and one otherwise.
+    pub fn start(&mut self, unit: &Unit) -> Result<u32, Error> {
+        let attempts = match &self.interrupted {
+            Some(interrupted) if interrupted.unit == *unit => {
+                interrupted.attempts.saturating_add(1)
+            }
+            _ => 1,
+        };
+        record(&self.db, unit, attempts)?;
+        if attempts > 1 {
+            self.interrupted = None;
+        }
+        Ok(attempts)
+    }
+
+    /// Records that the unit in progress has ended. The record of a unit
+    /// the last process ended during, that hasn't run again, is kept: the
+    /// next process still finds it.
     pub fn end(&mut self) -> Result<(), Error> {
-        self.db.execute("DELETE FROM reconcile_unit")?;
-        Ok(())
+        match &self.interrupted {
+            Some(interrupted) => record(&self.db, &interrupted.unit, interrupted.attempts),
+            None => {
+                self.db.execute("DELETE FROM reconcile_unit")?;
+                Ok(())
+            }
+        }
     }
 
     /// The checkpoint of `rid`'s cache rebuild, if one was recorded at its
@@ -470,9 +482,28 @@ impl State {
                  DELETE FROM rebuild_staging;
                  DELETE FROM reconcile_cache;",
             )?;
-            Ok(())
-        })
+            Ok::<_, Error>(())
+        })?;
+        self.interrupted = None;
+        Ok(())
     }
+}
+
+/// Records `unit` as the unit in progress, started `attempts` times.
+fn record(db: &sql::Connection, unit: &Unit, attempts: u32) -> Result<(), Error> {
+    let mut stmt = db.prepare(
+        "INSERT INTO reconcile_unit (id, rid, kind, position, attempts)
+         VALUES (1, ?1, ?2, ?3, ?4)
+         ON CONFLICT (id) DO UPDATE SET
+           rid = excluded.rid, kind = excluded.kind,
+           position = excluded.position, attempts = excluded.attempts",
+    )?;
+    stmt.bind((1, &unit.rid))?;
+    stmt.bind((2, unit.kind.as_str()))?;
+    stmt.bind((3, unit.position.as_str()))?;
+    stmt.bind((4, i64::from(attempts)))?;
+    stmt.next()?;
+    Ok(())
 }
 
 fn steps(text: &str) -> Result<BTreeSet<Step>, Error> {
@@ -661,6 +692,53 @@ mod tests {
         state.end().unwrap();
         assert_eq!(state.in_progress().unwrap(), None);
         assert_eq!(state.start(&unit).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_cut_off_unit_s_record_outlasts_the_units_before_it_runs_again() {
+        let (tmp, mut state) = state();
+        let unit = Unit {
+            rid: rid(),
+            kind: "cache".to_owned(),
+            position: "issue:".to_owned(),
+        };
+        let other = Unit {
+            kind: "ref-locks".to_owned(),
+            position: String::new(),
+            ..unit.clone()
+        };
+        let reopen = |state: State| {
+            drop(state);
+            State::open(tmp.path().join("cache.db")).unwrap()
+        };
+        state.start(&unit).unwrap();
+        // The process ends during it. The next one runs another unit first,
+        // and ends before it reaches it again.
+        let mut state = reopen(state);
+        assert_eq!(state.start(&other).unwrap(), 1);
+        state.end().unwrap();
+        let interrupted = InProgress {
+            unit: unit.clone(),
+            attempts: 1,
+        };
+        assert_eq!(state.interrupted(), Some(&interrupted));
+        assert_eq!(state.in_progress().unwrap(), Some(interrupted.clone()));
+        // The one after still counts it as started once.
+        let mut state = reopen(state);
+        assert_eq!(state.interrupted(), Some(&interrupted));
+        assert_eq!(state.start(&other).unwrap(), 1);
+        state.end().unwrap();
+        assert_eq!(state.start(&unit).unwrap(), 2);
+        assert_eq!(state.interrupted(), None);
+        // It ends during it again: the next process counts a third start,
+        // after other units.
+        let mut state = reopen(state);
+        assert_eq!(state.start(&other).unwrap(), 1);
+        state.end().unwrap();
+        assert_eq!(state.start(&unit).unwrap(), 3);
+        state.end().unwrap();
+        assert_eq!(state.in_progress().unwrap(), None);
+        assert_eq!(reopen(state).interrupted(), None);
     }
 
     #[test]
