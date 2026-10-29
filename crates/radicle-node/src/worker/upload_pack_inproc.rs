@@ -1343,9 +1343,10 @@ mod tests {
             .commit(Some("refs/heads/main"), &sig(), &sig(), "m", &tree, &[])
             .unwrap();
 
-        // Wanting the commit, with the big blob as a have.
+        // Wanting the commit, with the big blob as a have, under the usual
+        // allowance, which the blob is within: still, it isn't read.
         READ.with(|read| read.set(0));
-        let mut walk = Walk::new(&repo, MAX_WALK, 1024).unwrap();
+        let mut walk = Walk::new(&repo, MAX_WALK, MAX_METADATA_OBJECT).unwrap();
         let sent = objects_to_send(&mut walk, &[commit], &[big]).unwrap();
         assert!(!sent.contains(&big));
         assert!(sent.contains(&small));
@@ -1354,13 +1355,17 @@ mod tests {
 
         // Wanting the big blob, unadvertised: refused, unread.
         READ.with(|read| read.set(0));
-        let mut walk = Walk::new(&repo, MAX_WALK, 1024).unwrap();
+        let mut walk = Walk::new(&repo, MAX_WALK, MAX_METADATA_OBJECT).unwrap();
         assert_eq!(unadvertised(&mut walk, &[big]).unwrap(), Some(big));
-        assert!(READ.with(Cell::get) < 1024);
+        let read = READ.with(Cell::get);
+        assert!(read < 1024, "{read} bytes of bodies read");
 
-        // A tree past the allowance isn't read.
-        let mut walk = Walk::new(&repo, MAX_WALK, 16).unwrap();
-        let err = objects_to_send(&mut walk, &[commit], &[]).unwrap_err();
+        // A tree past the allowance isn't read, though its commit is: one of
+        // 300 entries, under 1 KiB.
+        let wide = commit_with(&repo, 300, 8);
+        let mut walk = Walk::new(&repo, MAX_WALK, 1024).unwrap();
+        assert!(walk.commit(wide).is_ok());
+        let err = objects_to_send(&mut walk, &[wide], &[]).unwrap_err();
         assert!(err.to_string().contains("too large to read"), "{err}");
     }
 
