@@ -44,35 +44,11 @@ impl Committer {
         #[cfg(not(any(test, feature = "test")))]
         {
             use crate::profile::env::GIT_COMMITTER_DATE;
-            use std::env::VarError;
-            use std::env::var;
 
-            let timestamp = match var(GIT_COMMITTER_DATE) {
-                Ok(s) => match s.trim().parse::<u64>() {
-                    Ok(timestamp) => timestamp,
-                    Err(err) => {
-                        panic!(
-                            "Value of environment variable `{}` does not parse as integer: {err}",
-                            GIT_COMMITTER_DATE
-                        );
-                    }
-                },
-                Err(VarError::NotPresent) => std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .expect("time is later than unix epoch")
-                    .as_secs(),
-                Err(VarError::NotUnicode(_)) => {
-                    panic!(
-                        "Value for environment variable `{}` is not valid Unicode.",
-                        GIT_COMMITTER_DATE
-                    );
-                }
-            };
-
-            let timestamp = timestamp
-                .try_into()
-                .expect("seconds since unix epoch must fit i64");
-
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs());
+            let timestamp = committer_time(std::env::var(GIT_COMMITTER_DATE), now);
             Self::from_key_and_time(public_key, timestamp)
         }
     }
@@ -104,6 +80,30 @@ impl Committer {
             time: Time::new(timestamp, 0),
         })
     }
+}
+
+/// The committer time `value` gives, in seconds since the epoch, or `now`'s.
+/// A value that isn't an integer (git takes other date formats too), or isn't
+/// Unicode, is ignored with a warning: never a panic.
+#[cfg_attr(any(test, feature = "test"), allow(dead_code))]
+fn committer_time(value: Result<String, std::env::VarError>, now: u64) -> i64 {
+    use crate::profile::env::GIT_COMMITTER_DATE;
+
+    let seconds = match value {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(seconds) => seconds,
+            Err(e) => {
+                log::warn!(target: "radicle", "Ignoring `{GIT_COMMITTER_DATE}`, whose value {s:?} isn't a time in seconds: {e}");
+                now
+            }
+        },
+        Err(std::env::VarError::NotPresent) => now,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            log::warn!(target: "radicle", "Ignoring `{GIT_COMMITTER_DATE}`: it isn't valid Unicode");
+            now
+        }
+    };
+    i64::try_from(seconds).unwrap_or(i64::MAX)
 }
 
 mod git2_impls {
@@ -262,5 +262,23 @@ mod git2_impls {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod committer_time_test {
+    use std::env::VarError;
+
+    use super::committer_time;
+
+    // Security R-14: `GIT_COMMITTER_DATE` that isn't an integer, such as one of
+    // git's own date formats, falls back to now rather than panicking.
+    #[test]
+    fn a_committer_date_that_isn_t_an_integer_is_now() {
+        assert_eq!(committer_time(Ok("1671125284".to_owned()), 7), 1671125284);
+        assert_eq!(committer_time(Ok("2005-04-07T22:13:13".to_owned()), 7), 7);
+        assert_eq!(committer_time(Ok("@1112911993 +0200".to_owned()), 7), 7);
+        assert_eq!(committer_time(Err(VarError::NotPresent), 7), 7);
+        assert_eq!(committer_time(Ok(u64::MAX.to_string()), 7), i64::MAX);
     }
 }
