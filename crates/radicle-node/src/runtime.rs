@@ -9,9 +9,9 @@ use std::sync::{Arc, PoisonError, mpsc};
 use std::{fs, io, net, time};
 
 #[cfg(unix)]
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
-use uds_windows::UnixListener;
+use uds_windows::{UnixListener, UnixStream};
 
 use handle::Handle;
 use localtime::LocalTime;
@@ -30,7 +30,7 @@ use radicle::node::gate::RepoGate;
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
 use radicle::node::{NodeId, routing};
-use radicle::profile::Home;
+use radicle::profile::{Home, NodeLock};
 use radicle::{Storage, cob, git, storage};
 use radicle_signals::Signal;
 use thiserror::Error;
@@ -102,6 +102,9 @@ pub enum Error {
         and restart the node"
     )]
     AlreadyRunning(PathBuf),
+    /// Another node runs on the home: it holds its node lock.
+    #[error("another node runs on the home at '{0}'")]
+    HomeLocked(PathBuf),
     /// A git version error.
     #[error("git version error: {0}")]
     GitVersion(#[from] git::VersionError),
@@ -146,6 +149,20 @@ pub struct Runtime {
     resolvers: resolver::Workers,
     /// The error the service stopped the node with, once it has.
     stopped: Stopped,
+    /// The home's node lock, held until the node has stopped: no other node
+    /// runs on the home meanwhile.
+    lock: NodeLock,
+}
+
+/// Removes a control socket the runtime bound, unless its start succeeds.
+struct Unbind(Option<PathBuf>);
+
+impl Drop for Unbind {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            fs::remove_file(path).ok();
+        }
+    }
 }
 
 impl Runtime {
@@ -159,6 +176,12 @@ impl Runtime {
     /// `gate` decides which addresses the node may dial, and resolves names
     /// for it ([`radicle::node::dial::Open`] keeps the node's own behaviour).
     ///
+    /// It takes the home's node lock first, so that no other node can run on
+    /// the home while this one does: [`Error::HomeLocked`] if one does. It
+    /// binds the control socket next, before any thread starts. A start that
+    /// fails after the node's threads have started stops and joins them, so
+    /// nothing of the node runs on.
+    ///
     /// This function spawns threads.
     #[allow(clippy::too_many_arguments)]
     pub fn init(
@@ -171,6 +194,13 @@ impl Runtime {
         gate: Arc<dyn Gate>,
         repositories: RepoGate,
     ) -> Result<Runtime, Error> {
+        let lock = home.lock_node().map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                Error::HomeLocked(home.path().to_path_buf())
+            } else {
+                Error::Io(e)
+            }
+        })?;
         let id = NodeId::from(*secret_key.public_key());
         let alias = config.alias.clone();
         let network = config.network;
@@ -258,6 +288,14 @@ impl Runtime {
         )
         .with_repositories(repositories.clone());
 
+        // The control socket is bound before any of the node's threads start,
+        // and removed again if the start fails.
+        let control = socket.clone().map(Self::bind).transpose()?;
+        let mut unbind = Unbind(match &control {
+            Some(ControlSocket::Bound(_, path)) => Some(path.clone()),
+            _ => None,
+        });
+
         let (worker_send, worker_recv) =
             crossbeam_channel::bounded::<worker::Task>(MAX_PENDING_TASKS);
         let stopped = Stopped::default();
@@ -317,14 +355,14 @@ impl Runtime {
         initialized?;
         let reactor = reactor?;
         let resolvers = resolvers.ok_or_else(|| io::Error::other("no resolver pool"))?;
-        let handle = Handle::new(home.clone(), socket.clone(), reactor.controller(), emitter);
+        let handle = Handle::new(home.clone(), socket, reactor.controller(), emitter);
 
         let nid = NodeId::from(*secret_key.public_key());
         let fetch = worker::FetchConfig {
             local: nid,
             expiry: worker::garbage::Expiry::default(),
         };
-        let pool = worker::Pool::with(
+        let pool = match worker::Pool::with(
             worker_recv,
             nid,
             handle.clone(),
@@ -339,8 +377,14 @@ impl Runtime {
                 policies_db: home.node().join(node::POLICIES_DB_FILE),
                 repositories,
             },
-        )?;
-        let control = socket.map(Self::bind).transpose()?;
+        ) {
+            Ok(pool) => pool,
+            Err(e) => {
+                Self::stop(reactor, resolvers);
+                return Err(e.into());
+            }
+        };
+        unbind.0 = None;
 
         Ok(Runtime {
             id,
@@ -354,10 +398,26 @@ impl Runtime {
             local_addrs,
             resolvers,
             stopped,
+            lock,
         })
     }
 
+    /// Stops a node whose start failed once its threads had started: the
+    /// reactor, then the resolvers its end lets go. A worker started ends once
+    /// the reactor's end closes its queue.
+    fn stop(reactor: Reactor, resolvers: resolver::Workers) {
+        if reactor.controller().shutdown().is_err() {
+            log::error!(target: "node", "Failed to stop the reactor of a node that didn't start");
+        }
+        if reactor.join().is_err() {
+            log::error!(target: "node", "The reactor of a node that didn't start panicked");
+        }
+        resolvers.join_within(RESOLVER_JOIN_LIMIT);
+    }
+
     pub fn run(self) -> Result<(), Error> {
+        // Released once the node has stopped, at the end.
+        let lock = self.lock;
         let home = self.home;
         let (listener, remove) = match self.control {
             Some(ControlSocket::Bound(listener, path)) => (Some(listener), Some(path)),
@@ -427,6 +487,7 @@ impl Runtime {
         remove.map(|path| fs::remove_file(path).ok());
 
         log::debug!(target: "node", "Node shutdown completed for {}", self.id);
+        drop(lock);
 
         // A node the service stopped returns the error it stopped with.
         match self
@@ -482,7 +543,36 @@ impl Runtime {
         log::info!(target: "node", "Binding control socket {}..", path.display());
         match UnixListener::bind(&path) {
             Ok(sock) => Ok(ControlSocket::Bound(sock, path)),
-            Err(err) if err.kind() == io::ErrorKind::AddrInUse => Err(Error::AlreadyRunning(path)),
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                // With the home's lock held, a socket nothing listens on is one
+                // a node that ended uncleanly left: it is removed, and bound
+                // again. One that answers belongs to a node that runs.
+                match UnixStream::connect(&path) {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        log::info!(target: "node", "Removing the stale control socket {}..", path.display());
+                        fs::remove_file(&path).or_else(|e| {
+                            if e.kind() == io::ErrorKind::NotFound {
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        })?;
+                        match UnixListener::bind(&path) {
+                            Ok(sock) => Ok(ControlSocket::Bound(sock, path)),
+                            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                                Err(Error::AlreadyRunning(path))
+                            }
+                            Err(err) => Err(err.into()),
+                        }
+                    }
+                    _ => Err(Error::AlreadyRunning(path)),
+                }
+            }
             Err(err) => Err(err.into()),
         }
     }

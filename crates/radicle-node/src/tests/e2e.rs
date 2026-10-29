@@ -3469,3 +3469,108 @@ fn test_gate_a_quarantined_repository_s_refs_arent_kept_to_announce() {
     assert!(kept_announcements(false) > 0, "nothing to tell apart");
     assert_eq!(kept_announcements(true), 0);
 }
+
+/// How many threads of the node `nid` run in this process, by their names,
+/// which begin with its ID (Linux keeps a thread name's first 15 bytes).
+#[cfg(target_os = "linux")]
+fn threads_of(nid: &radicle::node::NodeId) -> usize {
+    let prefix = nid.to_string();
+    let prefix = &prefix[..15];
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+        .filter(|name| name.starts_with(prefix))
+        .count()
+}
+
+#[test]
+// Security R-16: no two nodes run on one home. A second start is refused, and
+// the running node's control socket is left to it; once it has stopped, a
+// node starts there again.
+fn test_a_second_node_on_a_home_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13).spawn();
+    let socket = alice.home.socket_default();
+    // Once its run is under way, as well as before: the lock is held for the
+    // node's whole life.
+    thread::sleep(time::Duration::from_millis(300));
+    assert!(matches!(
+        init(Node::init(tmp.path(), config::relay("alice"), 13)),
+        Err(crate::runtime::Error::HomeLocked(_))
+    ));
+    #[cfg(unix)]
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "the running node's socket was taken from it"
+    );
+    alice.shutdown();
+
+    let runtime = init(Node::init(tmp.path(), config::relay("alice"), 13)).unwrap();
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+// Security R-16: with the home's lock held, a control socket nothing listens
+// on, left by a node that ended uncleanly, is removed and bound again; one
+// something listens on is left to it.
+fn test_a_stale_control_socket_is_replaced_and_a_live_one_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = Node::init(tmp.path(), config::relay("alice"), 13);
+    let socket = node.home.socket_default();
+    // A live one.
+    let live = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    assert!(matches!(
+        init(node),
+        Err(crate::runtime::Error::AlreadyRunning(_))
+    ));
+    assert!(socket.exists());
+    drop(live);
+    // Now stale: its file is still there.
+    assert!(socket.exists());
+    let runtime = init(Node::init(tmp.path(), config::relay("alice"), 13)).unwrap();
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Security R-16: a start that fails leaves no thread of the node running, and
+// lets go of the home's lock. The control socket is bound before any thread
+// starts, so a socket that can't be bound stops the start there.
+fn test_a_failed_start_leaves_nothing_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A key of this test's own, so that its threads' names are its own.
+    let node = Node::init(tmp.path(), config::relay("alice"), 4_242);
+    let nid = node.id;
+    let (_, signals) = std::sync::mpsc::sync_channel(1);
+    let result = crate::runtime::Runtime::init(
+        node.home.clone(),
+        node.config,
+        Some(tmp.path().join("missing").join("control.sock")),
+        vec![([127, 0, 0, 1], 0).into()],
+        signals,
+        node.secret_key,
+        std::sync::Arc::new(radicle::node::dial::Open),
+        radicle::node::gate::RepoGate::new(),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        threads_of(&nid),
+        0,
+        "threads of a node that didn't start run on"
+    );
+
+    let runtime = init(Node::init(tmp.path(), config::relay("alice"), 4_242)).unwrap();
+    assert!(threads_of(&nid) > 0);
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+}
