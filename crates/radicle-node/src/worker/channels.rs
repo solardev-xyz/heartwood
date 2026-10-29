@@ -14,6 +14,11 @@ use protocol::wire::StreamId;
 /// upload-pack's stdout, the data chunks are of a maximum size of 8192 bytes.
 pub const MAX_WORKER_CHANNEL_SIZE: usize = 64;
 
+/// The most data one channel event carries: a worker's larger write is split.
+/// So that a channel holds at most `MAX_WORKER_CHANNEL_SIZE` events of this
+/// size, and each becomes a wire frame a receiver's inbox can take.
+pub const MAX_CHANNEL_EVENT: usize = 64 * 1024;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ChannelsConfig {
     timeout: time::Duration,
@@ -69,6 +74,13 @@ impl ChannelsFlush {
     pub fn timeout(&self) -> time::Duration {
         self.sender.writer.timeout.max(self.receiver.timeout)
     }
+
+    /// The pack size limit of the stream: what a fetch reads at most, and
+    /// what an upload sends at most.
+    #[cfg(feature = "serve-in-process")]
+    pub fn limit(&self) -> FetchPackSizeLimit {
+        self.receiver.limiter.limit
+    }
 }
 
 impl fetch::transport::ConnectionStream for ChannelsFlush {
@@ -78,6 +90,14 @@ impl fetch::transport::ConnectionStream for ChannelsFlush {
     fn open(&mut self) -> (&mut Self::Read, &mut Self::Write) {
         (&mut self.receiver, &mut self.sender)
     }
+}
+
+/// Why an event wasn't sent without waiting.
+pub enum TrySend<T> {
+    /// The channel is full: the event, to send later.
+    Full(ChannelEvent<T>),
+    /// The other end is gone.
+    Disconnected,
 }
 
 /// Data that can be sent and received on worker channels.
@@ -142,11 +162,27 @@ impl<T: AsRef<[u8]>> Channels<T> {
         self.receiver.try_iter()
     }
 
+    /// Whether no event waits to be taken.
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+
     pub fn send(&self, event: ChannelEvent<T>) -> io::Result<()> {
         self.sender.send(event)
     }
 
-    pub fn close(self) -> Result<(), chan::SendError<ChannelEvent<T>>> {
+    /// Sends `event` if the channel has room, without waiting: the event back
+    /// if it hasn't.
+    pub fn try_send(&self, event: ChannelEvent<T>) -> Result<(), TrySend<T>> {
+        match self.sender.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(chan::TrySendError::Full(event)) => Err(TrySend::Full(event)),
+            Err(chan::TrySendError::Disconnected(_)) => Err(TrySend::Disconnected),
+        }
+    }
+
+    /// Closes the stream, without waiting ([`ChannelWriter::close`]).
+    pub fn close(self) {
         self.sender.close()
     }
 }
@@ -265,11 +301,13 @@ impl fetch::transport::SignalEof for ChannelFlushWriter<Vec<u8>> {
 }
 
 impl Write for ChannelFlushWriter<Vec<u8>> {
+    /// Sends `buf` as events of at most [`MAX_CHANNEL_EVENT`] bytes each.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = buf.len();
-        self.writer.send(buf.to_vec())?;
+        for chunk in buf.chunks(MAX_CHANNEL_EVENT) {
+            self.writer.send(chunk.to_vec())?;
+        }
         self.flush()?;
-        Ok(n)
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -292,8 +330,57 @@ impl<T: AsRef<[u8]>> ChannelWriter<T> {
         }
     }
 
-    /// Permanently close this stream.
-    pub fn close(self) -> Result<(), chan::SendError<ChannelEvent<T>>> {
-        self.sender.send(ChannelEvent::Close)
+    /// Permanently close this stream, without waiting: if its channel is
+    /// full, dropping the sender closes it all the same, and the other end
+    /// sees it disconnected.
+    pub fn close(self) {
+        self.sender.try_send(ChannelEvent::Close).ok();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod test {
+    use std::io::Write as _;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::reactor::Controller;
+    use radicle::profile::Home;
+
+    // Review of heartwood #11, round 1: a worker's write is split into
+    // events of at most `MAX_CHANNEL_EVENT`, so that no event, and no frame
+    // made of one, is larger whatever the worker writes.
+    #[test]
+    fn a_write_is_split_into_bounded_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(0)).unwrap());
+        let (sender, _commands) = chan::unbounded();
+        let handle = Handle::new(
+            Home::new(tmp.path().join("home")).unwrap(),
+            None,
+            Controller::new(sender, waker),
+            Default::default(),
+        );
+        let (wire, worker) =
+            Channels::<Vec<u8>>::pair(ChannelsConfig::new(time::Duration::from_secs(1))).unwrap();
+        let remote = radicle::test::arbitrary::r#gen(1);
+        let stream = StreamId::git(radicle::node::Link::Outbound).nth(1).unwrap();
+        let mut flush = ChannelsFlush::new(handle, worker, remote, stream);
+        let (_, writer) = flush.split();
+        let data = vec![5u8; 3 * MAX_CHANNEL_EVENT + 7];
+        assert_eq!(writer.write(&data).unwrap(), data.len());
+        let events = wire
+            .try_iter()
+            .map(|event| match event {
+                ChannelEvent::Data(data) => data.len(),
+                _ => panic!("not data"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            [MAX_CHANNEL_EVENT, MAX_CHANNEL_EVENT, MAX_CHANNEL_EVENT, 7]
+        );
     }
 }
