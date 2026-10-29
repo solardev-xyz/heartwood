@@ -940,23 +940,34 @@ mod tests {
     // checks, and reads the signed refs not at all. With 100,000 packed refs,
     // a one-ref unit took 0.15 to 0.3 s in a debug build here (0.07 to 0.14 s
     // in release), well inside the watchdog's 30 s; the check that loaded and
-    // verified the whole namespace every unit took 2.2 s, and fails this.
+    // verified the whole namespace every unit took 2.2 s.
+    //
+    // The bound is relative, so that it holds on a slow machine as on a fast
+    // one: each unit takes less than half of the work the old units each
+    // repeated, every ref read into a map and the signed refs read and
+    // verified, timed here first. The old check fails it.
     #[test]
     fn a_unit_s_work_doesn_t_grow_with_the_namespace() {
         let f = Fixture::new();
         pack_refs(&f, 100_000);
         let repo = f.repo();
         let nid = f.nid();
+        let start = std::time::Instant::now();
+        let all = repo.references_of(&nid).unwrap();
         let signed = Signed::load(&repo, &nid).unwrap();
+        let whole = start.elapsed();
+        assert!(all.len() > 100_000);
         let mut from = Checkpoint::default();
         for _ in 0..3 {
             let start = std::time::Instant::now();
             let unit = check(&repo, &signed, Authority::Owner, &from, 1).unwrap();
             let took = start.elapsed();
-            eprintln!("a one-ref unit of 100,000 refs took {took:?}");
+            eprintln!(
+                "a one-ref unit of 100,000 refs took {took:?}, the whole namespace {whole:?}"
+            );
             assert!(
-                took < std::time::Duration::from_secs(1),
-                "a one-ref unit took {took:?}"
+                took < whole / 2,
+                "a one-ref unit took {took:?}, the whole namespace {whole:?}"
             );
             let Check::Continue(next) = unit else {
                 panic!("{unit:?}")
