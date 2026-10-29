@@ -166,6 +166,35 @@ impl change::Storage for git2::Repository {
         load_manifest(self, &tree)
     }
 
+    /// The commit, its tree, its manifest and its contents: what `load`
+    /// reads. The commit and the tree are read only once their headers fit.
+    fn size_of(&self, id: &Oid, limit: u64) -> Result<Option<u64>, Self::LoadError> {
+        let odb = self.odb()?;
+        let header = |oid: git2::Oid| odb.read_header(oid).map(|(size, _)| size as u64);
+        let mut size = header(id.into())?;
+        if size > limit {
+            return Ok(Some(size));
+        }
+        let tree = self.find_commit(id.into())?.tree_id();
+        size = size.saturating_add(header(tree)?);
+        if size > limit {
+            return Ok(Some(size));
+        }
+        for entry in self.find_tree(tree)?.iter() {
+            let read = entry.kind() == Some(git2::ObjectType::Blob)
+                && entry
+                    .name()
+                    .is_ok_and(|name| name == MANIFEST_BLOB_NAME || name.parse::<i8>().is_ok());
+            if read {
+                size = size.saturating_add(header(entry.id())?);
+                if size > limit {
+                    return Ok(Some(size));
+                }
+            }
+        }
+        Ok(Some(size))
+    }
+
     fn load(&self, id: Self::ObjectId) -> Result<Entry, Self::LoadError> {
         let commit = super::commit::Commit::read(self, id.into())?;
         let timestamp = commit.committer().time.seconds() as u64;
