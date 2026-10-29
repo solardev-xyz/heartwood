@@ -375,21 +375,17 @@ impl<K: Ord + Copy, V> Dag<K, V> {
             .filter(move |k| !ancestors.contains(k) && !descendants.contains(k) && **k != key)
     }
 
-    /// Add nodes recursively to the topological order, starting from the given node.
+    /// Add nodes to the topological order, starting from the given node: each
+    /// node's dependents first, in reverse, then the node, at the front.
     fn visit(&self, key: &K, visited: &mut BTreeSet<K>, order: &mut VecDeque<K>) {
-        if visited.insert(*key) {
-            // Recursively visit all of the node's dependents.
-            if let Some(node) = self.graph.get(key) {
-                for dependent in node.dependents.iter().rev() {
-                    self.visit(dependent, visited, order);
-                }
-            }
-            // Add the node to the topological order.
-            order.push_front(*key);
-        }
+        self.depth_first(key, visited, order, |node| {
+            node.dependents.iter().rev().copied().collect()
+        });
     }
 
-    /// Add nodes recursively to the provided ordering, starting from the given node.
+    /// Add nodes to the provided ordering, starting from the given node: each
+    /// node's dependents first, those in the graph, in reverse of `ordering`,
+    /// then the node, at the front.
     fn visit_by(
         &self,
         key: &K,
@@ -397,21 +393,45 @@ impl<K: Ord + Copy, V> Dag<K, V> {
         order: &mut VecDeque<K>,
         ordering: &impl Fn((&K, &V), (&K, &V)) -> Ordering,
     ) {
-        if visited.insert(*key) {
-            // Recursively visit all of the node's dependents.
-            if let Some(node) = self.graph.get(key) {
-                let mut dependents: Vec<&Node<K, V>> = node
-                    .dependents
-                    .iter()
-                    .filter_map(|k| self.get(k))
-                    .collect::<Vec<_>>();
-                dependents.sort_by(|x, y| ordering((&x.key, &x.value), (&y.key, &y.value)));
-                for dependent in dependents.iter().rev() {
-                    self.visit_by(&dependent.key, visited, order, ordering);
+        self.depth_first(key, visited, order, |node| {
+            let mut dependents: Vec<&Node<K, V>> = node
+                .dependents
+                .iter()
+                .filter_map(|k| self.get(k))
+                .collect::<Vec<_>>();
+            dependents.sort_by(|x, y| ordering((&x.key, &x.value), (&y.key, &y.value)));
+            dependents.iter().rev().map(|node| node.key).collect()
+        });
+    }
+
+    /// A depth-first walk from `key`, with an explicit stack rather than
+    /// recursion, so that a graph as deep as a peer makes it can't overflow
+    /// the thread's stack. Each node is visited once, its `children` in
+    /// their order, and put at the front of `order` once they all have been,
+    /// exactly as a recursive walk would. A key not in the graph has no
+    /// children.
+    fn depth_first(
+        &self,
+        key: &K,
+        visited: &mut BTreeSet<K>,
+        order: &mut VecDeque<K>,
+        children: impl Fn(&Node<K, V>) -> Vec<K>,
+    ) {
+        let children_of = |key: &K| self.graph.get(key).map(&children).unwrap_or_default();
+        if !visited.insert(*key) {
+            return;
+        }
+        let mut stack = vec![(*key, children_of(key), 0)];
+        while let Some((key, kids, next)) = stack.last_mut() {
+            if let Some(child) = kids.get(*next).copied() {
+                *next += 1;
+                if visited.insert(child) {
+                    stack.push((child, children_of(&child), 0));
                 }
+            } else {
+                order.push_front(*key);
+                stack.pop();
             }
-            // Add the node to the topological order.
-            order.push_front(*key);
         }
     }
 }
@@ -445,6 +465,133 @@ impl<K: Ord + Copy + fmt::Debug, V> Index<&K> for Dag<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recursive walks the iterative ones replace, as the reference
+    /// order.
+    fn visit_recursively<K: Ord + Copy, V>(
+        dag: &Dag<K, V>,
+        key: &K,
+        visited: &mut BTreeSet<K>,
+        order: &mut VecDeque<K>,
+    ) {
+        if visited.insert(*key) {
+            if let Some(node) = dag.graph.get(key) {
+                for dependent in node.dependents.iter().rev() {
+                    visit_recursively(dag, dependent, visited, order);
+                }
+            }
+            order.push_front(*key);
+        }
+    }
+
+    fn visit_by_recursively<K: Ord + Copy, V>(
+        dag: &Dag<K, V>,
+        key: &K,
+        visited: &mut BTreeSet<K>,
+        order: &mut VecDeque<K>,
+        ordering: &impl Fn((&K, &V), (&K, &V)) -> Ordering,
+    ) {
+        if visited.insert(*key) {
+            if let Some(node) = dag.graph.get(key) {
+                let mut dependents: Vec<&Node<K, V>> =
+                    node.dependents.iter().filter_map(|k| dag.get(k)).collect();
+                dependents.sort_by(|x, y| ordering((&x.key, &x.value), (&y.key, &y.value)));
+                for dependent in dependents.iter().rev() {
+                    visit_by_recursively(dag, &dependent.key, visited, order, ordering);
+                }
+            }
+            order.push_front(*key);
+        }
+    }
+
+    #[test]
+    // The iterative walks visit every node in exactly the order the recursive
+    // ones did, on random graphs: from each start, and in sequence.
+    fn the_walks_keep_the_recursive_order() {
+        let mut rng = fastrand::Rng::with_seed(0x5eed);
+        for _ in 0..500 {
+            let mut dag = Dag::new();
+            let len = rng.u32(1..60);
+            for i in 0..len {
+                dag.node(i, rng.u8(..));
+            }
+            for i in 1..len {
+                for _ in 0..rng.usize(0..4) {
+                    dag.dependency(i, rng.u32(0..i));
+                }
+            }
+            // Keys the graph doesn't hold are walked as leaves.
+            let starts: Vec<u32> = (0..rng.usize(1..6)).map(|_| rng.u32(0..len + 3)).collect();
+            let ordering =
+                |(k1, v1): (&u32, &u8), (k2, v2): (&u32, &u8)| v1.cmp(v2).then(k1.cmp(k2));
+
+            let (mut visited, mut order) = (BTreeSet::new(), VecDeque::new());
+            let (mut seen, mut expected) = (BTreeSet::new(), VecDeque::new());
+            for start in &starts {
+                dag.visit(start, &mut visited, &mut order);
+                visit_recursively(&dag, start, &mut seen, &mut expected);
+            }
+            assert_eq!(order, expected);
+            assert_eq!(visited, seen);
+
+            let (mut visited, mut order) = (BTreeSet::new(), VecDeque::new());
+            let (mut seen, mut expected) = (BTreeSet::new(), VecDeque::new());
+            for start in &starts {
+                dag.visit_by(start, &mut visited, &mut order, &ordering);
+                visit_by_recursively(&dag, start, &mut seen, &mut expected, &ordering);
+            }
+            assert_eq!(order, expected);
+            assert_eq!(visited, seen);
+        }
+    }
+
+    /// A chain of `len` nodes, each depending on the one before.
+    fn chain(len: u32) -> Dag<u32, ()> {
+        let mut dag = Dag::new();
+        for i in 0..len {
+            dag.node(i, ());
+            if i > 0 {
+                dag.dependency(i, i - 1);
+            }
+        }
+        dag
+    }
+
+    #[test]
+    // Security R-20: a history as long as a peer makes it is walked without
+    // recursion. Each walk finishes on a 256 KiB stack, where the recursive
+    // walks overflowed it and aborted the process.
+    fn a_long_chain_is_walked_without_recursion() {
+        const LEN: u32 = 100_000;
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let dag = chain(LEN);
+                assert_eq!(dag.sorted().len(), LEN as usize);
+                assert_eq!(
+                    dag.fold(&[0], 0, |n, _, _| ControlFlow::Continue(n + 1)),
+                    LEN
+                );
+                // `prune_by`'s walk, on its own: its siblings cost grows with
+                // the square of the history, so the whole prune runs on a
+                // shorter chain below.
+                let (mut visited, mut order) = (BTreeSet::new(), VecDeque::new());
+                dag.visit_by(&0, &mut visited, &mut order, &|(a, _), (b, _)| a.cmp(b));
+                assert_eq!(order.len(), LEN as usize);
+                assert!(order.iter().copied().eq(0..LEN));
+
+                let mut dag = chain(5_000);
+                let mut seen = 0;
+                dag.prune(&[0], |_, _, _| {
+                    seen += 1;
+                    ControlFlow::Continue(())
+                });
+                assert_eq!(seen, 5_000);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn test_len() {
