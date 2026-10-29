@@ -126,6 +126,14 @@ impl Handle {
         }
     }
 
+    /// Marks the node as stopped, once it has: a shutdown asked of any of its
+    /// handles after that does nothing. Above all, it no longer connects to
+    /// the control socket's path, which the next node on the home may have
+    /// bound by then.
+    pub(crate) fn ended(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
     pub fn worker_result(&mut self, result: TaskResult) -> Result<(), io::Error> {
         self.controller.cmd(wire::Control::Worker(result))
     }

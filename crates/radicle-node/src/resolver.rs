@@ -139,21 +139,22 @@ impl Workers {
     }
 }
 
-/// Starts `threads` workers, resolving through `gate` the jobs of a queue
-/// that holds at most `queue`, and handing their answers back to the
-/// reactor through `controller`.
+/// Starts `threads` workers, named `name`, resolving through `gate` the jobs
+/// of a queue that holds at most `queue`, and handing their answers back to
+/// the reactor through `controller`.
 pub(crate) fn spawn(
     gate: Arc<dyn Gate>,
     controller: Controller,
     threads: usize,
     queue: usize,
+    name: String,
 ) -> io::Result<(Resolvers, Workers)> {
     let (jobs, queued) = chan::bounded::<Job>(queue);
     let mut workers = Vec::with_capacity(threads);
     for _ in 0..threads.max(1) {
         let (queued, gate, controller) = (queued.clone(), gate.clone(), controller.clone());
         let worker = thread::Builder::new()
-            .name("resolver".to_owned())
+            .name(name.clone())
             .spawn(move || work(queued, gate.as_ref(), controller))?;
         workers.push(worker);
     }

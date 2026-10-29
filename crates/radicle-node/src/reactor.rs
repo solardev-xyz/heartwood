@@ -273,6 +273,7 @@ impl Reactor {
     ///
     /// The service is sent to the newly created reactor thread which runs the
     /// reactor [`Runtime`].
+    #[cfg(test)]
     pub fn new<H>(service: H, thread_name: String) -> Result<Self, io::Error>
     where
         H: 'static + ReactionHandler,
@@ -280,10 +281,10 @@ impl Reactor {
         Self::with(|_| Ok(service), thread_name)
     }
 
-    /// [`Reactor::new`], for a service built with the reactor's [`Controller`]
-    /// in hand: `service` makes it before the reactor's thread starts, so the
-    /// service can hand the controller to threads of its own before any
-    /// event reaches it.
+    /// Creates a new reactor, for a service built with the reactor's
+    /// [`Controller`] in hand: `service` makes it before the reactor's thread
+    /// starts, so the service can hand the controller to threads of its own
+    /// before any event reaches it.
     pub fn with<H>(
         service: impl FnOnce(Controller) -> Result<H, io::Error>,
         thread_name: String,

@@ -28,10 +28,6 @@ impl ChannelsConfig {
         }
     }
 
-    pub fn with_timeout(self, timeout: time::Duration) -> Self {
-        Self { timeout, ..self }
-    }
-
     pub fn with_reader_limit(self, reader_limit: FetchPackSizeLimit) -> Self {
         Self {
             reader_limit,

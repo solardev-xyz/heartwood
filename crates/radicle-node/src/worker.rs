@@ -83,6 +83,10 @@ impl Worker {
     /// Waits for tasks and runs them. Blocks indefinitely unless there is an error receiving
     /// the next task.
     fn run(mut self) -> Result<(), chan::RecvError> {
+        #[cfg(test)]
+        if PANIC_ON_START.load(std::sync::atomic::Ordering::SeqCst) {
+            panic!("a worker's panic, for a test");
+        }
         loop {
             let task = self.tasks.recv()?;
             self.process(task);
@@ -343,10 +347,16 @@ impl Pool {
         db: radicle::node::Database,
         config: Config,
     ) -> Result<Self, policy::Error> {
+        // Every worker's store is opened before any worker starts: a pool
+        // that can't be made has no thread left behind.
+        let policies = (0..config.capacity)
+            .map(|_| {
+                policy::Store::reader(&config.policies_db)
+                    .map(|store| policy::Config::new(config.policy, store))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut pool = Vec::with_capacity(config.capacity);
-        for i in 0..config.capacity {
-            let policies =
-                policy::Config::new(config.policy, policy::Store::reader(&config.policies_db)?);
+        for (i, policies) in policies.into_iter().enumerate() {
             let worker = Worker {
                 nid,
                 tasks: tasks.clone(),
@@ -366,20 +376,47 @@ impl Pool {
         Ok(Self { pool })
     }
 
-    /// Run the worker pool.
-    ///
-    /// Blocks until all worker threads have exited.
-    pub fn run(self) -> std::thread::Result<()> {
-        for (i, worker) in self.pool.into_iter().enumerate() {
-            if let Err(err) = worker.join()? {
-                log::trace!(target: "pool", "Worker {i} exited: {err}");
+    /// Joins every worker, one that panicked or not: blocks until all have
+    /// exited, and then returns the first panic, if one did. A worker exits
+    /// once its queue closes, which the reactor's end does, or once it
+    /// panics. The pool keeps the workers not yet joined.
+    pub fn join(&mut self) -> std::thread::Result<()> {
+        let mut joined = Ok(());
+        let mut i = 0;
+        while !self.pool.is_empty() {
+            let worker = self.pool.remove(0);
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => log::trace!(target: "pool", "Worker {i} exited: {err}"),
+                Err(panic) => {
+                    log::error!(target: "pool", "Worker {i} panicked: {}", panic_message(&*panic));
+                    if joined.is_ok() {
+                        joined = Err(panic);
+                    }
+                }
             }
+            i += 1;
         }
         log::debug!(target: "pool", "Worker pool shutting down..");
 
-        Ok(())
+        joined
     }
 }
+
+/// A panic's message, if it has one.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(no message)")
+}
+
+/// Makes every worker panic as it starts, for a test that runs in a process
+/// of its own.
+#[cfg(test)]
+pub(crate) static PANIC_ON_START: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Test-only seams: work held, with its gate pass, until a test releases it,
 /// per point and repository.

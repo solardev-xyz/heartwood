@@ -3476,14 +3476,32 @@ fn test_gate_a_quarantined_repository_s_refs_arent_kept_to_announce() {
 
 /// How many threads of the node `nid` run in this process, by their names,
 /// which begin with its ID (Linux keeps a thread name's first 15 bytes).
+///
+/// A thread already exiting isn't counted: the kernel wakes a thread's joiner
+/// as it exits, before its task leaves `/proc`.
 #[cfg(target_os = "linux")]
 fn threads_of(nid: &radicle::node::NodeId) -> usize {
+    /// The kernel's flag of a task that is exiting.
+    const PF_EXITING: u64 = 0x4;
+
     let prefix = nid.to_string();
     let prefix = &prefix[..15];
     std::fs::read_dir("/proc/self/task")
         .unwrap()
-        .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
-        .filter(|name| name.starts_with(prefix))
+        .filter_map(|task| {
+            let task = task.ok()?.path();
+            let name = std::fs::read_to_string(task.join("comm")).ok()?;
+            let stat = std::fs::read_to_string(task.join("stat")).ok()?;
+            // After the name: the state, five fields more, then the flags.
+            let flags: u64 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(6)?
+                .parse()
+                .ok()?;
+            (name.starts_with(prefix) && flags & PF_EXITING == 0).then_some(())
+        })
         .count()
 }
 
@@ -3577,4 +3595,310 @@ fn test_a_failed_start_leaves_nothing_running() {
     let running = thread::spawn(move || runtime.run());
     handle.shutdown().unwrap();
     running.join().unwrap().unwrap();
+}
+
+/// The environment variable that names the test a child process runs.
+#[cfg(unix)]
+const CHILD_TEST: &str = "RAD_E2E_CHILD_TEST";
+
+/// Whether this process is the child that runs the test `name`. If it isn't,
+/// the test runs again in a child process of its own, and fails unless it
+/// passes there: a test that changes what a whole process shares, a hook or
+/// the umask, runs its body there.
+#[cfg(unix)]
+fn in_child(name: &str) -> bool {
+    if std::env::var(CHILD_TEST).as_deref() == Ok(name) {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1", "--nocapture"])
+        .env(CHILD_TEST, name)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{name} failed in its child process: {status}"
+    );
+    false
+}
+
+/// `node`'s runtime, with no control socket: every thread its run starts is
+/// joined by its end.
+#[cfg(target_os = "linux")]
+fn init_without_socket(
+    node: crate::test::node::Node,
+) -> Result<crate::runtime::Runtime, crate::runtime::Error> {
+    let (_, signals) = std::sync::mpsc::sync_channel(1);
+    crate::runtime::Runtime::init(
+        node.home.clone(),
+        node.config,
+        None,
+        vec![([127, 0, 0, 1], 0).into()],
+        signals,
+        node.secret_key,
+        std::sync::Arc::new(radicle::node::dial::Open),
+        radicle::node::gate::RepoGate::new(),
+    )
+}
+
+/// Takes `home`'s node lock, on a thread of its own, as soon as it is let go
+/// of, and counts the threads of the node `nid` still running at that moment.
+#[cfg(target_os = "linux")]
+fn on_release(
+    home: &radicle::profile::Home,
+    nid: &radicle::node::NodeId,
+) -> thread::JoinHandle<usize> {
+    let (home, nid) = (home.clone(), *nid);
+    thread::spawn(move || {
+        loop {
+            match home.lock_node() {
+                Ok(_lock) => return threads_of(&nid),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::yield_now(),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 1: a worker's panic doesn't unwind the
+// node's run. The run stops the reactor and joins every thread of the node
+// before it lets go of the home, and returns the panic as an error.
+fn test_a_worker_panic_stops_the_node_before_it_lets_go_of_its_home() {
+    if !in_child("tests::e2e::test_a_worker_panic_stops_the_node_before_it_lets_go_of_its_home") {
+        return;
+    }
+    crate::worker::PANIC_ON_START.store(true, std::sync::atomic::Ordering::SeqCst);
+    let tmp = tempfile::tempdir().unwrap();
+    let node = Node::init(tmp.path(), config::relay("alice"), 4_343);
+    let (nid, home) = (node.id, node.home.clone());
+    let runtime = init_without_socket(node).unwrap();
+    let released = on_release(&home, &nid);
+
+    let result = runtime.run();
+    assert!(
+        matches!(result, Err(crate::runtime::Error::Panicked("worker"))),
+        "{result:?}"
+    );
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 1: a runtime dropped without a run, as an
+// unwind drops it, stops and joins its threads before it lets go of the home.
+fn test_a_runtime_dropped_unrun_stops_before_it_lets_go_of_its_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = Node::init(tmp.path(), config::relay("alice"), 4_344);
+    let (nid, home) = (node.id, node.home.clone());
+    let runtime = init_without_socket(node).unwrap();
+    assert!(threads_of(&nid) > 0);
+    let released = on_release(&home, &nid);
+
+    drop(runtime);
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 1: a resolver still in a lookup as the node
+// stops is joined once the lookup returns, within the time a stop waits for
+// one, before the home is let go of.
+fn test_a_resolver_in_a_lookup_is_joined_before_the_home_is_let_go_of() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = Node::init(tmp.path(), config::relay("alice"), 4_345);
+    let (nid, home) = (node.id, node.home.clone());
+    let gate = std::sync::Arc::new(HeldGate::new(vec![]));
+    let (_, signals) = std::sync::mpsc::sync_channel(1);
+    let runtime = crate::runtime::Runtime::init(
+        home.clone(),
+        node.config,
+        None,
+        vec![],
+        signals,
+        node.secret_key,
+        gate.clone(),
+        radicle::node::gate::RepoGate::new(),
+    )
+    .unwrap();
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    let peer = SigningKey::from_seed(radicle::crypto::Seed::new([77; 32]));
+    handle
+        .command(service::Command::Connect(
+            *peer.public_key(),
+            "held.test:8776".parse().unwrap(),
+            ConnectOptions {
+                persistent: false,
+                timeout: time::Duration::from_secs(2),
+            },
+        ))
+        .unwrap();
+    gate.wait_for(1);
+    let released = on_release(&home, &nid);
+
+    let lookup = {
+        let gate = gate.clone();
+        thread::spawn(move || {
+            thread::sleep(time::Duration::from_millis(300));
+            gate.release();
+        })
+    };
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+    lookup.join().unwrap();
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+}
+
+#[test]
+// Review of heartwood #16, round 1: once a node has stopped, a shutdown asked
+// of its handle doesn't reach the control socket's path, which the next node
+// on the home has bound.
+fn test_a_stopped_node_s_handle_leaves_the_next_node_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = init(Node::init(tmp.path(), config::relay("alice"), 13)).unwrap();
+    let stale = runtime.handle.clone();
+    // Stopped through its reactor, as a host stops it, not through a handle.
+    let stop = runtime.controller();
+    let running = thread::spawn(move || runtime.run());
+    assert!(stop.shutdown().is_ok());
+    running.join().unwrap().unwrap();
+
+    let runtime = init(Node::init(tmp.path(), config::relay("alice"), 13)).unwrap();
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    stale.shutdown().ok();
+    thread::sleep(time::Duration::from_millis(500));
+    assert!(
+        !running.is_finished(),
+        "the stopped node's handle stopped the next node"
+    );
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+// Review of heartwood #16, round 1: what takes the control socket's place
+// while the node runs, a symbolic link here, is left as it is at its end,
+// and so is what the link names.
+fn test_a_replaced_control_socket_is_left_as_it_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = Node::init(tmp.path(), config::relay("alice"), 13);
+    let socket = node.home.socket_default();
+    let runtime = init(node).unwrap();
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+
+    let marker = tmp.path().join("marker");
+    std::fs::write(&marker, "marker").unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    std::os::unix::fs::symlink(&marker, &socket).unwrap();
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+
+    assert!(
+        socket.symlink_metadata().unwrap().file_type().is_symlink(),
+        "the link put in the socket's place was removed"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "marker");
+}
+
+#[cfg(unix)]
+#[test]
+// Review of heartwood #16, round 1: at start, a symbolic link at the control
+// socket's path, even to a stale socket, and a file that isn't a socket, are
+// neither connected to nor removed: the start is refused.
+fn test_a_control_socket_path_that_names_no_socket_is_left_as_it_is() {
+    use crate::runtime::Error;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let node = || Node::init(tmp.path(), config::relay("alice"), 13);
+    let socket = node().home.socket_default();
+    // A stale socket, which a link names.
+    let stale = tmp.path().join("stale.sock");
+    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    std::os::unix::fs::symlink(&stale, &socket).unwrap();
+    assert!(matches!(
+        init(node()),
+        Err(Error::ControlPath(_, "a symbolic link"))
+    ));
+    assert!(socket.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(stale.symlink_metadata().is_ok());
+
+    std::fs::remove_file(&socket).unwrap();
+    std::fs::write(&socket, "a file").unwrap();
+    assert!(matches!(
+        init(node()),
+        Err(Error::ControlPath(_, "a file that isn't a socket"))
+    ));
+    assert_eq!(std::fs::read_to_string(&socket).unwrap(), "a file");
+}
+
+#[cfg(unix)]
+#[test]
+// Review of heartwood #16, round 1: under a umask that leaves files readable
+// by all, the control socket the node binds is `0600`, and the home's `node`
+// directory is made `0700`. A socket bound in a directory of the host's is
+// `0600` too, and that directory is left as it is.
+fn test_a_control_socket_is_its_user_s_alone_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !in_child("tests::e2e::test_a_control_socket_is_its_user_s_alone_whatever_the_umask") {
+        return;
+    }
+    let mode = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
+    let tmp = tempfile::tempdir().unwrap();
+    let node = Node::init(tmp.path(), config::relay("alice"), 13);
+    let home = node.home.clone();
+    assert_eq!(mode(&home.node()), 0o755);
+    let runtime = init(node).unwrap();
+    assert_eq!(mode(&home.socket_default()), 0o600);
+    assert_eq!(mode(&home.node()), 0o700);
+    drop(runtime);
+
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    assert_eq!(mode(&shared), 0o755);
+    let socket = shared.join("control.sock");
+    let node = Node::init(tmp.path(), config::relay("alice"), 13);
+    let (_, signals) = std::sync::mpsc::sync_channel(1);
+    let runtime = crate::runtime::Runtime::init(
+        node.home.clone(),
+        node.config,
+        Some(socket.clone()),
+        vec![],
+        signals,
+        node.secret_key,
+        std::sync::Arc::new(radicle::node::dial::Open),
+        radicle::node::gate::RepoGate::new(),
+    )
+    .unwrap();
+    assert_eq!(mode(&socket), 0o600);
+    assert_eq!(mode(&shared), 0o755);
+    drop(runtime);
+    assert!(
+        socket.symlink_metadata().is_err(),
+        "the socket was left behind"
+    );
 }
