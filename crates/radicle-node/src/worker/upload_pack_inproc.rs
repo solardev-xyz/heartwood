@@ -249,6 +249,13 @@ fn read_command<R: Read>(iter: &mut StreamingPeekableIter<R>) -> io::Result<Opti
 /// written as it is made, a write's worth at a time, whatever the number of
 /// refs.
 fn handle_ls_refs<W: Write>(repo: &Repository, cmd: &Command, send: &mut W) -> io::Result<()> {
+    let mut walk = Walk::new(repo, MAX_WALK, MAX_METADATA_OBJECT)?;
+    ls_refs(&mut walk, cmd, send)
+}
+
+/// `ls-refs` within `walk`: each ref it advertises is a step of the walk, and
+/// so is each tag it peels.
+fn ls_refs<W: Write>(walk: &mut Walk, cmd: &Command, send: &mut W) -> io::Result<()> {
     let mut want_symrefs = false;
     let mut want_peel = false;
     let mut prefixes: Vec<String> = Vec::new();
@@ -264,7 +271,7 @@ fn handle_ls_refs<W: Write>(repo: &Repository, cmd: &Command, send: &mut W) -> i
         }
     }
 
-    let walk = Walk::new(repo, MAX_WALK, MAX_METADATA_OBJECT)?;
+    let repo = walk.repo;
     let mut out = Vec::with_capacity(WRITE_FLUSH_THRESHOLD + 1024);
     let refs = repo.references().map_err(git_err)?;
     for r in refs {
@@ -292,6 +299,7 @@ fn handle_ls_refs<W: Write>(repo: &Repository, cmd: &Command, send: &mut W) -> i
             }
         };
 
+        walk.step()?;
         let mut line = format!("{oid} {name}");
         if want_symrefs && let Some(target) = symref_target {
             line.push_str(&format!(" symref-target:{target}"));
@@ -455,20 +463,23 @@ impl<'r> Walk<'r> {
     }
 
     /// The commit an annotated tag `oid` peels to, if it is one and does.
-    fn peeled(&self, mut oid: Oid) -> io::Result<Option<Oid>> {
+    fn peeled(&mut self, mut oid: Oid) -> io::Result<Option<Oid>> {
         if self.kind(oid)? != Some(ObjectType::Tag) {
             return Ok(None);
         }
-        // A chain of tags, followed in a loop: no deeper than the walk's
-        // allowance, each a body read.
-        for _ in 0..MAX_WALK {
+        // A chain of tags, followed in a loop: each tag a step of the walk,
+        // before its body is read, so the walk's budget and deadline bound
+        // the chain, and end the command when it passes them.
+        loop {
             match self.kind(oid)? {
-                Some(ObjectType::Tag) => oid = self.tag_target(oid)?,
+                Some(ObjectType::Tag) => {
+                    self.step()?;
+                    oid = self.tag_target(oid)?;
+                }
                 Some(ObjectType::Commit) => return Ok(Some(oid)),
                 _ => return Ok(None),
             }
         }
-        Ok(None)
     }
 }
 
@@ -1371,6 +1382,67 @@ mod tests {
 
     // Review of heartwood #11, round 1: `ls-refs` writes its advertisement as
     // it makes it, in bounded writes, whatever the number of refs.
+    /// A commit and four annotated tags chained to it, the last one under
+    /// `refs/tags/chain`, the store's only ref: the commit and the last tag.
+    fn tag_chain(repo: &Repository) -> (Oid, Oid) {
+        let commit = commit_with(repo, 1, 8);
+        let mut target = commit;
+        for i in 0..4 {
+            let object = repo.find_object(target, None).unwrap();
+            target = repo
+                .tag_annotation_create(&format!("t{i}"), &object, &sig(), "a tag")
+                .unwrap();
+        }
+        repo.reference("refs/tags/chain", target, true, "test")
+            .unwrap();
+        (commit, target)
+    }
+
+    #[test]
+    // Review of heartwood #11, round 2: each tag a peel follows is a step of
+    // its walk, before its body is read. A chain longer than what is left of
+    // the walk fails the command, rather than reading past it.
+    fn a_tag_chain_is_peeled_within_its_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path()).unwrap();
+        let (commit, top) = tag_chain(&repo);
+
+        // Four tags take four steps.
+        let mut walk = Walk::new(&repo, 4, MAX_METADATA_OBJECT).unwrap();
+        assert_eq!(walk.peeled(top).unwrap(), Some(commit));
+        assert_eq!(walk.left, 0);
+        let mut walk = Walk::new(&repo, 3, MAX_METADATA_OBJECT).unwrap();
+        assert!(walk.peeled(top).is_err());
+        // A walk with nothing left reads no tag's body.
+        let mut walk = Walk::new(&repo, 1, MAX_METADATA_OBJECT).unwrap();
+        walk.step().unwrap();
+        READ.with(|read| read.set(0));
+        assert!(walk.peeled(top).is_err());
+        assert_eq!(READ.with(Cell::get), 0);
+
+        // `ls-refs` with `peel`: the ref, and its four tags.
+        let cmd = Command {
+            name: "ls-refs".to_owned(),
+            lines: vec![b"command=ls-refs".to_vec(), b"peel".to_vec()],
+        };
+        let mut sink = Sink::default();
+        let mut walk = Walk::new(&repo, 5, MAX_METADATA_OBJECT).unwrap();
+        ls_refs(&mut walk, &cmd, &mut sink).unwrap();
+        let wire = String::from_utf8_lossy(&sink.writes.concat()).into_owned();
+        assert!(
+            wire.contains(&format!("{top} refs/tags/chain peeled:{commit}")),
+            "{wire}"
+        );
+        let mut walk = Walk::new(&repo, 4, MAX_METADATA_OBJECT).unwrap();
+        assert!(ls_refs(&mut walk, &cmd, &mut Sink::default()).is_err());
+
+        // A want's check: the commit is wantable as the chain's peeled tip.
+        let mut walk = Walk::new(&repo, 5, MAX_METADATA_OBJECT).unwrap();
+        assert_eq!(unadvertised(&mut walk, &[commit]).unwrap(), None);
+        let mut walk = Walk::new(&repo, 4, MAX_METADATA_OBJECT).unwrap();
+        assert!(unadvertised(&mut walk, &[commit]).is_err());
+    }
+
     #[test]
     fn ls_refs_writes_its_advertisement_in_bounded_writes() {
         let dir = tempfile::tempdir().unwrap();
