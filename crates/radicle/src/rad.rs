@@ -105,18 +105,28 @@ fn init_configure(
     let branch = git::fmt::Qualified::from(git::fmt::lit::refs_heads(default_branch));
 
     {
-        // Push branch to storage.
-        let stored = dunce::canonicalize(stored.path())?.display().to_string();
-
-        // Pushes to default branch to the namespace of the `signer`.
-        let pushspec = git::fmt::refspec::Refspec {
+        // Copies the default branch into the namespace of the `signer`, by a
+        // fetch from the working copy into storage, in this process, with
+        // libgit2's local transport. No `git` process runs: none of the
+        // working copy's hooks, nor commands its configuration names, and
+        // nothing of the environment reaches one.
+        let working = dunce::canonicalize(repo.path())?.display().to_string();
+        let fetchspec = git::fmt::refspec::Refspec {
             src: branch.clone(),
             dst: branch.with_namespace(git::fmt::Component::from(pk)),
             force: false,
         }
         .to_string();
 
-        git::run(Some(repo.path()), ["push".to_string(), stored, pushspec])?;
+        stored.backend.remote_anonymous(&working)?.fetch(
+            &[fetchspec.as_str()],
+            Some(
+                git::raw::FetchOptions::new()
+                    .update_fetchhead(false)
+                    .download_tags(git::raw::AutotagOption::None),
+            ),
+            None,
+        )?;
     }
 
     // N.b. we need to create the remote branch for the default branch
@@ -558,6 +568,75 @@ mod tests {
         assert_eq!(project.description(), "Acme's repo");
         assert_eq!(project.default_branch(), &git::fmt::refname!("master"));
         assert_eq!(doc.delegates().first(), &Did::from(public_key));
+    }
+
+    // Security R-13: initializing from a working copy runs none of its hooks,
+    // since no `git` process runs: the branch is fetched into storage in this
+    // process.
+    #[cfg(unix)]
+    #[test]
+    fn init_runs_none_of_the_working_copy_s_hooks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let signer = SigningKey::mock(73);
+        let storage = Storage::open(tempdir.path().join("storage"), fixtures::user()).unwrap();
+        transport::local::register(storage.clone());
+
+        let (repo, _) = fixtures::repository(tempdir.path().join("working"));
+        let marker = tempdir.path().join("hooks-ran");
+        let hooks = tempdir.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for hook in ["pre-push", "reference-transaction", "post-update"] {
+            for dir in [hooks.clone(), repo.path().join("hooks")] {
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join(hook);
+                std::fs::write(
+                    &path,
+                    format!("#!/bin/sh\necho {hook} >> '{}'\n", marker.display()),
+                )
+                .unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        repo.config()
+            .unwrap()
+            .set_str("core.hooksPath", hooks.to_str().unwrap())
+            .unwrap();
+
+        let (proj, _, refs) = init(
+            &repo,
+            "acme".try_into().unwrap(),
+            "Acme's repo",
+            git::fmt::refname!("master"),
+            Visibility::default(),
+            &signer,
+            &storage,
+        )
+        .unwrap();
+
+        assert!(
+            !marker.exists(),
+            "hooks ran: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        // The branch is in the signer's namespace, and signed.
+        let head = repo.refname_to_id("refs/heads/master").unwrap();
+        let stored = storage.repository(proj).unwrap();
+        assert_eq!(
+            stored
+                .raw()
+                .refname_to_id(&format!(
+                    "refs/namespaces/{}/refs/heads/master",
+                    signer.public_key()
+                ))
+                .unwrap(),
+            head
+        );
+        assert_eq!(
+            refs.head(component!("master")).unwrap(),
+            git::Oid::from(head)
+        );
     }
 
     #[test]
