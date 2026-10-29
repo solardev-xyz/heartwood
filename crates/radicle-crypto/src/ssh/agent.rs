@@ -95,14 +95,11 @@ impl Agent {
     /// Register a key with the agent.
     pub fn register(&mut self, key: &SigningKey) -> Result<(), AgentError> {
         use ssh_key::private::{Ed25519Keypair, KeypairData};
+        // Wiped once handed to the agent.
+        let bytes = zeroize::Zeroizing::new(key.to_keypair_bytes());
         self.client.add_identity(proto::AddIdentity {
             credential: PrivateCredential::Key {
-                privkey: KeypairData::Ed25519(
-                    Ed25519Keypair::from_bytes(
-                        &ed25519_dalek::SigningKey::from(key.clone()).to_keypair_bytes(),
-                    )
-                    .unwrap(),
-                ),
+                privkey: KeypairData::Ed25519(Ed25519Keypair::from_bytes(&bytes).unwrap()),
                 comment: "".into(),
             },
         })
