@@ -44,6 +44,12 @@ pub enum Error {
     Git(#[from] git::raw::Error),
     #[error("invalid reconcile state: {0}")]
     Invalid(String),
+    /// A symbolic ref resolves through a ref outside `refs/` whose name isn't
+    /// UTF-8. libgit2 follows it, but it can't be looked up here, so the
+    /// version can't take what it points at: it is refused rather than taken
+    /// as absent.
+    #[error("a symbolic ref resolves through {0:?}, a ref whose name isn't UTF-8")]
+    Undecodable(String),
 }
 
 /// A step of one repository's repair, recorded once it is finished.
@@ -124,7 +130,8 @@ pub struct InProgress {
 ///
 /// Each field is length-prefixed, and each entry tagged with its class, so
 /// that no two sets of refs hash the same bytes. A ref that is neither direct
-/// nor symbolic, or that libgit2 can't read, is an error.
+/// nor symbolic, or that libgit2 can't read, is an error, and so is a
+/// dependency whose name isn't UTF-8 ([`Error::Undecodable`]).
 pub fn version(repo: &Repository) -> Result<Oid, Error> {
     let mut refs = BTreeSet::new();
     let mut outside = Vec::new();
@@ -146,15 +153,18 @@ pub fn version(repo: &Repository) -> Result<Oid, Error> {
         if !followed.insert(name.clone()) {
             continue;
         }
-        let found = match std::str::from_utf8(&name) {
-            Ok(text) => match repo.backend.find_reference(text) {
-                Ok(reference) => Some(reference),
-                Err(e) if e.code() == git::raw::ErrorCode::NotFound => None,
-                Err(e) => return Err(e.into()),
-            },
-            // libgit2 can't look a name up that isn't UTF-8: it can't
-            // resolve through one either.
-            Err(_) => None,
+        // libgit2 resolves through a name that isn't UTF-8, but git2 looks
+        // names up as strings only: such a dependency can't be taken, and is
+        // refused, never taken as absent.
+        let Ok(text) = std::str::from_utf8(&name) else {
+            return Err(Error::Undecodable(
+                String::from_utf8_lossy(&name).into_owned(),
+            ));
+        };
+        let found = match repo.backend.find_reference(text) {
+            Ok(reference) => Some(reference),
+            Err(e) if e.code() == git::raw::ErrorCode::NotFound => None,
+            Err(e) => return Err(e.into()),
         };
         let target = match found {
             Some(reference) => {
@@ -829,5 +839,59 @@ mod tests {
         let before = version(&repo).unwrap();
         repo.backend.set_head("refs/heads/two").unwrap();
         assert_ne!(version(&repo).unwrap(), before);
+    }
+
+    // Review of heartwood #8, round 3: a namespace's symbolic ref that
+    // resolves through a ref outside `refs/` whose name isn't UTF-8 depends on
+    // a ref the version can't read. libgit2 follows it, so the version is
+    // refused, rather than taking it as absent: no progress is recorded at a
+    // version blind to it, or reused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dependency_whose_name_isn_t_utf_8_is_refused() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        use super::super::namespace::{Check, Signed, check};
+        use crate::storage::SignRepository as _;
+
+        let (_tmp, repo, nid) = project();
+        let signer = SigningKey::mock(0xb4);
+        let head = repo.backend.head().unwrap().target().unwrap();
+        // A ref outside `refs/`, named with a byte that isn't UTF-8, at the
+        // head commit; and the namespace's ref pointing at it.
+        let outside = repo.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join(std::ffi::OsStr::from_bytes(b"raw-\xff")),
+            format!("{head}\n"),
+        )
+        .unwrap();
+        let link = repo
+            .path()
+            .join(format!("refs/namespaces/{nid}/refs/heads/link"));
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&link, b"ref: outside/raw-\xff\n").unwrap();
+        // libgit2 resolves it.
+        let resolved = repo
+            .backend
+            .find_reference(&format!("refs/namespaces/{nid}/refs/heads/link"))
+            .unwrap()
+            .resolve()
+            .unwrap()
+            .target()
+            .unwrap();
+        assert_eq!(resolved, head);
+        repo.sign_refs(&signer).unwrap();
+        let signed = Signed::load(&repo, &nid).unwrap();
+        let mut from = Checkpoint::default();
+        let clean = loop {
+            match check(&repo, &signed, Authority::None, &from, 1024).unwrap() {
+                Check::Continue(next) => from = next,
+                end => break end,
+            }
+        };
+        assert_eq!(clean, Check::Clean);
+
+        assert!(matches!(version(&repo), Err(Error::Undecodable(_))));
     }
 }
