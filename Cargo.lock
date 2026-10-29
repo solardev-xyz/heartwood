@@ -2805,6 +2805,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "git2",
+ "gix-date",
  "indexmap",
  "jsonschema",
  "libc",

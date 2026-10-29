@@ -83,27 +83,41 @@ impl Committer {
 }
 
 /// The committer time `value` gives, in seconds since the epoch, or `now`'s.
-/// A value that isn't an integer (git takes other date formats too), or isn't
-/// Unicode, is ignored with a warning: never a panic.
+///
+/// It is read as git reads `GIT_COMMITTER_DATE`, by gitoxide's parser
+/// ([`gix_date::parse`]): git's raw format, with or without its `@`
+/// (`@1112911993 +0200`), a Unix time, ISO 8601, RFC 2822, and git's other
+/// formats. Its zone is dropped, as before: a committer's time is in UTC. An
+/// empty value is now, as it is for git.
+///
+/// A value the parser refuses, or that isn't Unicode, is ignored with a
+/// warning, never a panic. A relative date ("2 days ago") is one, as it is
+/// for git there.
 #[cfg_attr(any(test, feature = "test"), allow(dead_code))]
 fn committer_time(value: Result<String, std::env::VarError>, now: u64) -> i64 {
     use crate::profile::env::GIT_COMMITTER_DATE;
 
-    let seconds = match value {
-        Ok(s) => match s.trim().parse::<u64>() {
-            Ok(seconds) => seconds,
-            Err(e) => {
-                log::warn!(target: "radicle", "Ignoring `{GIT_COMMITTER_DATE}`, whose value {s:?} isn't a time in seconds: {e}");
-                now
-            }
-        },
-        Err(std::env::VarError::NotPresent) => now,
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return now,
         Err(std::env::VarError::NotUnicode(_)) => {
             log::warn!(target: "radicle", "Ignoring `{GIT_COMMITTER_DATE}`: it isn't valid Unicode");
-            now
+            return now;
         }
     };
-    i64::try_from(seconds).unwrap_or(i64::MAX)
+    let date = value.trim();
+    if date.is_empty() {
+        return now;
+    }
+    // Git's `@` marks its raw format, or a Unix time, as one.
+    match gix_date::parse(date.strip_prefix('@').unwrap_or(date), None) {
+        Ok(time) => time.seconds,
+        Err(e) => {
+            log::warn!(target: "radicle", "Ignoring `{GIT_COMMITTER_DATE}`, whose value {value:?} isn't a date: {e}");
+            now
+        }
+    }
 }
 
 mod git2_impls {
@@ -271,14 +285,96 @@ mod committer_time_test {
 
     use super::committer_time;
 
-    // Security R-14: `GIT_COMMITTER_DATE` that isn't an integer, such as one of
-    // git's own date formats, falls back to now rather than panicking.
+    /// A time that stands for now.
+    const NOW: u64 = 7;
+
+    /// What `git var GIT_COMMITTER_IDENT` makes of `date` as its committer
+    /// date: its time in seconds, or `None` if git refuses it.
+    fn git_time(date: &str) -> Option<i64> {
+        let output = std::process::Command::new("git")
+            .args(["var", "GIT_COMMITTER_IDENT"])
+            .env("GIT_COMMITTER_NAME", "radicle")
+            .env("GIT_COMMITTER_EMAIL", "radicle@localhost")
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("git runs");
+        if !output.status.success() {
+            return None;
+        }
+        let ident = String::from_utf8(output.stdout).unwrap();
+        // `<name> <<email>> <seconds> <zone>`.
+        let mut fields = ident.trim_end().rsplit(' ');
+        let _zone = fields.next();
+        Some(fields.next().unwrap().parse().unwrap())
+    }
+
+    // Review of heartwood #14, round 1: `GIT_COMMITTER_DATE` is read as git
+    // reads it, against git itself: its raw format, a Unix time, ISO 8601 and
+    // RFC 2822 give git's time, and what git refuses is now.
     #[test]
-    fn a_committer_date_that_isn_t_an_integer_is_now() {
-        assert_eq!(committer_time(Ok("1671125284".to_owned()), 7), 1671125284);
-        assert_eq!(committer_time(Ok("2005-04-07T22:13:13".to_owned()), 7), 7);
-        assert_eq!(committer_time(Ok("@1112911993 +0200".to_owned()), 7), 7);
-        assert_eq!(committer_time(Err(VarError::NotPresent), 7), 7);
-        assert_eq!(committer_time(Ok(u64::MAX.to_string()), 7), i64::MAX);
+    fn a_committer_date_is_read_as_git_reads_it() {
+        let read = [
+            // Git's raw format, and a Unix time.
+            "1112911993 +0200",
+            "@1112911993 +0200",
+            "@1112911993",
+            "1112911993",
+            " 1112911993 ",
+            // ISO 8601.
+            "2005-04-07T22:13:13 +0200",
+            "2005-04-07T22:13:13+02:00",
+            "2005-04-07 22:13:13 +0200",
+            "2005-04-07T22:13:13Z",
+            "2005-04-07T22:13:13.5+02:00",
+            "2005.04.07 22:13:13 +0200",
+            // RFC 2822, and git's own format.
+            "Thu, 07 Apr 2005 22:13:13 +0200",
+            "Thu, 7 Apr 2005 22:13:13 +0200",
+            "7 Apr 2005 22:13:13 +0200",
+            "Thu Apr 7 22:13:13 2005 +0200",
+        ];
+        let refused = [
+            "not a date",
+            "now",
+            "yesterday",
+            "2 days ago",
+            "@",
+            "18446744073709551615",
+        ];
+        for date in read {
+            let git = git_time(date).unwrap_or_else(|| panic!("git refuses {date:?}"));
+            assert_eq!(committer_time(Ok(date.to_owned()), NOW), git, "{date:?}");
+        }
+        for date in refused {
+            assert_eq!(git_time(date), None, "git reads {date:?}");
+            assert_eq!(
+                committer_time(Ok(date.to_owned()), NOW),
+                NOW as i64,
+                "{date:?}"
+            );
+        }
+    }
+
+    // Security R-14: a committer date that is unset, empty or not Unicode is
+    // now, and never a panic.
+    #[test]
+    fn a_committer_date_that_isn_t_there_is_now() {
+        assert_eq!(committer_time(Err(VarError::NotPresent), NOW), NOW as i64);
+        assert_eq!(committer_time(Ok(String::new()), NOW), NOW as i64);
+        assert_eq!(committer_time(Ok("  ".to_owned()), NOW), NOW as i64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+
+            let value = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            assert_eq!(
+                committer_time(Err(VarError::NotUnicode(value)), NOW),
+                NOW as i64
+            );
+        }
+        assert_eq!(
+            committer_time(Err(VarError::NotPresent), u64::MAX),
+            i64::MAX
+        );
     }
 }
