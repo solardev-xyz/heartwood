@@ -3763,6 +3763,181 @@ fn test_a_resolver_in_a_lookup_is_joined_before_the_home_is_let_go_of() {
     );
 }
 
+/// A runtime for a node of `seed` on `tmp`, with its default control socket,
+/// dialling through `gate`.
+#[cfg(target_os = "linux")]
+fn init_gated(
+    tmp: &std::path::Path,
+    seed: usize,
+    gate: std::sync::Arc<dyn radicle::node::dial::Gate>,
+) -> (
+    radicle::node::NodeId,
+    radicle::profile::Home,
+    crate::runtime::Runtime,
+) {
+    let node = Node::init(tmp, config::relay("alice"), seed);
+    let (nid, home) = (node.id, node.home.clone());
+    let (_, signals) = std::sync::mpsc::sync_channel(1);
+    let runtime = crate::runtime::Runtime::init(
+        home.clone(),
+        node.config,
+        Some(home.socket_default()),
+        vec![],
+        signals,
+        node.secret_key,
+        gate,
+        radicle::node::gate::RepoGate::new(),
+    )
+    .unwrap();
+    (nid, home, runtime)
+}
+
+/// Two connections to the control socket at `path`, each keeping a command
+/// thread of it busy: one that sends nothing, and one that streams the
+/// node's events.
+#[cfg(target_os = "linux")]
+fn busy_control(path: &std::path::Path) -> [std::os::unix::net::UnixStream; 2] {
+    use std::io::Write as _;
+
+    let idle = std::os::unix::net::UnixStream::connect(path).unwrap();
+    let mut events = std::os::unix::net::UnixStream::connect(path).unwrap();
+    writeln!(
+        events,
+        "{}",
+        serde_json::to_string(&radicle::node::Command::Subscribe).unwrap()
+    )
+    .unwrap();
+    [idle, events]
+}
+
+/// Has `gate` hold a lookup of the node `handle` controls.
+#[cfg(target_os = "linux")]
+fn hold_a_lookup(handle: &crate::runtime::handle::Handle, gate: &HeldGate) {
+    let peer = SigningKey::from_seed(radicle::crypto::Seed::new([77; 32]));
+    handle
+        .command(service::Command::Connect(
+            *peer.public_key(),
+            "held.test:8776".parse().unwrap(),
+            ConnectOptions {
+                persistent: false,
+                timeout: time::Duration::from_secs(2),
+            },
+        ))
+        .unwrap();
+    gate.wait_for(1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 2: a node's control socket listener, and
+// the commands it serves, an idle one and one streaming events among them,
+// are stopped and joined before the node lets go of its home. It runs in a
+// process of its own, where each command's thread stays a while once its
+// command has returned, so that one ended but not joined would be seen.
+fn test_a_node_s_control_threads_end_before_it_lets_go_of_its_home() {
+    use std::io::Read as _;
+
+    if !in_child("tests::e2e::test_a_node_s_control_threads_end_before_it_lets_go_of_its_home") {
+        return;
+    }
+    crate::control::COMMAND_LINGER.store(300, std::sync::atomic::Ordering::SeqCst);
+    let tmp = tempfile::tempdir().unwrap();
+    let (nid, home, runtime) = init_gated(
+        tmp.path(),
+        4_346,
+        std::sync::Arc::new(radicle::node::dial::Open),
+    );
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    let mut clients = busy_control(&home.socket_default());
+    // Both are taken, and served.
+    thread::sleep(time::Duration::from_millis(300));
+    let released = on_release(&home, &nid);
+
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+    // Their connections were closed.
+    for client in &mut clients {
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 2: a resolver still in its lookup past the
+// time a stop waits for one keeps the node's home: the run returns, and the
+// home's lock is released only once the lookup has ended.
+fn test_a_resolver_past_its_limit_keeps_the_home_until_it_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gate = std::sync::Arc::new(HeldGate::new(vec![]));
+    let (nid, home, runtime) = init_gated(tmp.path(), 4_347, gate.clone());
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    hold_a_lookup(&handle, &gate);
+
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+    // The run has returned, past its wait for a resolver, and the home is
+    // still held.
+    assert_eq!(
+        home.lock_node().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let released = on_release(&home, &nid);
+    gate.release();
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 2: a worker's panic stops the node, with its
+// control socket's commands and a resolver past its limit, before the home is
+// let go of.
+fn test_a_worker_panic_with_control_and_a_lookup_lets_go_of_the_home_last() {
+    if !in_child(
+        "tests::e2e::test_a_worker_panic_with_control_and_a_lookup_lets_go_of_the_home_last",
+    ) {
+        return;
+    }
+    crate::worker::PANIC_ON_START.store(true, std::sync::atomic::Ordering::SeqCst);
+    let tmp = tempfile::tempdir().unwrap();
+    let gate = std::sync::Arc::new(HeldGate::new(vec![]));
+    let (nid, home, runtime) = init_gated(tmp.path(), 4_348, gate.clone());
+    let handle = runtime.handle.clone();
+    hold_a_lookup(&handle, &gate);
+    let _clients = busy_control(&home.socket_default());
+    let released = on_release(&home, &nid);
+    let lookup = {
+        let gate = gate.clone();
+        thread::spawn(move || {
+            thread::sleep(time::Duration::from_millis(1_500));
+            gate.release();
+        })
+    };
+
+    let result = runtime.run();
+    assert!(
+        matches!(result, Err(crate::runtime::Error::Panicked("worker"))),
+        "{result:?}"
+    );
+    lookup.join().unwrap();
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+}
+
 #[test]
 // Review of heartwood #16, round 1: once a node has stopped, a shutdown asked
 // of its handle doesn't reach the control socket's path, which the next node

@@ -3,6 +3,8 @@ use std::io::BufReader;
 use std::io::LineWriter;
 use std::io::prelude::*;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, net, time};
 
 #[cfg(unix)]
@@ -23,6 +25,17 @@ use crate::runtime::thread;
 /// Maximum timeout for waiting for node events.
 const MAX_TIMEOUT: time::Duration = time::Duration::MAX;
 
+/// How long the listener waits, when no connection is pending, before it
+/// looks again, and checks whether it is to stop.
+const LISTEN_POLL: time::Duration = time::Duration::from_millis(50);
+
+/// How long a command's thread stays, in milliseconds, once its command has
+/// returned: for a test in a process of its own, to see that the thread is
+/// joined, not merely ended by the time its node lets go of its home.
+#[cfg(test)]
+pub(crate) static COMMAND_LINGER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("failed to bind control socket listener: {0}")]
@@ -33,8 +46,16 @@ pub enum Error {
     Node(#[from] runtime::handle::Error),
 }
 
-/// Listen for commands on the control socket, and process them.
-pub fn listen<E, H>(listener: UnixListener, handle: H) -> Result<(), Error>
+/// Listen for commands on the control socket, and process them, each on a
+/// thread of its own, until `stop` is set.
+///
+/// The listener doesn't block on its socket: it looks for a connection
+/// every [`LISTEN_POLL`], and checks `stop` in between. Once it is set, it
+/// shuts down the connections of the commands still running, so that a read
+/// or a write they wait on ends, joins their threads, and returns. A
+/// command waiting on the node itself ends once the node has stopped: its
+/// handle fails, and an event stream ends as the node closes it.
+pub fn listen<E, H>(listener: UnixListener, handle: H, stop: Arc<AtomicBool>) -> Result<(), Error>
 where
     H: Handle<Error = runtime::handle::Error> + 'static,
     H::Sessions: serde::Serialize,
@@ -43,13 +64,26 @@ where
 {
     log::debug!(target: "control", "Control thread listening on socket..");
     let nid = handle.nid()?;
+    listener.set_nonblocking(true).map_err(Error::Bind)?;
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(mut stream) => {
+    let mut commands: Vec<(UnixStream, std::thread::JoinHandle<()>)> = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Err(e) = stream.set_nonblocking(false) {
+                    log::warn!(target: "control", "Failed to set up an incoming connection: {e}");
+                    continue;
+                }
+                let control = match stream.try_clone() {
+                    Ok(control) => control,
+                    Err(e) => {
+                        log::warn!(target: "control", "Failed to set up an incoming connection: {e}");
+                        continue;
+                    }
+                };
                 let handle = handle.clone();
-
-                thread::spawn(&nid, "control", move || {
+                let thread = thread::spawn(&nid, "control", move || {
+                    let mut stream = stream;
                     if let Err(e) = command(&stream, handle) {
                         log::debug!(target: "control", "Command returned error: {e}");
 
@@ -58,13 +92,41 @@ where
                         stream.flush().ok();
                         stream.shutdown(net::Shutdown::Both).ok();
                     }
+                    #[cfg(test)]
+                    std::thread::sleep(time::Duration::from_millis(
+                        COMMAND_LINGER.load(Ordering::SeqCst),
+                    ));
                 });
+                commands.push((control, thread));
             }
-            Err(e) => log::warn!(target: "control", "Failed to accept incoming connection: {e}"),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(LISTEN_POLL),
+            Err(e) => {
+                log::warn!(target: "control", "Failed to accept incoming connection: {e}");
+                std::thread::sleep(LISTEN_POLL);
+            }
         }
+        // The commands that have ended are joined, so that their handles
+        // don't pile up.
+        let (ended, running): (Vec<_>, Vec<_>) = commands
+            .into_iter()
+            .partition(|(_, thread)| thread.is_finished());
+        for (_, thread) in ended {
+            if thread.join().is_err() {
+                log::error!(target: "control", "A control command's thread panicked");
+            }
+        }
+        commands = running;
     }
     log::debug!(target: "control", "Exiting control loop..");
 
+    for (stream, _) in &commands {
+        stream.shutdown(net::Shutdown::Both).ok();
+    }
+    for (_, thread) in commands {
+        if thread.join().is_err() {
+            log::error!(target: "control", "A control command's thread panicked");
+        }
+    }
     Ok(())
 }
 
@@ -302,7 +364,7 @@ mod tests {
         thread::spawn({
             let handle = handle.clone();
 
-            move || listen(listener, handle)
+            move || listen(listener, handle, Default::default())
         });
 
         for rid in &rids {
@@ -352,7 +414,7 @@ mod tests {
         thread::spawn({
             let handle = crate::test::handle::Handle::default();
 
-            move || crate::control::listen(listener, handle)
+            move || crate::control::listen(listener, handle, Default::default())
         });
 
         // Wait for node to be online.

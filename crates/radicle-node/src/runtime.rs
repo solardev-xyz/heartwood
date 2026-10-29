@@ -170,6 +170,7 @@ struct Lifecycle {
     pool: Option<worker::Pool>,
     resolvers: Option<resolver::Workers>,
     watcher: Option<Watcher>,
+    control: Option<Control>,
     handle: Option<Handle>,
     socket: Option<SocketFile>,
     lock: Option<NodeLock>,
@@ -181,6 +182,13 @@ struct Watcher {
     thread: std::thread::JoinHandle<()>,
 }
 
+/// The control socket's listener thread, and the word that stops it. It
+/// joins the threads of the commands it serves before it ends.
+struct Control {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<Result<(), control::Error>>,
+}
+
 impl Lifecycle {
     /// The life of a node that holds `lock`, before anything of it runs.
     fn new(lock: NodeLock) -> Self {
@@ -189,6 +197,7 @@ impl Lifecycle {
             pool: None,
             resolvers: None,
             watcher: None,
+            control: None,
             handle: None,
             socket: None,
             lock: Some(lock),
@@ -197,10 +206,18 @@ impl Lifecycle {
 
     /// Stops what of the node runs, and joins it.
     ///
-    /// The reactor goes first: its end closes the workers' and the
-    /// resolvers' queues. The workers, the resolvers and the signal watcher
-    /// follow. Then the control socket's file is removed, if its path still
-    /// names the socket bound, and the lock is released.
+    /// 1. The reactor goes first: its end closes the workers' and the
+    ///    resolvers' queues.
+    /// 2. The workers follow, then the resolvers, within their limit, and the
+    ///    signal watcher.
+    /// 3. The handles stop, and their event streams end.
+    /// 4. The control socket's listener stops, once it has joined the
+    ///    commands it serves.
+    /// 5. The control socket's file is removed, if its path still names the
+    ///    socket bound.
+    /// 6. The lock is released, once every resolver has ended: at once if
+    ///    they all have, and otherwise by a thread that waits for those still
+    ///    in a lookup ([`reap`]).
     ///
     /// It returns the first thread found to have panicked, if one did.
     fn end(&mut self) -> Option<&'static str> {
@@ -218,11 +235,13 @@ impl Lifecycle {
         {
             panicked = panicked.or(Some("worker"));
         }
-        // A resolver still in a name lookup after this is left to end on its
-        // own. It touches nothing of the home.
-        if let Some(resolvers) = self.resolvers.take() {
-            resolvers.join_within(RESOLVER_JOIN_LIMIT);
-        }
+        // A resolver still in a name lookup after the limit is waited for,
+        // below, with the home's lock held until it has ended.
+        let resolving = self
+            .resolvers
+            .take()
+            .map(|resolvers| resolvers.join_within(RESOLVER_JOIN_LIMIT))
+            .filter(|left| !left.is_empty());
         // The watcher ends at its next check, whether or not the host still
         // holds its signal sender.
         if let Some(watcher) = self.watcher.take() {
@@ -232,14 +251,50 @@ impl Lifecycle {
                 panicked = panicked.or(Some("signal watcher"));
             }
         }
+        // The handles stop, and their event streams end, so that the control
+        // commands that wait on them return.
         if let Some(handle) = self.handle.take() {
             handle.ended();
+        }
+        // The control socket's listener stops at its next look, and joins the
+        // commands it serves.
+        if let Some(control) = self.control.take() {
+            control.stop.store(true, Ordering::Release);
+            match control.thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::error!(target: "node", "The control socket's listener failed: {e}")
+                }
+                Err(_) => {
+                    log::error!(target: "node", "The control socket's listener panicked");
+                    panicked = panicked.or(Some("control"));
+                }
+            }
         }
         if let Some(socket) = self.socket.take() {
             socket.remove();
         }
-        self.lock = None;
+        let lock = self.lock.take();
+        if let Some(resolving) = resolving {
+            reap(resolving, lock);
+        }
         panicked
+    }
+}
+
+/// Waits for the resolvers still in a name lookup, on a thread of its own,
+/// and only then releases the home's `lock`: no other node takes the home
+/// while a lookup of this one's runs, and the node's own stop needn't wait
+/// for a resolver past its limit. The thread runs nothing of the node.
+fn reap(resolving: resolver::Workers, lock: Option<NodeLock>) {
+    let reaper = std::thread::Builder::new()
+        .name("node-reaper".to_owned())
+        .spawn(move || {
+            resolving.join();
+            drop(lock);
+        });
+    if let Err(e) = reaper {
+        log::error!(target: "node", "Unable to start a thread to wait for the resolvers: {e}");
     }
 }
 
@@ -558,7 +613,7 @@ impl Runtime {
         if life.resolvers.is_none() {
             return Err(io::Error::other("no resolver pool").into());
         }
-        let handle = Handle::new(home.clone(), socket, controller, emitter);
+        let handle = Handle::new(home.clone(), controller, emitter);
         life.handle = Some(handle.clone());
 
         let nid = NodeId::from(*secret_key.public_key());
@@ -626,10 +681,12 @@ impl Runtime {
         log::info!(target: "node", "Running node {} in {}..", id, home.path().display());
 
         if let Some(listener) = listener {
-            thread::spawn(&id, "control", {
-                let handle = handle.clone();
-                || control::listen(listener, handle)
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = thread::spawn(&id, "control", {
+                let (handle, stop) = (handle.clone(), stop.clone());
+                || control::listen(listener, handle, stop)
             });
+            life.control = Some(Control { stop, thread });
         }
 
         let watcher_stop = Arc::new(AtomicBool::new(false));
@@ -673,13 +730,6 @@ impl Runtime {
         // what is left of the node is stopped, and joined.
         let workers = life.pool.as_mut().map_or(Ok(()), worker::Pool::join);
         let ended = life.end();
-
-        // Nb. We don't join the control thread here, as we have no way of notifying it that the
-        // node is shutting down. With a control socket, its listener thread, and any thread
-        // serving a command, outlive `run`, as they always have; the binary exits once `run`
-        // returns. Without one, every thread `run` starts has been joined by now. A command
-        // still served reaches the node through its handle alone, which reaches nothing once
-        // the reactor has ended.
 
         log::debug!(target: "node", "Node shutdown completed for {id}");
 
