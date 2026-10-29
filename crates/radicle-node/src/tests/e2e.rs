@@ -3902,3 +3902,73 @@ fn test_a_control_socket_is_its_user_s_alone_whatever_the_umask() {
         "the socket was left behind"
     );
 }
+
+/// A dial gate that refuses every target, and counts those it was asked
+/// about.
+#[derive(Debug, Default)]
+struct Counting {
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+impl radicle::node::dial::Gate for Counting {
+    fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+        self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        false
+    }
+
+    fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+#[test]
+// Security R-12, part 3: a node with a static peer set and no `connect` peers
+// is isolated: it takes no bootstrap nodes, so Iris and Rosa never enter its
+// address book, and its dial gate never sees a target. One with a dynamic
+// peer set still takes them.
+fn test_a_static_node_with_no_peers_dials_no_one() {
+    use radicle::node::address::Store as _;
+    use radicle::node::config::{Network, PeerConfig};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bootstrap = Network::Main
+        .bootstrap()
+        .into_iter()
+        .flat_map(|(_, _, addrs)| addrs)
+        .map(|addr| <(radicle::node::NodeId, radicle::node::Address)>::from(addr).0)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!bootstrap.is_empty());
+
+    for (peers, alias, id) in [
+        (PeerConfig::Static, "isolated", 51),
+        (PeerConfig::Dynamic, "dynamic", 52),
+    ] {
+        let mut node = Node::init(tmp.path(), config::relay(alias), id);
+        node.config.network = Network::Main;
+        node.config.peers = peers.clone();
+        node.config.connect.clear();
+        let gate = std::sync::Arc::new(Counting::default());
+        let node = node.spawn_with_gate(gate.clone());
+        // Long enough for the service's first connection round.
+        thread::sleep(time::Duration::from_millis(1500));
+        let book = radicle::node::Database::reader(
+            node.home.node().join(radicle::node::NODE_DB_FILE),
+            radicle::node::db::config::Config::default(),
+        )
+        .unwrap();
+        let known = bootstrap
+            .iter()
+            .filter(|nid| book.get(nid).unwrap().is_some())
+            .count();
+        let seen = gate.seen.load(std::sync::atomic::Ordering::SeqCst);
+        node.shutdown();
+        match peers {
+            PeerConfig::Static => {
+                assert_eq!(known, 0, "an isolated node took bootstrap nodes");
+                assert_eq!(seen, 0, "an isolated node's gate saw {seen} target(s)");
+            }
+            PeerConfig::Dynamic => assert_eq!(known, bootstrap.len()),
+        }
+    }
+}
