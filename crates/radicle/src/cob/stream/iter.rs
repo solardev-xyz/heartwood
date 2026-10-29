@@ -131,24 +131,29 @@ where
     type Item = Result<Op<A>, error::Ops>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let commit = self.walk.next()?;
-        match commit {
-            Ok(commit) => {
-                let entry = crate::git::Oid::from(commit.id());
-                // N.b. mark this commit as seen, so that it is not walked again
-                self.walk.inner.hide(commit.id()).ok();
-                // Skip any Op that do not match the manifest
-                match self.load(entry) {
-                    Ok(entry) => entry.map(Ok).or_else(|| self.next()),
-                    Err(err) => match err {
-                        // This is a parent commit that is not an Op
-                        error::Ops::Manifest { source: _ } => self.next(),
-                        err => Some(Err(err)),
-                    },
+        // A loop rather than recursion over skipped commits, of which a
+        // peer's history can hold as many as it likes (Security R-20).
+        loop {
+            let commit = self.walk.next()?;
+            match commit {
+                Ok(commit) => {
+                    let entry = crate::git::Oid::from(commit.id());
+                    // N.b. mark this commit as seen, so that it is not walked again
+                    self.walk.inner.hide(commit.id()).ok();
+                    // Skip any Op that do not match the manifest
+                    match self.load(entry) {
+                        Ok(Some(op)) => return Some(Ok(op)),
+                        Ok(None) => continue,
+                        Err(err) => match err {
+                            // This is a parent commit that is not an Op
+                            error::Ops::Manifest { source: _ } => continue,
+                            err => return Some(Err(err)),
+                        },
+                    }
                 }
+                // Something was wrong with the commit
+                Err(err) => return Some(Err(error::Ops::Commit { source: err })),
             }
-            // Something was wrong with the commit
-            Err(err) => Some(Err(error::Ops::Commit { source: err })),
         }
     }
 }

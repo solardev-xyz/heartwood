@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Windows ]; then export RUST_TEST_THREADS=1; fi
-          cargo test --locked -p radicle -p radicle-node -p radicle-protocol -p radicle-signals
+          cargo test --locked -p radicle -p radicle-node -p radicle-protocol -p radicle-signals -p radicle-dag -p radicle-cob
       - name: cargo test (radicle-node, as libradicle builds it)
         shell: bash
         run: |
