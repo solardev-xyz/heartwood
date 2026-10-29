@@ -107,7 +107,8 @@ impl Keystore {
         comment: &str,
         passphrase: Option<Passphrase>,
     ) -> Result<(), Error> {
-        let keypair_bytes = keypair.to_keypair_bytes();
+        // Wiped once stored.
+        let keypair_bytes = Zeroizing::new(keypair.to_keypair_bytes());
         let ssh_pair = ssh_key::private::Ed25519Keypair::from_bytes(&keypair_bytes)?;
         let ssh_pair = ssh_key::private::KeypairData::Ed25519(ssh_pair);
         let secret = ssh_key::PrivateKey::new(ssh_pair, comment)?;
@@ -208,7 +209,11 @@ impl Keystore {
             secret
         };
         match secret.key_data() {
-            Ed25519(pair) => Ok(Some(SigningKey::try_from(pair.to_bytes())?)),
+            Ed25519(pair) => {
+                // The keypair's bytes are wiped once the key is made.
+                let bytes = Zeroizing::new(pair.to_bytes());
+                Ok(Some(SigningKey::from_keypair_bytes(&bytes)?))
+            }
             _ => Err(Error::InvalidKeyType),
         }
     }
