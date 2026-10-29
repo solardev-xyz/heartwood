@@ -124,32 +124,38 @@ pub struct InProgress {
 
 /// The version of `repo`: a hash over every ref's name and target. Any
 /// change to a ref changes it.
+///
+/// Each ref is taken as libgit2 stores it, none skipped: its name's bytes,
+/// UTF-8 or not, and its target, an object ID or, for a symbolic ref, the
+/// name it points at, unresolved. Each is length-prefixed, so that no two
+/// sets of refs hash the same text. A ref that is neither direct nor
+/// symbolic, or that libgit2 can't read, is an error.
 pub fn version(repo: &Repository) -> Result<Oid, Error> {
     let mut refs = Vec::new();
     for reference in repo.backend.references()? {
         let reference = reference?;
-        let Ok(name) = reference.name() else {
-            continue;
+        let name = reference.name_bytes().to_vec();
+        let target = if let Some(oid) = reference.target() {
+            [b"oid ".as_slice(), oid.as_bytes()].concat()
+        } else if let Some(symbolic) = reference.symbolic_target_bytes() {
+            [b"ref ".as_slice(), symbolic].concat()
+        } else {
+            return Err(Error::Invalid(format!(
+                "the ref {:?} has no target",
+                String::from_utf8_lossy(&name)
+            )));
         };
-        let target = reference
-            .resolve()
-            .ok()
-            .and_then(|resolved| resolved.target());
-        refs.push((
-            name.to_owned(),
-            target.map_or_else(|| "-".to_owned(), |oid| oid.to_string()),
-        ));
+        refs.push((name, target));
     }
     refs.sort();
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     for (name, target) in refs {
-        // A ref name has no space or line feed.
-        text.push_str(&name);
-        text.push(' ');
-        text.push_str(&target);
-        text.push('\n');
+        for field in [name, target] {
+            bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(&field);
+        }
     }
-    let hash = git::raw::Oid::hash_object(git::raw::ObjectType::Blob, text.as_bytes())?;
+    let hash = git::raw::Oid::hash_object(git::raw::ObjectType::Blob, &bytes)?;
     Ok(hash.into())
 }
 
@@ -503,8 +509,8 @@ mod tests {
     use super::*;
 
     use crate::crypto::{Signer as _, SigningKey};
-    use crate::storage::ReadStorage as _;
     use crate::storage::git::Storage;
+    use crate::storage::{ReadRepository as _, ReadStorage as _};
     use crate::test::{arbitrary, fixtures};
 
     fn rid() -> RepoId {
@@ -729,5 +735,77 @@ mod tests {
             )
             .unwrap();
         assert_ne!(version(&repo).unwrap(), added);
+    }
+
+    /// A project's repository in a new storage, and its signer's node ID.
+    fn project() -> (tempfile::TempDir, Repository, NodeId) {
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = SigningKey::mock(0xb4);
+        let storage = Storage::open(tmp.path().join("storage"), fixtures::user()).unwrap();
+        let (rid, _, _, _) =
+            fixtures::project(tmp.path().join("project"), &storage, &signer).unwrap();
+        let repo = storage.repository(rid).unwrap();
+        (tmp, repo, *signer.public_key())
+    }
+
+    // Review of heartwood #8, round 1: a ref whose name isn't UTF-8 is part of
+    // the version, so that a repair's finished steps don't hold once one is
+    // added.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ref_with_a_name_that_isn_t_utf_8_changes_the_version() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let (tmp, repo, nid) = project();
+        let mut state = State::open(tmp.path().join("cache.db")).unwrap();
+        let before = version(&repo).unwrap();
+        state.begin(&repo.id, before).unwrap();
+        state.finish(&repo.id, Step::Namespaces).unwrap();
+
+        // A loose ref under the namespace, named with a byte that isn't
+        // UTF-8, at a valid target.
+        let head = repo.backend.head().unwrap().target().unwrap();
+        let heads = repo
+            .path()
+            .join(format!("refs/namespaces/{nid}/refs/heads"));
+        std::fs::create_dir_all(&heads).unwrap();
+        std::fs::write(
+            heads.join(std::ffi::OsStr::from_bytes(b"caf\xe9")),
+            format!("{head}\n"),
+        )
+        .unwrap();
+        let after = version(&repo).unwrap();
+        assert_ne!(after, before);
+        assert!(state.begin(&repo.id, after).unwrap().is_empty());
+    }
+
+    // Review of heartwood #8, round 1: a symbolic ref is taken by the name it
+    // points at, unresolved: moved to another ref at the same commit, or left
+    // dangling, it changes the version, and is never an error.
+    #[test]
+    fn a_symbolic_ref_is_taken_by_the_name_it_points_at() {
+        let (_tmp, repo, nid) = project();
+        let head = repo.backend.head().unwrap().target().unwrap();
+        let name = |leaf: &str| format!("refs/namespaces/{nid}/refs/heads/{leaf}");
+        for leaf in ["one", "two"] {
+            repo.backend
+                .reference(&name(leaf), head, true, "test")
+                .unwrap();
+        }
+        repo.backend
+            .reference_symbolic(&name("link"), &name("one"), true, "test")
+            .unwrap();
+        let one = version(&repo).unwrap();
+        repo.backend
+            .reference_symbolic(&name("link"), &name("two"), true, "test")
+            .unwrap();
+        let two = version(&repo).unwrap();
+        assert_ne!(two, one);
+        repo.backend
+            .reference_symbolic(&name("link"), &name("gone"), true, "test")
+            .unwrap();
+        let dangling = version(&repo).unwrap();
+        assert_ne!(dangling, two);
+        assert_eq!(version(&repo).unwrap(), dangling);
     }
 }
