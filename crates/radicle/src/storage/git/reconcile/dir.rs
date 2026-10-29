@@ -112,6 +112,12 @@ mod imp {
             }
         }
 
+        /// Flushes it, so that the entries removed from it are removed on
+        /// disk.
+        pub fn sync(&self) -> io::Result<()> {
+            Ok(rustix::fs::fsync(&self.0)?)
+        }
+
         /// Removes everything in it.
         fn empty(&self) -> io::Result<()> {
             for name in self.names()? {
@@ -185,14 +191,36 @@ mod imp {
             Ok((self.kind(name)? == Some(Kind::Dir)).then(|| Self(self.0.join(name))))
         }
 
-        /// Removes its entry `name`, which isn't a directory. `false` if
-        /// there was none.
+        /// Removes its entry `name`, which isn't a directory: a link is
+        /// removed itself. `false` if there was none.
+        ///
+        /// A link to a directory, or a junction, is removed as a directory is
+        /// (`RemoveDirectoryW`), which removes the link and never its target:
+        /// a file's removal refuses it.
         pub fn remove_file(&self, name: &OsStr) -> io::Result<bool> {
-            match fs::remove_file(self.0.join(name)) {
+            let path = self.0.join(name);
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            let removed = if is_directory_link(&meta) {
+                fs::remove_dir(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            match removed {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(e),
             }
+        }
+
+        /// Flushes it, so that the entries removed from it are removed on
+        /// disk. A directory opened for writing, as a handle with backup
+        /// semantics, flushes with `FlushFileBuffers`.
+        pub fn sync(&self) -> io::Result<()> {
+            sync_dir(&self.0)
         }
 
         /// Removes its entry `name`, and everything in it, if, checked again
@@ -208,15 +236,53 @@ mod imp {
     }
 
     #[cfg(windows)]
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    #[cfg(windows)]
     fn is_reparse_point(meta: &fs::Metadata) -> bool {
         use std::os::windows::fs::MetadataExt as _;
 
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    /// Whether it is a reparse point that is a directory, a link to one or a
+    /// junction: not followed by `symlink_metadata`.
+    #[cfg(windows)]
+    fn is_directory_link(meta: &fs::Metadata) -> bool {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        let attributes = meta.file_attributes();
+        attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+
+    #[cfg(windows)]
+    fn sync_dir(path: &Path) -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+            .sync_all()
     }
 
     #[cfg(not(windows))]
     fn is_reparse_point(_: &fs::Metadata) -> bool {
         false
+    }
+
+    #[cfg(not(windows))]
+    fn is_directory_link(_: &fs::Metadata) -> bool {
+        false
+    }
+
+    #[cfg(not(windows))]
+    fn sync_dir(_: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no directory flush on this platform",
+        ))
     }
 }
