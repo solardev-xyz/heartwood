@@ -36,6 +36,10 @@ pub enum Error {
     Sql(#[from] sql::Error),
     #[error("invalid quarantine record: {0}")]
     Invalid(String),
+    #[error("no record ID from the operating system's random generator: {0}")]
+    Random(getrandom::Error),
+    #[error("a new record's ID, {0}, is another record's: nothing was recorded")]
+    Collision(Qid),
 }
 
 /// Why reconciliation couldn't repair a repository.
@@ -83,10 +87,17 @@ impl FromStr for Kind {
 pub struct Qid(u128);
 
 impl Qid {
-    /// A new ID. Unique, not secret: it is drawn from the process's
-    /// randomly seeded generator.
-    fn random() -> Self {
-        Self(fastrand::u128(..))
+    /// A new ID: 128 bits from the operating system's cryptographic
+    /// generator, independent of any generator the process seeds, so that no
+    /// two records share one, even across a removal.
+    fn random() -> Result<Self, Error> {
+        #[cfg(test)]
+        if let Some(qid) = tests::NEXT_QID.take() {
+            return Ok(Self(qid));
+        }
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(Error::Random)?;
+        Ok(Self(u128::from_be_bytes(bytes)))
     }
 }
 
@@ -154,7 +165,8 @@ impl Quarantine {
     }
 
     /// Quarantines `rid`, unless it is already: its record either way. A
-    /// repository already quarantined keeps its first record.
+    /// repository already quarantined keeps its first record. A new record's
+    /// ID that another record holds is refused, with nothing recorded.
     pub fn quarantine(
         &mut self,
         rid: RepoId,
@@ -165,13 +177,21 @@ impl Quarantine {
         since: LocalTime,
     ) -> Result<Record, Error> {
         transaction(&self.db, |db| {
+            if let Some(record) = get(db, &rid)? {
+                return Ok(record);
+            }
+            let qid = Qid::random()?;
+            let mut stmt = db.prepare("SELECT 1 FROM quarantine WHERE qid = ?1")?;
+            stmt.bind((1, qid.to_string().as_str()))?;
+            if stmt.next()? == sql::State::Row {
+                return Err(Error::Collision(qid));
+            }
             let mut stmt = db.prepare(
                 "INSERT INTO quarantine (rid, qid, kind, step, unit, evidence, since)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT (rid) DO NOTHING",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             stmt.bind((1, &rid))?;
-            stmt.bind((2, Qid::random().to_string().as_str()))?;
+            stmt.bind((2, qid.to_string().as_str()))?;
             stmt.bind((3, kind.as_str()))?;
             stmt.bind((4, step))?;
             stmt.bind((5, unit))?;
@@ -294,7 +314,8 @@ pub enum RemoveError {
 ///
 /// 1. it unseeds the repository, in `policies`;
 /// 2. it deletes `storage/<rid>`, following no links (a link of that name is
-///    removed itself);
+///    removed itself, a junction included), and flushes the storage
+///    directory, so that the deletion is on disk;
 /// 3. it deletes the repository's rows of the COB cache, `cache`;
 /// 4. it clears the record.
 ///
@@ -320,6 +341,9 @@ pub fn remove_repo(
     if !root.remove_tree(name)? {
         root.remove_file(name)?;
     }
+    // The record keeps the repository out until the deletion is on disk: a
+    // flush that fails leaves it, for the removal to be run again.
+    sync(&root)?;
 
     cob::cache::Remove::<cob::issue::Issue>::remove_all(cache, &rid)?;
     cob::cache::Remove::<cob::patch::Patch>::remove_all(cache, &rid)?;
@@ -328,9 +352,27 @@ pub fn remove_repo(
     Ok(Removal::Removed)
 }
 
+/// Flushes the storage directory `root`.
+fn sync(root: &Dir) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_SYNC.get() {
+        return Err(std::io::Error::other("the flush failed (test)"));
+    }
+    root.sync()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        /// The ID the next record takes, if set.
+        pub(super) static NEXT_QID: Cell<Option<u128>> = const { Cell::new(None) };
+        /// Whether flushing the storage directory fails.
+        pub(super) static FAIL_SYNC: Cell<bool> = const { Cell::new(false) };
+    }
 
     use crate::cob::cache::migrate;
     use crate::node::policy::Scope;
@@ -420,7 +462,7 @@ mod tests {
 
     #[test]
     fn a_qid_reads_back_as_written() {
-        let qid = Qid::random();
+        let qid = Qid::random().unwrap();
         assert_eq!(qid.to_string().len(), 32);
         assert_eq!(qid.to_string().parse::<Qid>().unwrap(), qid);
         assert!("0123".parse::<Qid>().is_err());
@@ -542,7 +584,7 @@ mod tests {
     fn a_removal_takes_its_record_s_qid() {
         let (mut f, neighbour) = removing();
         // Another qid: nothing is removed.
-        assert_eq!(f.remove(Qid::random()), Removal::NotQuarantined);
+        assert_eq!(f.remove(Qid::random().unwrap()), Removal::NotQuarantined);
         assert!(f.intact(&f.rid));
         assert_eq!(f.quarantine.get(&f.rid).unwrap(), Some(f.record.clone()));
 
@@ -622,5 +664,108 @@ mod tests {
         assert_eq!(f.remove(f.record.qid), Removal::Removed);
         assert!(std::fs::symlink_metadata(&name).is_err());
         assert!(outside.path().join("kept").exists());
+    }
+
+    // Review of heartwood #8, round 1: the process's own generator has no
+    // part in a record's ID. Seeded alike just before each record, it gives
+    // two records two IDs.
+    #[test]
+    fn two_records_never_share_a_qid_whatever_the_process_s_generator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Quarantine::open(tmp.path().join(QUARANTINE_DB_FILE)).unwrap();
+        let (a, b) = (rid(), rid());
+        let since = LocalTime::now();
+        fastrand::seed(0x5eed);
+        let first = db
+            .quarantine(a, Kind::Cache, "cache", None, "", since)
+            .unwrap();
+        fastrand::seed(0x5eed);
+        let second = db
+            .quarantine(b, Kind::Cache, "cache", None, "", since)
+            .unwrap();
+        assert_ne!(first.qid, second.qid);
+    }
+
+    // Review of heartwood #8, round 1: a new record's ID that another record
+    // holds is refused, and nothing is recorded or replaced.
+    #[test]
+    fn a_qid_another_record_holds_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Quarantine::open(tmp.path().join(QUARANTINE_DB_FILE)).unwrap();
+        let (a, b) = (rid(), rid());
+        NEXT_QID.set(Some(7));
+        let first = db
+            .quarantine(a, Kind::Cache, "cache", None, "", LocalTime::now())
+            .unwrap();
+        assert_eq!(first.qid, Qid(7));
+        NEXT_QID.set(Some(7));
+        assert!(matches!(
+            db.quarantine(b, Kind::Cache, "cache", None, "", LocalTime::now()),
+            Err(Error::Collision(Qid(7)))
+        ));
+        assert_eq!(db.get(&b).unwrap(), None);
+        assert_eq!(db.get(&a).unwrap(), Some(first));
+        // Drawn from the operating system, IDs differ.
+        let second = db
+            .quarantine(b, Kind::Cache, "cache", None, "", LocalTime::now())
+            .unwrap();
+        assert_ne!(second.qid, Qid(7));
+    }
+
+    // Review of heartwood #8, round 1: the record stays until the deletion of
+    // the repository's directory is on disk.
+    #[test]
+    fn a_removal_keeps_its_record_until_the_storage_directory_is_flushed() {
+        let (mut f, neighbour) = removing();
+        FAIL_SYNC.set(true);
+        let result = remove_repo(
+            &mut f.quarantine,
+            &mut f.policies,
+            &f.storage,
+            &mut f.cache,
+            f.rid,
+            f.record.qid,
+        );
+        FAIL_SYNC.set(false);
+        assert!(matches!(result, Err(RemoveError::Io(_))), "{result:?}");
+        assert_eq!(f.quarantine.get(&f.rid).unwrap(), Some(f.record.clone()));
+        assert_eq!(cache_rows(&f.cache, &f.rid), 2);
+        // Run again, it completes.
+        assert_eq!(f.remove(f.record.qid), Removal::Removed);
+        assert!(f.gone(&f.rid));
+        assert!(f.intact(&neighbour));
+    }
+
+    /// A junction at `link` to the directory `target`, as `mklink /J` makes
+    /// one, with no privilege.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J {}", link.display());
+    }
+
+    // Review of heartwood #8, round 1: a junction in the repository's place is
+    // removed itself, on Windows, and its target is left.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_the_repository_s_place_is_removed_itself() {
+        let (mut f, neighbour) = removing();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("kept"), b"x").unwrap();
+        let name = f.storage.join(f.rid.canonical());
+        std::fs::remove_dir_all(&name).unwrap();
+        junction(&name, outside.path());
+        assert_eq!(f.remove(f.record.qid), Removal::Removed);
+        assert!(std::fs::symlink_metadata(&name).is_err());
+        assert!(outside.path().join("kept").exists());
+        assert!(f.quarantine.get(&f.rid).unwrap().is_none());
+        assert!(f.intact(&neighbour));
     }
 }
