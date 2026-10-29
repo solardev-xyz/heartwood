@@ -221,7 +221,12 @@ impl Runtime {
         )?;
         let mut stores: service::Stores<_> = db.clone().into();
 
-        if config.connect.is_empty() && stores.addresses().is_empty()? {
+        // A node with a static peer set dials its `connect` peers alone: it
+        // takes no bootstrap nodes, so that one with none dials no one.
+        if matches!(config.peers, node::config::PeerConfig::Dynamic)
+            && config.connect.is_empty()
+            && stores.addresses().is_empty()?
+        {
             log::info!(target: "node", "Address book is empty. Adding bootstrap nodes..");
 
             for (alias, version, addrs) in config.network.bootstrap() {
