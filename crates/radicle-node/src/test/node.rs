@@ -491,12 +491,34 @@ impl Node {
     /// Spawn a node in its own thread.
     pub fn spawn(self) -> NodeHandle {
         let socket = self.home.socket_default();
-        self.spawn_with(Some(socket), std::sync::Arc::new(radicle::node::dial::Open))
+        self.spawn_with(
+            Some(socket),
+            std::sync::Arc::new(radicle::node::dial::Open),
+            radicle::node::gate::RepoGate::new(),
+        )
     }
 
     /// Spawn a node in its own thread, with no control socket: only its handle controls it.
     pub fn spawn_without_control_socket(self) -> NodeHandle {
-        self.spawn_with(None, std::sync::Arc::new(radicle::node::dial::Open))
+        self.spawn_with(
+            None,
+            std::sync::Arc::new(radicle::node::dial::Open),
+            radicle::node::gate::RepoGate::new(),
+        )
+    }
+
+    /// Spawn a node in its own thread, consulting `repositories` before it
+    /// fetches, announces or serves a repository.
+    pub fn spawn_with_repositories(
+        self,
+        repositories: radicle::node::gate::RepoGate,
+    ) -> NodeHandle {
+        let socket = self.home.socket_default();
+        self.spawn_with(
+            Some(socket),
+            std::sync::Arc::new(radicle::node::dial::Open),
+            repositories,
+        )
     }
 
     /// Spawn a node in its own thread, dialling through `gate`.
@@ -505,13 +527,14 @@ impl Node {
         gate: std::sync::Arc<dyn radicle::node::dial::Gate>,
     ) -> NodeHandle {
         let socket = self.home.socket_default();
-        self.spawn_with(Some(socket), gate)
+        self.spawn_with(Some(socket), gate, radicle::node::gate::RepoGate::new())
     }
 
     fn spawn_with(
         self,
         socket: Option<PathBuf>,
         gate: std::sync::Arc<dyn radicle::node::dial::Gate>,
+        repositories: radicle::node::gate::RepoGate,
     ) -> NodeHandle {
         let alias = self.config.alias.clone();
 
@@ -525,6 +548,7 @@ impl Node {
             signals,
             self.secret_key.clone(),
             gate,
+            repositories,
         )
         .unwrap();
 

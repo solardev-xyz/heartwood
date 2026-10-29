@@ -3,6 +3,7 @@ use std::{collections::HashSet, fmt, sync::Arc, time};
 use radicle::crypto::PublicKey;
 use radicle::node::FetchResult;
 use radicle::node::Seeds;
+use radicle::node::gate::RepoState;
 use radicle::node::policy::Scope;
 use radicle::node::{Address, Alias, Config, ConnectOptions};
 use radicle::storage::refs;
@@ -110,6 +111,9 @@ pub enum Command {
     Block(NodeId, Responder<bool>),
     /// Query the internal service state.
     QueryState(Arc<QueryState>, SyncSender<Result<()>>),
+    /// A repository's state at the repository gate changed: the gate tells
+    /// the node, which runs what waited for it to open.
+    Gate(RepoId, RepoState),
 }
 
 impl Command {
@@ -218,6 +222,7 @@ impl fmt::Debug for Command {
             Self::Unfollow(id, _) => write!(f, "Unfollow({id})"),
             Self::Block(id, _) => write!(f, "Block({id})"),
             Self::QueryState { .. } => write!(f, "QueryState(..)"),
+            Self::Gate(rid, state) => write!(f, "Gate({rid}, {state})"),
         }
     }
 }
