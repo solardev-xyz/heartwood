@@ -5,7 +5,8 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 
 use cyphernet::encrypt::noise::NoiseState;
-use cyphernet::proxy::socks5;
+
+use super::socks5;
 
 use mio::event::Source;
 use mio::net::TcpStream;
@@ -216,9 +217,9 @@ mod impl_noise {
 }
 
 mod impl_socks5 {
-    use cyphernet::addr::{Host as _, HostName, NetAddr};
-    use cyphernet::proxy::socks5::{Error, Socks5};
+    use cyphernet::addr::{HostName, NetAddr};
 
+    use super::socks5::{Error, Socks5};
     use super::*;
 
     impl StateMachine for Socks5 {
@@ -235,12 +236,10 @@ mod impl_socks5 {
             self.advance(input)
         }
 
+        /// The session's peer, once the handshake is over, or at once for a
+        /// session with none.
         fn artifact(&self) -> Option<Self::Artifact> {
-            match self {
-                Socks5::Initial(addr, false) if !addr.requires_proxy() => Some(addr.clone()),
-                Socks5::Active(addr) => Some(addr.clone()),
-                _ => None,
-            }
+            self.target().cloned()
         }
     }
 }

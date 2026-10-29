@@ -12,7 +12,6 @@ use std::{io, net, time};
 use crossbeam_channel as chan;
 use cyphernet::addr::{HostName, InetHost, NetAddr};
 use cyphernet::encrypt::noise::{HandshakePattern, Keyset, NoiseState};
-use cyphernet::proxy::socks5;
 use cyphernet::{Digest, Sha256};
 use localtime::{LocalDuration, LocalTime};
 use mio::net::TcpStream;
@@ -35,6 +34,7 @@ use radicle::node::dial::Gate;
 use radicle::storage::WriteStorage;
 
 use crate::reactor;
+use crate::reactor::socks5;
 use crate::reactor::{Listener, Transport};
 use crate::reactor::{NoiseSession, ProtocolArtifact, SessionEvent, Socks5Session};
 use crate::reactor::{Token, Tokens};
@@ -365,6 +365,53 @@ pub(crate) struct Wire<D, S> {
     next_resolution: u64,
     /// The error the service stopped the node with, once it has.
     stopped: Stopped,
+    /// The secret its SOCKS5 credentials are derived from, per remote node.
+    isolation: Isolation,
+}
+
+/// Stream isolation per remote node, through a SOCKS5 proxy: each remote
+/// node gets credentials of its own (RFC 1929), so that a proxy that isolates
+/// streams by their credentials, as Tor's Arti does, keeps each peer's
+/// connections on circuits apart from every other peer's.
+///
+/// Each password is derived from the remote's node ID and a secret of the
+/// node's own, made from the operating system's generator as the node starts
+/// and never written: the proxy can't tell from it which node a connection
+/// is for, nor link one run's passwords to another's.
+#[derive(Clone)]
+struct Isolation {
+    secret: [u8; Isolation::SECRET_LEN],
+}
+
+impl Isolation {
+    /// 128 bits.
+    const SECRET_LEN: usize = 16;
+    /// The username every connection gives.
+    const USERNAME: &'static str = "radicle";
+
+    fn new() -> Self {
+        let mut secret = [0; Self::SECRET_LEN];
+        getrandom::fill(&mut secret).expect("failed get random bytes from the operating system");
+        Self { secret }
+    }
+
+    /// The credentials for connections to `nid`: HMAC-SHA-256 of its node
+    /// ID, under the node's secret, in hexadecimal.
+    fn credentials(&self, nid: &NodeId) -> socks5::Credentials {
+        use hmac::Mac as _;
+
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&self.secret)
+            .expect("HMAC takes a key of any length");
+        mac.update(nid.as_ref());
+        let password = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        socks5::Credentials::new(Self::USERNAME, password)
+            .expect("a fixed username and a 64-character password are within bounds")
+    }
 }
 
 impl<D, S> Wire<D, S>
@@ -398,6 +445,7 @@ where
             resolving: HashMap::new(),
             next_resolution: 0,
             stopped,
+            isolation: Isolation::new(),
         }
     }
 
@@ -504,7 +552,13 @@ where
             let err = io::Error::other("a dial needs a resolved route");
             return self.dial_failed(nid, &addr, DialFailure::Local(err));
         }
-        match dial(route, nid, self.secret_key.clone())
+        // Through a proxy, a gate that asks for it gets each remote node's
+        // connections isolated from every other's.
+        let credentials = self
+            .gate
+            .isolates_streams()
+            .then(|| self.isolation.credentials(&nid));
+        match dial(route, nid, self.secret_key.clone(), credentials)
             .and_then(Transport::<WireSession>::with_session)
         {
             Ok(transport) => {
@@ -1468,11 +1522,13 @@ fn checked(
 }
 
 /// Establish a new outgoing connection, along `route`, which must be a
-/// [`Route::Connect`].
+/// [`Route::Connect`]. Through a proxy, it authenticates with `credentials`,
+/// if there are any, and with no authentication otherwise.
 fn dial(
     route: Route,
     remote_id: crypto::PublicKey,
     signer: crypto::SigningKey,
+    credentials: Option<socks5::Credentials>,
 ) -> io::Result<WireSession> {
     let Route::Connect { connect, socks } = route else {
         return Err(io::Error::other("a dial needs a resolved route"));
@@ -1490,21 +1546,12 @@ fn dial(
 
     // Through a proxy, the session asks it for `socks`; otherwise it talks to
     // the peer directly.
-    let (remote_addr, force_proxy) = match socks {
-        Some(socks) => (socks, true),
-        None => (
-            NetAddr::new(HostName::Ip(connect.ip()), connect.port()),
-            false,
-        ),
+    let socks = match socks {
+        Some(socks) => socks5::Socks5::through(socks, credentials),
+        None => socks5::Socks5::direct(NetAddr::new(HostName::Ip(connect.ip()), connect.port())),
     };
 
-    Ok(session(
-        remote_addr,
-        Some(remote_id),
-        connection,
-        force_proxy,
-        signer,
-    ))
+    Ok(session(socks, Some(remote_id), connection, signer))
 }
 
 /// Accept a new connection.
@@ -1513,15 +1560,20 @@ pub fn accept(
     connection: TcpStream,
     secret_key: crypto::SigningKey,
 ) -> WireSession {
-    session(remote_addr, None, connection, false, secret_key)
+    session(
+        socks5::Socks5::direct(remote_addr),
+        None,
+        connection,
+        secret_key,
+    )
 }
 
-/// Create a new [`WireSession`].
+/// Create a new [`WireSession`], with `socks` as its SOCKS5 handshake, or
+/// none.
 fn session(
-    remote_addr: NetAddr<HostName>,
+    socks: socks5::Socks5,
     remote_id: Option<crypto::VerifyingKey>,
     connection: TcpStream,
-    force_proxy: bool,
     secret_key: crypto::SigningKey,
 ) -> WireSession {
     if let Err(e) = connection.set_nodelay(true) {
@@ -1589,10 +1641,7 @@ fn session(
 
     let connection = TcpStream::from_std(connection);
 
-    let proxy = {
-        let socks5 = socks5::Socks5::with(remote_addr, force_proxy);
-        Socks5Session::new(connection, socks5)
-    };
+    let proxy = Socks5Session::new(connection, socks);
 
     let mut random = [0; 32];
     getrandom::fill(&mut random).expect("failed get random bytes from the operating system");
@@ -1800,6 +1849,32 @@ mod test {
         }
     }
 
+    // Security R-12, part 4: each remote node gets SOCKS5 credentials of its
+    // own, the same each time within a run, and the password, derived under
+    // the node's secret, tells nothing of the node ID it is for.
+    #[test]
+    fn each_remote_node_gets_credentials_of_its_own() {
+        let isolation = Isolation::new();
+        let [alice, bob] = [7, 9].map(|seed| *crypto::SigningKey::mock(seed).public_key());
+        let credentials = isolation.credentials(&alice);
+        assert_eq!(credentials.username(), b"radicle");
+        assert_eq!(credentials.password().len(), 64);
+        assert!(credentials.password().iter().all(u8::is_ascii_hexdigit));
+        assert_eq!(isolation.credentials(&alice), credentials);
+        assert_ne!(isolation.credentials(&bob), credentials);
+        // Another run's secret gives other passwords.
+        assert_ne!(Isolation::new().credentials(&alice), credentials);
+        // Not the node ID, in any form.
+        let password = String::from_utf8(credentials.password().to_vec()).unwrap();
+        let hex = alice
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(!password.contains(&hex[..16]));
+        assert!(!password.contains(&alice.to_human()));
+    }
+
     // Review of heartwood #4, round 1: with `Open`, an onion or I2P name
     // forwarded without a proxy takes exactly the route it always has: its
     // name is resolved, and the address it resolves to is asked for the name
@@ -1831,15 +1906,20 @@ mod test {
             };
             assert_eq!(connect, resolved);
             // What the node always sent: SOCKS to the resolved address, for
-            // the name.
-            let before = socks5::Socks5::with((*target).clone(), false)
-                .advance(&[])
-                .unwrap();
-            let after = socks5::Socks5::with(socks.expect("SOCKS"), true)
-                .advance(&[])
-                .unwrap();
-            assert_eq!(before, vec![5, 1, 0]);
-            assert_eq!(after, before, "{name}");
+            // the name, with no authentication.
+            let mut socks = socks5::Socks5::through(socks.expect("SOCKS"), None);
+            assert_eq!(socks.advance(&[]).unwrap(), vec![5, 1, 0]);
+            let host = name.rsplit_once(':').unwrap().0;
+            assert_eq!(
+                socks.advance(&[5, 0]).unwrap(),
+                [
+                    &[5, 1, 0, 3, host.len() as u8][..],
+                    host.as_bytes(),
+                    &8776u16.to_be_bytes()
+                ]
+                .concat(),
+                "{name}"
+            );
         }
     }
 
