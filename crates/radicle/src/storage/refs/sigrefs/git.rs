@@ -92,7 +92,8 @@ impl Committer {
 ///
 /// A value the parser refuses, or that isn't Unicode, is ignored with a
 /// warning, never a panic. A relative date ("2 days ago") is one, as it is
-/// for git there.
+/// for git there. So is a value the parser reads but git refuses
+/// ([`refused_by_git`]).
 #[cfg_attr(any(test, feature = "test"), allow(dead_code))]
 fn committer_time(value: Result<String, std::env::VarError>, now: u64) -> i64 {
     use crate::profile::env::GIT_COMMITTER_DATE;
@@ -111,13 +112,52 @@ fn committer_time(value: Result<String, std::env::VarError>, now: u64) -> i64 {
         return now;
     }
     // Git's `@` marks its raw format, or a Unix time, as one.
-    match gix_date::parse(date.strip_prefix('@').unwrap_or(date), None) {
+    let marked = date.strip_prefix('@').map(str::trim_start);
+    let date = marked.unwrap_or(date);
+    if let Some(refusal) = refused_by_git(date, marked.is_some()) {
+        log::warn!(target: "radicle", "Ignoring `{GIT_COMMITTER_DATE}`, whose value {value:?} git refuses: {refusal}");
+        return now;
+    }
+    match gix_date::parse(date, None) {
         Ok(time) => time.seconds,
         Err(e) => {
             log::warn!(target: "radicle", "Ignoring `{GIT_COMMITTER_DATE}`, whose value {value:?} isn't a date: {e}");
             now
         }
     }
+}
+
+/// Why git refuses `date`, a committer date that gix-date reads, with its
+/// `@` taken off (`marked`): a Unix time with a sign; one of fewer than nine
+/// digits, outside git's raw format (`@<seconds> <zone>`, whatever the
+/// seconds); and a date with no time.
+#[cfg_attr(any(test, feature = "test"), allow(dead_code))]
+fn refused_by_git(date: &str, marked: bool) -> Option<&'static str> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut fields = date.split_whitespace();
+    let first = fields.next()?;
+    let (zone, rest) = (fields.next(), fields.next());
+
+    let signed = |s: &str| s.len() > 1 && s.starts_with(['+', '-']) && digits(&s[1..]);
+
+    // A Unix time, alone or with a zone, as gix-date reads one.
+    let unsigned = first.strip_prefix(['+', '-']).unwrap_or(first);
+    if digits(unsigned) && rest.is_none() && zone.is_none_or(signed) {
+        if unsigned.len() != first.len() {
+            return Some("a time with a sign");
+        }
+        // Git's raw format: one space, then a zone of a sign and four digits.
+        let raw =
+            marked && zone.is_some_and(|zone| zone.len() == 5 && date == format!("{first} {zone}"));
+        if !raw && unsigned.len() < 9 {
+            return Some("a time of fewer than nine digits, outside git's raw format");
+        }
+        return None;
+    }
+    if zone.is_none() && date.split('-').count() == 3 && date.split('-').all(digits) {
+        return Some("a date with no time");
+    }
+    None
 }
 
 mod git2_impls {
@@ -320,6 +360,12 @@ mod committer_time_test {
             "@1112911993",
             "1112911993",
             " 1112911993 ",
+            "@ 1112911993",
+            "100000000 +0200",
+            "@100000000",
+            // Git's raw format takes any number of seconds.
+            "@1000 +0200",
+            "@0 +0000",
             // ISO 8601.
             "2005-04-07T22:13:13 +0200",
             "2005-04-07T22:13:13+02:00",
@@ -340,6 +386,24 @@ mod committer_time_test {
             "2 days ago",
             "@",
             "18446744073709551615",
+            // gix-date reads these, and git doesn't: a time with a sign, one
+            // of fewer than nine digits outside the raw format, and a date
+            // with no time.
+            "-1000",
+            "+0200",
+            "+1112911993",
+            "-1112911993",
+            "@-1000 +0000",
+            "0",
+            "1000",
+            "99999999",
+            "@1000",
+            "@99999999",
+            "1000 +0200",
+            "99999999 +0200",
+            "@1000  +0200",
+            "2005-04-07",
+            "2005-4-7",
         ];
         for date in read {
             let git = git_time(date).unwrap_or_else(|| panic!("git refuses {date:?}"));
