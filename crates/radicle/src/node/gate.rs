@@ -40,7 +40,29 @@ pub enum RepoState {
     Quarantined(Quarantine),
 }
 
+/// What a [`Pass`] admits: closing a repository waits for the passes its new
+/// state no longer lets through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Purpose {
+    /// One of the node's mutations of it: a fetch with its cache update, or
+    /// a migration of its signed refs. Only while it is open.
+    Mutate,
+    /// Serving it to a peer, while its state serves.
+    Serve,
+    /// Announcing its refs, while its state announces.
+    Announce,
+}
+
 impl RepoState {
+    /// Whether it lets a pass for `purpose` through.
+    pub fn permits(&self, purpose: Purpose) -> bool {
+        match purpose {
+            Purpose::Mutate => self.fetches(),
+            Purpose::Serve => self.serves(),
+            Purpose::Announce => self.announces(),
+        }
+    }
+
     pub fn is_open(&self) -> bool {
         matches!(self, Self::Open)
     }
@@ -77,10 +99,11 @@ impl fmt::Display for RepoState {
     }
 }
 
-/// The node's mutations of a repository still under way when the gate was
-/// asked to close it: the host can't repair it yet.
+/// The node's work on a repository still under way, that its new state
+/// doesn't let through, when the gate was asked to close it: the host can't
+/// count on the new state yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{rid} still has {passes} mutation(s) under way")]
+#[error("{rid} still has {passes} operation(s) under way")]
 pub struct Busy {
     pub rid: RepoId,
     pub passes: usize,
@@ -91,8 +114,8 @@ type Listener = Box<dyn Fn(RepoId, RepoState) + Send + Sync>;
 #[derive(Default)]
 struct Repositories {
     states: HashMap<RepoId, RepoState>,
-    /// The passes held, per repository.
-    passes: HashMap<RepoId, usize>,
+    /// The passes held, per repository and purpose.
+    passes: HashMap<(RepoId, Purpose), usize>,
 }
 
 #[derive(Default)]
@@ -141,37 +164,50 @@ impl RepoGate {
     }
 
     /// A pass for one of the node's mutations of `rid`: a fetch, with its
-    /// cache update. `None` unless `rid` is open. Closing `rid` waits for the
-    /// passes held to drop.
+    /// cache update. `None` unless `rid` is open.
     pub fn enter(&self, rid: RepoId) -> Option<Pass> {
+        self.admit(rid, Purpose::Mutate)
+    }
+
+    /// A pass for `purpose` on `rid`, held for as long as the work it admits
+    /// runs: `None` unless `rid`'s state lets it through. The check and the
+    /// work it admits are one, as far as [`RepoGate::close`] can tell: a
+    /// close waits for the passes its state doesn't let through.
+    pub fn admit(&self, rid: RepoId, purpose: Purpose) -> Option<Pass> {
         let mut repositories = self.inner.lock();
         if !repositories
             .states
             .get(&rid)
             .copied()
             .unwrap_or_default()
-            .is_open()
+            .permits(purpose)
         {
             return None;
         }
-        *repositories.passes.entry(rid).or_default() += 1;
+        *repositories.passes.entry((rid, purpose)).or_default() += 1;
         Some(Pass {
             inner: self.inner.clone(),
             rid,
+            purpose,
         })
     }
 
     /// Closes `rid` with `state`, being repaired or quarantined: from now on,
-    /// no pass for it is given. Then waits, up to `timeout`, for the passes
-    /// already held to drop: `Busy` if some are still held. Either way, `rid`
-    /// stays closed.
+    /// it lets through only the passes `state` permits. Then waits, up to
+    /// `timeout`, for the passes already held that `state` doesn't permit to
+    /// drop: `Busy` if some are still held. Either way, `rid` stays closed.
     pub fn close(&self, rid: RepoId, state: RepoState, timeout: Duration) -> Result<(), Busy> {
         let deadline = Instant::now() + timeout;
         {
             let mut repositories = self.inner.lock();
             repositories.states.insert(rid, state);
             loop {
-                let passes = repositories.passes.get(&rid).copied().unwrap_or(0);
+                let passes = repositories
+                    .passes
+                    .iter()
+                    .filter(|((r, purpose), _)| *r == rid && !state.permits(*purpose))
+                    .map(|(_, passes)| passes)
+                    .sum::<usize>();
                 if passes == 0 {
                     break;
                 }
@@ -224,26 +260,31 @@ impl RepoGate {
     }
 }
 
-/// A mutation of a repository under way: closing the repository waits for it
-/// to drop.
+/// Work on a repository under way, admitted for its purpose: closing the
+/// repository to a state that doesn't permit it waits for it to drop.
 pub struct Pass {
     inner: Arc<Inner>,
     rid: RepoId,
+    purpose: Purpose,
 }
 
 impl fmt::Debug for Pass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Pass").field("rid", &self.rid).finish()
+        f.debug_struct("Pass")
+            .field("rid", &self.rid)
+            .field("purpose", &self.purpose)
+            .finish()
     }
 }
 
 impl Drop for Pass {
     fn drop(&mut self) {
         let mut repositories = self.inner.lock();
-        if let Some(passes) = repositories.passes.get_mut(&self.rid) {
+        let key = (self.rid, self.purpose);
+        if let Some(passes) = repositories.passes.get_mut(&key) {
             *passes = passes.saturating_sub(1);
             if *passes == 0 {
-                repositories.passes.remove(&self.rid);
+                repositories.passes.remove(&key);
             }
         }
         drop(repositories);
@@ -358,5 +399,42 @@ mod test {
                 (rid, quarantined)
             ]
         );
+    }
+
+    // Review of heartwood #7, round 1: serving and announcing are fenced like
+    // mutations, each by the states that don't let them through. A close
+    // waits for exactly those passes.
+    #[test]
+    fn closing_waits_for_the_passes_its_state_doesn_t_let_through() {
+        let gate = RepoGate::new();
+        let rid = arbitrary::r#gen::<RepoId>(1);
+        let serve = gate.admit(rid, Purpose::Serve).unwrap();
+        let announce = gate.admit(rid, Purpose::Announce).unwrap();
+        let zero = Duration::ZERO;
+
+        // Quarantined for its cache, it is still served and announced.
+        let cache = RepoState::Quarantined(Quarantine::Cache);
+        assert_eq!(gate.close(rid, cache, zero), Ok(()));
+        assert!(gate.admit(rid, Purpose::Serve).is_some());
+        assert!(gate.admit(rid, Purpose::Announce).is_some());
+        assert!(gate.admit(rid, Purpose::Mutate).is_none());
+        // Being repaired, it is served, but not announced.
+        assert_eq!(
+            gate.close(rid, RepoState::Repairing, zero),
+            Err(Busy { rid, passes: 1 })
+        );
+        assert!(gate.admit(rid, Purpose::Serve).is_some());
+        assert!(gate.admit(rid, Purpose::Announce).is_none());
+        drop(announce);
+        assert_eq!(gate.close(rid, RepoState::Repairing, zero), Ok(()));
+        // Quarantined for a namespace, it is neither.
+        let namespace = RepoState::Quarantined(Quarantine::Namespace);
+        assert_eq!(
+            gate.close(rid, namespace, zero),
+            Err(Busy { rid, passes: 1 })
+        );
+        assert!(gate.admit(rid, Purpose::Serve).is_none());
+        drop(serve);
+        assert_eq!(gate.close(rid, namespace, zero), Ok(()));
     }
 }

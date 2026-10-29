@@ -30,7 +30,7 @@ use radicle::node::address::Store as _;
 use radicle::node::address::{AddressBook, AddressType, KnownAddress};
 use radicle::node::config::{PeerConfig, RateLimit};
 use radicle::node::dial;
-use radicle::node::gate::{RepoGate, RepoState};
+use radicle::node::gate::{Purpose, RepoGate, RepoState};
 use radicle::node::refs::Store as _;
 use radicle::node::routing::Store as _;
 use radicle::node::seed;
@@ -485,8 +485,17 @@ where
         let mut private = BTreeSet::new();
 
         for repo in self.storage.repositories()? {
-            let repo = self.upgrade_sigrefs(repo)?;
             let rid = repo.rid;
+            // A repository the gate closes to mutation isn't migrated: it is,
+            // at the next start that finds it open. The migration holds the
+            // gate's pass.
+            let repo = match self.repositories.enter(rid) {
+                Some(_pass) => self.upgrade_sigrefs(repo)?,
+                None => {
+                    debug!(target: "service", "Not migrating {rid}: it is {}", self.repositories.state(&rid));
+                    repo
+                }
+            };
 
             // If we're not seeding this repo, just skip it.
             if !self.policies.is_seeding(&rid)? {
@@ -521,6 +530,15 @@ where
             // If we got here, it likely means a repo was updated while the node was stopped.
             // Therefore, we pre-load a refs announcement for this repo, so that it is included in
             // the historical gossip messages when a node connects and subscribes to this repo.
+            // One the gate holds back isn't: being repaired, it is announced once it opens.
+            let Some(_pass) = self.repositories.admit(rid, Purpose::Announce) else {
+                if self.repositories.state(&rid) == RepoState::Repairing {
+                    let (namespaces, own) = self.deferred_announcements.entry(rid).or_default();
+                    namespaces.insert(nid);
+                    *own = true;
+                }
+                continue;
+            };
             if let Ok((ann, _)) = self.refs_announcement_for(rid, [nid]) {
                 debug!(target: "service", "Adding refs announcement for {rid} to historical gossip messages..");
                 self.db.gossip_mut().announced(&nid, &ann)?;
@@ -530,9 +548,13 @@ where
         // Ensure that our inventory is recorded in our routing table, and we are seeding
         // all of it. It can happen that inventory is not properly seeded if for eg. the
         // user creates a new repository while the node is stopped.
+        //
+        // The routing table keeps every one; the inventory the node announces leaves out
+        // those the repository gate quarantines for a namespace, until they open.
         self.db
             .routing_mut()
             .add_inventory(inventory.iter(), nid, time.into())?;
+        inventory.retain(|rid| self.repositories.state(rid).inventoried());
         self.inventory = gossip::inventory(self.timestamp(), inventory);
 
         // Ensure that private repositories are not in our inventory. It's possible that
@@ -1308,16 +1330,17 @@ where
             }
             fetcher::state::event::Fetched::Completed { from, rid, refs: _ } => {
                 // The repository closed after the fetch was sent to a worker:
-                // being repaired, the fetch waits for it to open again.
-                if let Err(crate::worker::FetchError::Closed { .. }) = &result
-                    && self.repositories.state(&rid) == RepoState::Repairing
-                {
+                // the fetch goes through the gate again, whatever its state is
+                // by now. Open again, it starts; being repaired, it waits;
+                // quarantined, it fails. Each of its responders is answered
+                // once, by that fetch.
+                if let Err(crate::worker::FetchError::Closed { .. }) = &result {
                     let config = self.fetch_config();
                     if subscribers.is_empty() {
-                        self.defer_fetch(rid, from, vec![], config, None);
+                        self.fetch(rid, from, vec![], config, None);
                     }
                     for responder in subscribers {
-                        self.defer_fetch(rid, from, vec![], config, Some(responder));
+                        self.fetch(rid, from, vec![], config, Some(responder));
                     }
                     return;
                 }
@@ -2476,8 +2499,10 @@ where
         remotes: impl IntoIterator<Item = NodeId>,
         own: bool,
     ) -> Result<(Vec<RefsAt>, Timestamp), Error> {
-        let state = self.repositories.state(&rid);
-        if !state.announces() {
+        // The repository gate's pass, held until the announcement is queued:
+        // a close to a state that doesn't announce waits for it.
+        let Some(_pass) = self.repositories.admit(rid, Purpose::Announce) else {
+            let state = self.repositories.state(&rid);
             // Being repaired, it is announced once it opens again.
             if state == RepoState::Repairing {
                 let (namespaces, any_own) = self.deferred_announcements.entry(rid).or_default();
@@ -2485,7 +2510,7 @@ where
                 *any_own |= own;
             }
             return Err(Error::Gated { rid, state });
-        }
+        };
         let (ann, refs) = self.refs_announcement_for(rid, remotes)?;
         let timestamp = ann.timestamp();
         let peers = self.sessions.connected().map(|(_, p)| p);

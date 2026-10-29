@@ -2701,3 +2701,44 @@ fn gate_leaves_a_namespace_quarantine_out_of_the_inventory() {
     amy.command(Command::Gate(rid, RepoState::Open));
     assert!(last(&mut amy).unwrap().contains(&rid));
 }
+
+#[test]
+// Review of heartwood #7, round 1: a fetch a worker found closed goes through
+// the gate again when its result comes back, whatever the state is by then.
+// Reopened before the result arrives, the fetch runs at once, and its
+// responder is answered once.
+fn gate_a_fetch_found_closed_runs_again_once_reopened() {
+    let storage = arbitrary::nonempty_storage(1);
+    let rid = *storage.repos.keys().next().unwrap();
+    let doc = storage.repos.get(&rid).unwrap().doc.clone();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+
+    let (cmd, result) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    let repairing = node::gate::RepoState::Repairing;
+    gate.close(rid, repairing, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, repairing));
+    // It opens again before the worker's result comes back.
+    gate.open(rid);
+    amy.command(Command::Gate(rid, node::gate::RepoState::Open));
+    amy.fetched(
+        rid,
+        *bob.nid(),
+        Err(protocol::worker::FetchError::Closed {
+            rid,
+            state: repairing,
+        }),
+    );
+    assert!(
+        result.try_recv().is_err(),
+        "the fetch failed instead of running again"
+    );
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    amy.fetched(rid, *bob.nid(), Ok(FetchResult::new(doc)));
+    assert_matches!(result.try_recv(), Ok(Ok(node::FetchResult::Success { .. })));
+    assert!(result.try_recv().is_err(), "answered twice");
+}
