@@ -37,7 +37,24 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
-ignore = []
+#
+# Both come in through ssh-agent-lib 0.6, which turns on every algorithm
+# ssh-key 0.6 has (its `crypto` feature): RSA, and ECDSA over P-256, P-384
+# and P-521, which elliptic-curve 0.13 builds on crypto-bigint 0.5. Neither
+# can be turned off from here. heartwood makes no private-key operation
+# with them: its keys are Ed25519, the keystore refuses a key of another
+# type (`Error::InvalidKeyType`) once it has read it, and the agent is asked
+# to register and sign with Ed25519 keys only. Reading another type's key
+# file only decodes its numbers; none of rsa's or elliptic-curve's
+# arithmetic runs on them.
+ignore = [
+    # rsa, the Marvin attack: its private-key operations aren't constant
+    # time. No release fixes it.
+    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operation in heartwood; no fixed release" },
+    # crypto-bigint, timing variability: fixed from 0.7.6 only, which
+    # elliptic-curve 0.13 can't use.
+    { id = "RUSTSEC-2026-0387", reason = "no ECDSA private-key operation in heartwood; crypto-bigint 0.5 has no fix" },
+]
 
 # This section is considered when running `cargo deny check licenses`
 [licenses]
