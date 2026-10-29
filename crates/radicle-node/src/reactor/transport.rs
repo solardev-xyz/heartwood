@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt::{Debug, Display, Formatter};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, io};
 
 use mio::event::{Event, Source};
@@ -61,6 +63,9 @@ pub struct Transport<S: Session> {
     write_intent: bool,
     read_buffer: Box<[u8; READ_BUFFER_SIZE]>,
     write_buffer: VecDeque<u8>,
+    /// How many bytes `write_buffer` holds, shared with the handler, so that
+    /// it can hold back what it would add to a buffer already full.
+    buffered: Arc<AtomicUsize>,
 }
 
 impl<S: Session> std::fmt::Debug for Transport<S> {
@@ -131,7 +136,14 @@ impl<S: Session> Transport<S> {
             write_intent: true,
             read_buffer: Box::new([0u8; READ_BUFFER_SIZE]),
             write_buffer: VecDeque::new(),
+            buffered: Arc::default(),
         })
+    }
+
+    /// How many bytes its write buffer holds, as it changes: what is buffered
+    /// and not yet written to the session.
+    pub fn buffered(&self) -> Arc<AtomicUsize> {
+        self.buffered.clone()
     }
 
     pub fn display(&self) -> impl Display {
@@ -275,6 +287,8 @@ impl<S: Session> Transport<S> {
         );
 
         self.write_intent = n > written.n;
+        self.buffered
+            .store(self.write_buffer.len(), Ordering::Relaxed);
 
         if self.write_intent {
             log::debug!(target: "transport", "Resource {} was able to consume only a part of the buffered data ({} of {n} bytes)", written.n, self.display());
@@ -361,6 +375,78 @@ impl<S: Session> super::BufferWrite for Transport<S> {
         }
 
         self.write_buffer.extend(buf);
+        self.buffered
+            .store(self.write_buffer.len(), Ordering::Relaxed);
         self.write_intent = true;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod test {
+    use std::io::{Read, Write};
+
+    use super::super::BufferWrite as _;
+    use super::*;
+
+    /// A session that takes at most `accept` bytes a write, then blocks.
+    struct Slow {
+        accept: usize,
+        written: Vec<u8>,
+    }
+
+    impl Read for Slow {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+    }
+
+    impl Write for Slow {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.accept == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(self.accept);
+            self.accept -= n;
+            self.written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Session for Slow {
+        type Artifact = String;
+
+        fn artifact(&self) -> Option<String> {
+            Some("slow".to_owned())
+        }
+    }
+
+    // Security R-10: the handler sees how much a transport has buffered, as
+    // it is buffered and as it is written.
+    #[test]
+    fn its_buffered_bytes_follow_its_write_buffer() {
+        let mut transport = Transport::with_session(Slow {
+            accept: 300,
+            written: Vec::new(),
+        })
+        .unwrap();
+        let buffered = transport.buffered();
+        assert_eq!(buffered.load(Ordering::Relaxed), 0);
+        transport.buffer_write(&[1; 1_000]);
+        assert_eq!(buffered.load(Ordering::Relaxed), 1_000);
+
+        let mut events = Vec::new();
+        transport.handle_writable(&mut events);
+        assert!(events.is_empty());
+        assert_eq!(transport.session.written.len(), 300);
+        assert_eq!(buffered.load(Ordering::Relaxed), 700);
+
+        transport.session.accept = usize::MAX;
+        transport.handle_writable(&mut events);
+        assert_eq!(buffered.load(Ordering::Relaxed), 0);
     }
 }

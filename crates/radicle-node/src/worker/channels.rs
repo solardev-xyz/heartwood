@@ -69,6 +69,13 @@ impl ChannelsFlush {
     pub fn timeout(&self) -> time::Duration {
         self.sender.writer.timeout.max(self.receiver.timeout)
     }
+
+    /// The pack size limit of the stream: what a fetch reads at most, and
+    /// what an upload sends at most.
+    #[cfg(feature = "serve-in-process")]
+    pub fn limit(&self) -> FetchPackSizeLimit {
+        self.receiver.limiter.limit
+    }
 }
 
 impl fetch::transport::ConnectionStream for ChannelsFlush {
@@ -140,6 +147,11 @@ impl<T: AsRef<[u8]>> Channels<T> {
 
     pub fn try_iter(&self) -> impl Iterator<Item = ChannelEvent<T>> + '_ {
         self.receiver.try_iter()
+    }
+
+    /// Whether no event waits to be taken.
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
     }
 
     pub fn send(&self, event: ChannelEvent<T>) -> io::Result<()> {

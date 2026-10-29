@@ -151,6 +151,8 @@ impl Worker {
                 log::debug!(target: "worker", "Worker processing incoming fetch for {remote} on stream {stream}..");
 
                 let timeout = channels.timeout();
+                #[cfg(feature = "serve-in-process")]
+                let limit = channels.limit();
                 let (mut stream_r, stream_w) = channels.split();
 
                 let mut iter = gix_packetline::blocking_io::StreamingPeekableIter::new(
@@ -229,6 +231,7 @@ impl Worker {
                         &header,
                         stream_r,
                         stream_w,
+                        limit,
                     )
                     .map_err(UploadError::UploadPack)
                 };

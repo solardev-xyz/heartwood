@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use std::{io, net, time};
@@ -40,7 +42,7 @@ use crate::reactor::{NoiseSession, ProtocolArtifact, SessionEvent, Socks5Session
 use crate::reactor::{Token, Tokens};
 use crate::resolver;
 use crate::worker;
-use crate::worker::channels::{ChannelEvent, ChannelsConfig};
+use crate::worker::channels::{ChannelEvent, Channels, ChannelsConfig};
 use crate::worker::{Task, TaskResult};
 
 /// NoiseXK handshake pattern.
@@ -103,6 +105,14 @@ pub(crate) type WireSession = NoiseSession<crypto::SigningKey, Sha256, Socks5Ses
 
 /// Reactor action.
 type Action = reactor::Action<Listener, Transport<WireSession>>;
+
+/// How many bytes a peer's write buffer may hold before a worker's stream to
+/// it waits: the stream's data stays in its bounded channel, so its worker
+/// waits too, rather than the buffer growing with whatever the worker makes.
+pub const STREAM_BUFFER_LIMIT: usize = 512 * 1024;
+
+/// How soon a stream that waited for its peer's write buffer tries again.
+const STREAM_RETRY: time::Duration = time::Duration::from_millis(10);
 
 /// Where the wire leaves the error the service stopped the node with, for the
 /// runtime to return once the reactor has ended.
@@ -365,6 +375,10 @@ pub(crate) struct Wire<D, S> {
     next_resolution: u64,
     /// The error the service stopped the node with, once it has.
     stopped: Stopped,
+    /// Each peer's transport write buffer, as the wire sees it.
+    outboxes: HashMap<Token, Outbox>,
+    /// The streams whose data waits for their peer's write buffer to drain.
+    waiting: HashSet<(NodeId, StreamId)>,
 }
 
 impl<D, S> Wire<D, S>
@@ -398,6 +412,8 @@ where
             resolving: HashMap::new(),
             next_resolution: 0,
             stopped,
+            outboxes: HashMap::new(),
+            waiting: HashSet::new(),
         }
     }
 
@@ -689,8 +705,10 @@ where
             return;
         };
         let metrics = self.metrics.peer(remote);
+        let outbox = self.outboxes.entry(fd).or_default();
 
-        for data in s.channels.try_iter() {
+        let (events, more) = take_within(&s.channels, outbox);
+        for data in events {
             let frame = match data {
                 ChannelEvent::Data(data) => {
                     metrics.sent_git_bytes += data.len();
@@ -703,9 +721,20 @@ where
             self.actions
                 .push_back(reactor::Action::Send(fd, frame.encode_to_vec()));
         }
+        // The rest waits in the stream's channel, which is bounded: its worker
+        // waits once it is full. It is tried again soon.
+        if more {
+            if self.waiting.insert((remote, stream)) {
+                log::trace!(target: "wire", "Stream {stream} to {remote} waits for its peer's write buffer");
+            }
+            self.actions.push_back(reactor::Action::SetTimer(STREAM_RETRY));
+        } else {
+            self.waiting.remove(&(remote, stream));
+        }
     }
 
     fn cleanup(&mut self, token: Token) {
+        self.outboxes.remove(&token);
         if self.inbound.remove(&token) {
             log::debug!(target: "wire", token=token.0; "Cleaning up inbound peer state");
         } else if let Some(outbound) = self.outbound.remove(&token) {
@@ -719,6 +748,40 @@ where
             log::debug!(target: "wire", token=token.0; "Tried to cleanup unknown peer");
         }
     }
+}
+
+/// A peer's transport write buffer, as the wire sees it: what the transport
+/// holds, and what was queued to it since the reactor last applied the
+/// actions, which isn't in the buffer yet.
+#[derive(Default)]
+struct Outbox {
+    buffered: Arc<AtomicUsize>,
+    queued: usize,
+}
+
+impl Outbox {
+    fn holds(&self) -> usize {
+        self.buffered
+            .load(Ordering::Relaxed)
+            .saturating_add(self.queued)
+    }
+}
+
+/// The events waiting on a worker's `channels`, taken while the peer's
+/// `outbox`, with those taken, holds less than [`STREAM_BUFFER_LIMIT`]; and
+/// whether any are left. What is taken counts as queued to it.
+fn take_within(channels: &Channels, outbox: &mut Outbox) -> (Vec<ChannelEvent>, bool) {
+    let mut taken = Vec::new();
+    while outbox.holds() < STREAM_BUFFER_LIMIT {
+        let Some(event) = channels.try_iter().next() else {
+            return (taken, false);
+        };
+        if let ChannelEvent::Data(data) = &event {
+            outbox.queued = outbox.queued.saturating_add(data.len());
+        }
+        taken.push(event);
+    }
+    (taken, !channels.is_empty())
 }
 
 impl<D, S> reactor::ReactionHandler for Wire<D, S>
@@ -742,6 +805,16 @@ where
             })
             .sum();
         self.metrics.worker_queue_size = self.worker.len();
+
+        // The reactor has applied every action since the last tick: what was
+        // queued is in the peers' buffers now. The streams that waited for
+        // them try again.
+        for outbox in self.outboxes.values_mut() {
+            outbox.queued = 0;
+        }
+        for (remote, stream) in std::mem::take(&mut self.waiting) {
+            self.flush(remote, stream);
+        }
 
         self.service.tick(LocalTime::now(), &self.metrics);
     }
@@ -819,7 +892,14 @@ where
         }
     }
 
-    fn transport_registered(&mut self, token: Token, _transport: &Self::Transport) {
+    fn transport_registered(&mut self, token: Token, transport: &Self::Transport) {
+        self.outboxes.insert(
+            token,
+            Outbox {
+                buffered: transport.buffered(),
+                queued: 0,
+            },
+        );
         if let Some(outbound) = self.outbound.get(&token) {
             log::debug!(target: "wire", token=token.0; "Outbound peer resource registered for {}", outbound.nid);
         } else if self.inbound.contains(&token) {
@@ -1103,6 +1183,7 @@ where
                 // The peer transport is already disconnected and removed from the reactor;
                 // therefore there is no need to initiate a disconnection. We simply remove
                 // the peer from the map.
+                self.outboxes.remove(&token);
                 match self.peers.remove(&token) {
                     Some(mut peer) => {
                         if let Peer::Connected { streams, .. } = &mut peer {
@@ -2087,5 +2168,43 @@ mod test {
             !wire.service.fetcher().active_fetches().contains_key(&rid),
             "fetch result should have cleared active[rid]"
         );
+    }
+
+    // Security R-10: a worker's stream is taken off its channel only while
+    // its peer's write buffer has room. The rest waits in the channel, which
+    // is bounded, so its worker waits too.
+    #[test]
+    fn a_stream_waits_for_its_peer_s_write_buffer() {
+        use crate::worker::channels::Channels;
+
+        let (wire, worker) =
+            Channels::<Vec<u8>>::pair(ChannelsConfig::new(time::Duration::from_secs(1))).unwrap();
+        let chunk = 100 * 1024;
+        for _ in 0..10 {
+            worker.send(ChannelEvent::Data(vec![0; chunk])).unwrap();
+        }
+        let mut outbox = Outbox::default();
+        // Room for six chunks, the last one passing the limit.
+        let (taken, more) = take_within(&wire, &mut outbox);
+        let room = STREAM_BUFFER_LIMIT.div_ceil(chunk);
+        assert_eq!(taken.len(), room);
+        assert!(more);
+        // In the same turn, what was taken counts: nothing more is.
+        let (taken, more) = take_within(&wire, &mut outbox);
+        assert!(taken.is_empty());
+        assert!(more);
+        // Nor is anything while the transport's buffer is full.
+        outbox.queued = 0;
+        outbox.buffered.store(STREAM_BUFFER_LIMIT, Ordering::Relaxed);
+        let (taken, more) = take_within(&wire, &mut outbox);
+        assert!(taken.is_empty());
+        assert!(more);
+        // Once it drains, the rest is taken, with the stream's end.
+        outbox.buffered.store(0, Ordering::Relaxed);
+        worker.send(ChannelEvent::Eof).unwrap();
+        let (taken, more) = take_within(&wire, &mut outbox);
+        assert_eq!(taken.len(), 10 - room + 1);
+        assert!(matches!(taken.last(), Some(ChannelEvent::Eof)));
+        assert!(!more);
     }
 }
