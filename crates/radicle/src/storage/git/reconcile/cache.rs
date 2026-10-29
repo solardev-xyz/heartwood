@@ -698,6 +698,12 @@ mod tests {
         );
         assert_eq!(f.state.cache_checkpoint(&rid, f.version()).unwrap(), None);
         assert_eq!(f.state.scan(&rid, f.version()).unwrap(), None);
+        // Publication cleared the staging and the worklist.
+        assert!(f.staged().is_empty(), "publication left the staging");
+        for kind in Kind::ALL {
+            let (ids, _) = f.state.worklist(&rid, kind, None, BATCH_COBS).unwrap();
+            assert!(ids.is_empty(), "publication left the {kind} worklist");
+        }
     }
 
     #[test]
