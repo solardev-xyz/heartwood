@@ -122,6 +122,7 @@ fn run_with_signals(
         receiver,
         node.secret_key,
         std::sync::Arc::new(radicle::node::dial::Open),
+        radicle::node::gate::RepoGate::new(),
     )
     .unwrap();
     assert!(runtime.control.is_none());
@@ -2659,6 +2660,7 @@ fn init(node: crate::test::node::Node) -> Result<crate::runtime::Runtime, crate:
         signals,
         node.secret_key,
         std::sync::Arc::new(radicle::node::dial::Open),
+        radicle::node::gate::RepoGate::new(),
     )
 }
 
@@ -3155,4 +3157,315 @@ fn test_dial_a_timely_answer_the_deadline_overtook_costs_nothing() {
         "{result:?}"
     );
     assert_eq!(penalty(&alice, &bob, &book), before);
+}
+
+#[test]
+// heartwood#14 (freedom-core design 0008): a fetch of a repository being
+// repaired waits, through the runtime, until the host opens it again.
+fn test_gate_a_fetch_waits_for_the_repair() {
+    use radicle::node::gate::{RepoGate, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    let gate = RepoGate::new();
+    let mut alice = alice.spawn_with_repositories(gate.clone());
+    let bob = bob.spawn();
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+    alice.handle.seed(acme, Scope::All).unwrap();
+
+    gate.close(acme, RepoState::Repairing, time::Duration::from_secs(5))
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut handle = alice.handle.clone();
+    let fetching = thread::spawn(move || {
+        tx.send(handle.fetch(acme, bob.id, DEFAULT_TIMEOUT, None))
+            .unwrap();
+    });
+    // While it is being repaired, nothing of it is fetched.
+    assert!(rx.recv_timeout(time::Duration::from_millis(500)).is_err());
+    assert!(alice.storage.repository(acme).is_err());
+
+    gate.open(acme);
+    let result = rx
+        .recv_timeout(time::Duration::from_secs(20))
+        .unwrap()
+        .unwrap();
+    assert!(result.is_success(), "{result:?}");
+    assert!(alice.storage.repository(acme).is_ok());
+    fetching.join().unwrap();
+}
+
+#[test]
+// heartwood#14: a repository quarantined for a namespace isn't served; one
+// quarantined for its cache is.
+fn test_gate_a_namespace_quarantine_isnt_served() {
+    use radicle::node::gate::{Quarantine, RepoGate, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    let gate = RepoGate::new();
+    let mut alice = alice.spawn();
+    let bob = bob.spawn_with_repositories(gate.clone());
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+    alice.handle.seed(acme, Scope::All).unwrap();
+
+    gate.close(
+        acme,
+        RepoState::Quarantined(Quarantine::Namespace),
+        time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let result = alice
+        .handle
+        .fetch(acme, bob.id, DEFAULT_TIMEOUT, None)
+        .unwrap();
+    assert!(!result.is_success(), "{result:?}");
+    assert!(alice.storage.repository(acme).is_err());
+
+    gate.close(
+        acme,
+        RepoState::Quarantined(Quarantine::Cache),
+        time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let result = alice
+        .handle
+        .fetch(acme, bob.id, DEFAULT_TIMEOUT, None)
+        .unwrap();
+    assert!(result.is_success(), "{result:?}");
+}
+
+#[test]
+// heartwood#14: closing a repository waits for a fetch of it already under
+// way, which holds its gate pass until it is done.
+fn test_gate_closing_waits_for_a_fetch_under_way() {
+    use crate::worker::seams::{self, Point};
+    use radicle::node::gate::{Busy, RepoGate, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    let gate = RepoGate::new();
+    let mut alice = alice.spawn_with_repositories(gate.clone());
+    let bob = bob.spawn();
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+    alice.handle.seed(acme, Scope::All).unwrap();
+
+    seams::hold(Point::Fetch, acme);
+    // Let go however the test ends, so that alice can stop.
+    struct Release(radicle::identity::RepoId);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            seams::release(Point::Fetch, self.0);
+        }
+    }
+    let _release = Release(acme);
+    let mut handle = alice.handle.clone();
+    let fetching =
+        thread::spawn(move || handle.fetch(acme, bob.id, DEFAULT_TIMEOUT, None).unwrap());
+    let until = time::Instant::now() + time::Duration::from_secs(10);
+    while !seams::waiting(Point::Fetch, acme) {
+        assert!(time::Instant::now() < until, "the fetch never began");
+        thread::sleep(time::Duration::from_millis(5));
+    }
+    // The fetch holds its pass: closing can't finish, but closes all the same.
+    assert_eq!(
+        gate.close(acme, RepoState::Repairing, time::Duration::from_millis(200)),
+        Err(Busy {
+            rid: acme,
+            passes: 1
+        })
+    );
+    assert!(gate.enter(acme).is_none());
+    // Let go, the fetch it already began completes, and the close with it.
+    seams::release(Point::Fetch, acme);
+    gate.close(acme, RepoState::Repairing, time::Duration::from_secs(20))
+        .unwrap();
+    assert!(fetching.join().unwrap().is_success());
+}
+
+#[test]
+// Review of heartwood #7, round 1: a repository the gate quarantines before
+// the node starts is neither migrated nor advertised as it starts, and comes
+// back in its inventory once the host opens it.
+fn test_gate_a_repository_closed_at_start_isnt_migrated_or_announced() {
+    use radicle::node::gate::{Quarantine, RepoGate, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    let name = format!("refs/namespaces/{}/refs/rad/sigrefs", bob.id);
+    let sigrefs = |storage: &radicle::storage::git::Storage| {
+        storage
+            .repository(acme)
+            .unwrap()
+            .backend
+            .refname_to_id(&name)
+            .unwrap()
+    };
+    // Its signed refs at the root of their history: they need migrating, as
+    // a start would, were it open.
+    let repo = bob.storage.repository(acme).unwrap();
+    let mut root = repo.backend.find_commit(sigrefs(&bob.storage)).unwrap();
+    while let Ok(parent) = root.parent(0) {
+        root = parent;
+    }
+    repo.backend
+        .reference(&name, root.id(), true, "test")
+        .unwrap();
+    let before = sigrefs(&bob.storage);
+    let gate = RepoGate::new();
+    gate.close(
+        acme,
+        RepoState::Quarantined(Quarantine::Namespace),
+        time::Duration::ZERO,
+    )
+    .unwrap();
+    let bob = bob.spawn_with_repositories(gate.clone());
+    let alice = alice.spawn();
+    let events = alice.handle.events();
+    let mut handle = alice.handle.clone();
+    handle
+        .connect(bob.id, bob.addr.into(), ConnectOptions::default())
+        .unwrap();
+
+    // Bob's inventory, as he connects, leaves acme out.
+    let inventory = |events: &radicle::node::events::Events| {
+        events
+            .wait(
+                |e| match e {
+                    Event::InventoryAnnounced { nid, inventory, .. } if *nid == bob.id => {
+                        Some(inventory.clone())
+                    }
+                    _ => None,
+                },
+                time::Duration::from_secs(10),
+            )
+            .unwrap()
+    };
+    assert!(!inventory(&events).contains(&acme));
+    // Nor was it migrated as he started.
+    assert_eq!(
+        sigrefs(&bob.storage),
+        before,
+        "a quarantined repository was migrated"
+    );
+
+    // Opened, it is in his inventory again.
+    gate.open(acme);
+    let until = time::Instant::now() + time::Duration::from_secs(10);
+    while !inventory(&events).contains(&acme) {
+        assert!(time::Instant::now() < until, "acme never came back");
+    }
+}
+
+#[test]
+// Review of heartwood #7, round 1: serving is fenced like a mutation. An
+// upload admitted before a namespace quarantine holds its pass: the close is
+// busy until the upload is done, and nothing is served after it.
+fn test_gate_closing_waits_for_an_upload_under_way() {
+    use crate::worker::seams::{self, Point};
+    use radicle::node::gate::{Busy, Purpose, Quarantine, RepoGate, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(tmp.path(), config::relay("alice"), 13);
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    let gate = RepoGate::new();
+    let mut alice = alice.spawn();
+    let bob = bob.spawn_with_repositories(gate.clone());
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+    alice.handle.seed(acme, Scope::All).unwrap();
+
+    seams::hold(Point::Serve, acme);
+    // Let go however the test ends, so that bob can stop.
+    struct Release(radicle::identity::RepoId);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            seams::release(Point::Serve, self.0);
+        }
+    }
+    let _release = Release(acme);
+    let mut handle = alice.handle.clone();
+    let fetching =
+        thread::spawn(move || handle.fetch(acme, bob.id, DEFAULT_TIMEOUT, None).unwrap());
+    let until = time::Instant::now() + time::Duration::from_secs(10);
+    while !seams::waiting(Point::Serve, acme) {
+        assert!(time::Instant::now() < until, "bob never began to serve");
+        thread::sleep(time::Duration::from_millis(5));
+    }
+    // Admitted and authorized, the upload holds its pass: the quarantine
+    // can't finish, but closes all the same.
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    assert_eq!(
+        gate.close(acme, namespace, time::Duration::from_millis(200)),
+        Err(Busy {
+            rid: acme,
+            passes: 1
+        })
+    );
+    assert!(gate.admit(acme, Purpose::Serve).is_none());
+    seams::release(Point::Serve, acme);
+    gate.close(acme, namespace, time::Duration::from_secs(20))
+        .unwrap();
+    assert!(fetching.join().unwrap().is_success());
+    // Quarantined, it isn't served.
+    let result = alice
+        .handle
+        .fetch(acme, bob.id, DEFAULT_TIMEOUT, None)
+        .unwrap();
+    assert!(!result.is_success(), "{result:?}");
+}
+
+/// Bob's refs announcements of acme kept, as he starts, to replay to peers
+/// that subscribe: with acme migrated before he starts, so that it has refs
+/// to announce, and quarantined for a namespace if `quarantined`.
+fn kept_announcements(quarantined: bool) -> i64 {
+    use radicle::node::gate::{Quarantine, RepoGate, RepoState};
+    use radicle::storage::{SignRepository as _, WriteStorage as _};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme", "");
+    bob.storage
+        .repository_mut(acme)
+        .unwrap()
+        .force_sign_refs(&bob.secret_key)
+        .unwrap();
+    let gate = RepoGate::new();
+    if quarantined {
+        gate.close(
+            acme,
+            RepoState::Quarantined(Quarantine::Namespace),
+            time::Duration::ZERO,
+        )
+        .unwrap();
+    }
+    let bob = bob.spawn_with_repositories(gate);
+    let db = sqlite::open(bob.home.node().join(radicle::node::NODE_DB_FILE)).unwrap();
+    let mut stmt = db
+        .prepare("SELECT COUNT(*) FROM announcements WHERE repo = ?1")
+        .unwrap();
+    stmt.bind((1, acme.to_string().as_str())).unwrap();
+    stmt.next().unwrap();
+    stmt.read::<i64, _>(0).unwrap()
+}
+
+#[test]
+// Review of heartwood #7, round 1: as he starts, Bob keeps a refs
+// announcement of a repository updated while he was stopped, to replay to
+// peers; not of one the gate quarantines for a namespace.
+fn test_gate_a_quarantined_repository_s_refs_arent_kept_to_announce() {
+    assert!(kept_announcements(false) > 0, "nothing to tell apart");
+    assert_eq!(kept_announcements(true), 0);
 }

@@ -2498,3 +2498,496 @@ fn a_stopped_service_does_nothing_more() {
         "a stopped service stored an announcement"
     );
 }
+
+/// A peer whose storage holds three repositories of its own, signed with
+/// its own key.
+fn gated_peer(tmp: &std::path::Path) -> Peer<Storage> {
+    let signer = SigningKey::mock(AMY as usize);
+    let storage = fixtures::storage(tmp.join("amy"), &signer).unwrap();
+    Peer::with_storage("amy", AMY, storage)
+}
+
+#[test]
+// heartwood#14 (freedom-core design 0008): a fetch of a repository being
+// repaired waits for it to open again, then runs.
+fn gate_defers_a_fetch_until_the_repository_opens() {
+    let storage = arbitrary::nonempty_storage(1);
+    let rid = *storage.repos.keys().next().unwrap();
+    let doc = storage.repos.get(&rid).unwrap().doc.clone();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+
+    gate.close(rid, node::gate::RepoState::Repairing, time::Duration::ZERO)
+        .unwrap();
+    let (cmd, result) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_matches!(amy.fetches().next(), None);
+    assert!(result.try_recv().is_err(), "it waits");
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, node::gate::RepoState::Open));
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    amy.fetched(rid, *bob.nid(), Ok(FetchResult::new(doc)));
+    assert_matches!(result.try_recv(), Ok(Ok(node::FetchResult::Success { .. })));
+}
+
+#[test]
+// heartwood#14: a fetch that reached a worker after its repository closed for
+// repair waits for it to open again, then runs.
+fn gate_defers_a_fetch_a_worker_found_closed() {
+    let storage = arbitrary::nonempty_storage(1);
+    let rid = *storage.repos.keys().next().unwrap();
+    let doc = storage.repos.get(&rid).unwrap().doc.clone();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+
+    let (cmd, result) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    let repairing = node::gate::RepoState::Repairing;
+    gate.close(rid, repairing, time::Duration::ZERO).unwrap();
+    amy.fetched(
+        rid,
+        *bob.nid(),
+        Err(protocol::worker::FetchError::Closed {
+            rid,
+            state: repairing,
+        }),
+    );
+    assert!(result.try_recv().is_err(), "it waits");
+    assert_matches!(amy.fetches().next(), None);
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, node::gate::RepoState::Open));
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    amy.fetched(rid, *bob.nid(), Ok(FetchResult::new(doc)));
+    assert_matches!(result.try_recv(), Ok(Ok(node::FetchResult::Success { .. })));
+}
+
+#[test]
+// heartwood#14: a fetch of a quarantined repository is refused, and fetches
+// waiting for its repair fail once it is quarantined.
+fn gate_refuses_a_fetch_of_a_quarantined_repository() {
+    use node::gate::{Quarantine, RepoState};
+
+    let storage = arbitrary::nonempty_storage(1);
+    let rid = *storage.repos.keys().next().unwrap();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+
+    gate.close(rid, RepoState::Repairing, time::Duration::ZERO)
+        .unwrap();
+    let (cmd, waiting) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    let quarantined = RepoState::Quarantined(Quarantine::Cache);
+    gate.close(rid, quarantined, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, quarantined));
+    assert_matches!(
+        waiting.try_recv(),
+        Ok(Ok(node::FetchResult::Failed { reason })) if reason.contains("quarantined")
+    );
+
+    let (cmd, refused) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_matches!(
+        refused.try_recv(),
+        Ok(Ok(node::FetchResult::Failed { reason })) if reason.contains("quarantined")
+    );
+    assert_matches!(amy.fetches().next(), None);
+}
+
+#[test]
+// heartwood#14: refs of a repository being repaired are announced once it
+// opens again, not before; a repository quarantined for its cache is still
+// announced, and one quarantined for a namespace isn't.
+fn gate_holds_back_refs_announcements() {
+    use node::gate::{Quarantine, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let bob = Peer::bob();
+    let rid = *amy.inventory().iter().next().unwrap();
+    amy.connect_to(&bob);
+    // Bob takes every announcement.
+    amy.receive(*bob.nid(), Message::Subscribe(Subscribe::all()));
+    amy.messages(*bob.nid()).for_each(drop);
+    let gate = amy.repositories().clone();
+    let refs = |amy: &mut Peer<Storage>| {
+        amy.messages(*bob.nid())
+            .filter(|m| {
+                matches!(
+                    m,
+                    Message::Announcement(Announcement {
+                        message: AnnouncementMessage::Refs(RefsAnnouncement { rid: r, .. }),
+                        ..
+                    }) if *r == rid
+                )
+            })
+            .count()
+    };
+    let announce = |amy: &mut Peer<Storage>| {
+        let (cmd, result) = Command::announce_refs(rid, [*amy.nid()].into());
+        amy.command(cmd);
+        result.try_recv().unwrap()
+    };
+
+    gate.close(rid, RepoState::Repairing, time::Duration::ZERO)
+        .unwrap();
+    assert!(announce(&mut amy).is_err());
+    assert_eq!(refs(&mut amy), 0);
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    assert_eq!(refs(&mut amy), 1, "announced once it opened");
+
+    let cache = RepoState::Quarantined(Quarantine::Cache);
+    gate.close(rid, cache, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, cache));
+    assert!(announce(&mut amy).is_ok());
+    assert_eq!(refs(&mut amy), 1);
+
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, namespace, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, namespace));
+    assert!(announce(&mut amy).is_err());
+    assert_eq!(refs(&mut amy), 0);
+}
+
+#[test]
+// heartwood#14: a repository quarantined for a namespace leaves the
+// inventory, and comes back once it opens.
+fn gate_leaves_a_namespace_quarantine_out_of_the_inventory() {
+    use node::gate::{Quarantine, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let bob = Peer::bob();
+    let rid = *amy.inventory().iter().next().unwrap();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+    let last = |amy: &mut Peer<Storage>| {
+        amy.inventory_announcements(*bob.nid())
+            .filter_map(|m| match m {
+                Message::Announcement(Announcement {
+                    message: AnnouncementMessage::Inventory(InventoryAnnouncement { inventory, .. }),
+                    ..
+                }) => Some(inventory.iter().copied().collect::<BTreeSet<_>>()),
+                _ => None,
+            })
+            .last()
+    };
+    assert!(amy.inventory().contains(&rid));
+
+    // Being repaired, or quarantined for its cache, it stays in.
+    for state in [
+        RepoState::Repairing,
+        RepoState::Quarantined(Quarantine::Cache),
+    ] {
+        gate.close(rid, state, time::Duration::ZERO).unwrap();
+        amy.command(Command::Gate(rid, state));
+        assert_eq!(last(&mut amy), None, "{state}: no new inventory");
+    }
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, namespace, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, namespace));
+    assert!(!last(&mut amy).unwrap().contains(&rid));
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    assert!(last(&mut amy).unwrap().contains(&rid));
+}
+
+#[test]
+// Review of heartwood #7, round 1: a fetch a worker found closed goes through
+// the gate again when its result comes back, whatever the state is by then.
+// Reopened before the result arrives, the fetch runs at once, and its
+// responder is answered once.
+fn gate_a_fetch_found_closed_runs_again_once_reopened() {
+    let storage = arbitrary::nonempty_storage(1);
+    let rid = *storage.repos.keys().next().unwrap();
+    let doc = storage.repos.get(&rid).unwrap().doc.clone();
+    let mut amy = Peer::with_storage("amy", AMY, storage);
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    let gate = amy.repositories().clone();
+
+    let (cmd, result) = Command::fetch(rid, *bob.nid(), DEFAULT_TIMEOUT, None);
+    amy.command(cmd);
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    let repairing = node::gate::RepoState::Repairing;
+    gate.close(rid, repairing, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, repairing));
+    // It opens again before the worker's result comes back.
+    gate.open(rid);
+    amy.command(Command::Gate(rid, node::gate::RepoState::Open));
+    amy.fetched(
+        rid,
+        *bob.nid(),
+        Err(protocol::worker::FetchError::Closed {
+            rid,
+            state: repairing,
+        }),
+    );
+    assert!(
+        result.try_recv().is_err(),
+        "the fetch failed instead of running again"
+    );
+    assert_eq!(amy.fetches().next(), Some((rid, *bob.nid())));
+    amy.fetched(rid, *bob.nid(), Ok(FetchResult::new(doc)));
+    assert_matches!(result.try_recv(), Ok(Ok(node::FetchResult::Success { .. })));
+    assert!(result.try_recv().is_err(), "answered twice");
+}
+
+/// The repositories of each inventory in `messages`, in order.
+fn inventories(messages: impl Iterator<Item = Message>) -> Vec<BTreeSet<RepoId>> {
+    messages
+        .filter_map(|m| match m {
+            Message::Announcement(Announcement {
+                message: AnnouncementMessage::Inventory(InventoryAnnouncement { inventory, .. }),
+                ..
+            }) => Some(inventory.iter().copied().collect()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many refs announcements of `rid` by `node` are in `messages`.
+fn refs_of(
+    messages: impl Iterator<Item = Message>,
+    rid: RepoId,
+    node: radicle::node::NodeId,
+) -> usize {
+    messages
+        .filter(|m| {
+            matches!(
+                m,
+                Message::Announcement(Announcement {
+                    node: n,
+                    message: AnnouncementMessage::Refs(RefsAnnouncement { rid: r, .. }),
+                    ..
+                }) if *r == rid && *n == node
+            )
+        })
+        .count()
+}
+
+#[test]
+// Review of heartwood #7, round 2: our own stored announcements are replayed
+// to a subscriber only as the gate lets them through when it subscribes. A
+// repository quarantined for its cache is replayed as before; one quarantined
+// for a namespace isn't.
+fn gate_a_namespace_quarantine_s_stored_refs_arent_replayed() {
+    use node::gate::{Quarantine, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let nid = *amy.nid();
+    let rid = *amy.inventory().iter().next().unwrap();
+    let (bob, cid, eve) = (Peer::bob(), Peer::cid(), Peer::eve());
+    let gate = amy.repositories().clone();
+    // Amy's refs of it are stored, while it is open.
+    let (cmd, result) = Command::announce_refs(rid, [nid].into());
+    amy.command(cmd);
+    result.try_recv().unwrap().unwrap();
+    let replayed = |amy: &mut Peer<Storage>, peer: &Peer<MockStorage>| {
+        amy.connect_to(peer);
+        amy.receive(*peer.nid(), Message::Subscribe(Subscribe::all()));
+        refs_of(amy.messages(*peer.nid()), rid, nid)
+    };
+    assert_eq!(replayed(&mut amy, &bob), 1, "open: replayed");
+
+    let cache = RepoState::Quarantined(Quarantine::Cache);
+    gate.close(rid, cache, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, cache));
+    assert_eq!(
+        replayed(&mut amy, &cid),
+        1,
+        "quarantined for its cache: replayed"
+    );
+
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, namespace, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, namespace));
+    assert_eq!(
+        replayed(&mut amy, &eve),
+        0,
+        "quarantined for a namespace: replayed"
+    );
+}
+
+#[test]
+// Review of heartwood #7, round 2: an inventory sent after a close to a
+// namespace quarantine has returned leaves the repository out, even before
+// the reactor hears of the close: a stored inventory replayed to a
+// subscriber, a new peer's initial inventory, and the announcement to the
+// peers already connected. One being repaired stays in.
+fn gate_an_inventory_sent_before_the_reactor_hears_of_a_close_leaves_it_out() {
+    use node::gate::{Quarantine, RepoState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let rid = *amy.inventory().iter().next().unwrap();
+    let (bob, cid, eve) = (Peer::bob(), Peer::cid(), Peer::eve());
+    let gate = amy.repositories().clone();
+    // Being repaired, it stays in, as it is still served.
+    gate.close(rid, RepoState::Repairing, time::Duration::ZERO)
+        .unwrap();
+    amy.connected(*cid.nid(), cid.address(), Link::Inbound);
+    assert!(inventories(amy.messages(*cid.nid()))[0].contains(&rid));
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+
+    amy.connect_to(&bob);
+    // Amy's inventory, with it, is stored.
+    amy.command(Command::AnnounceInventory);
+    assert!(inventories(amy.messages(*bob.nid()))[0].contains(&rid));
+
+    // Closed, and the reactor hasn't heard yet.
+    let namespace = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, namespace, time::Duration::ZERO).unwrap();
+    amy.receive(*bob.nid(), Message::Subscribe(Subscribe::all()));
+    let replayed = inventories(amy.messages(*bob.nid()));
+    assert!(
+        replayed.iter().all(|inventory| !inventory.contains(&rid)),
+        "a stored inventory with it was replayed: {replayed:?}"
+    );
+    amy.connected(*eve.nid(), eve.address(), Link::Inbound);
+    let initial = inventories(amy.messages(*eve.nid()));
+    assert_eq!(initial.len(), 1);
+    assert!(!initial[0].contains(&rid), "the initial inventory holds it");
+    let announced = inventories(amy.messages(*bob.nid()));
+    assert_eq!(announced.len(), 1);
+    assert!(
+        !announced[0].contains(&rid),
+        "the announced inventory holds it"
+    );
+
+    // Once the reactor hears, there is nothing more to announce, and the
+    // inventory comes back once it opens.
+    amy.command(Command::Gate(rid, namespace));
+    assert!(inventories(amy.messages(*bob.nid())).is_empty());
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    assert!(inventories(amy.messages(*bob.nid()))[0].contains(&rid));
+}
+
+/// Lets work held at `point` go however a test ends.
+struct Release(protocol::service::seams::Point, RepoId);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        protocol::service::seams::release(self.0, self.1);
+    }
+}
+
+/// Holds the work at `point` on `rid` that `trigger` starts: while it waits,
+/// with its pass, closes `rid` for a namespace with a short timeout, and
+/// tries for a pass of `purpose`; then lets it go, and closes again. What
+/// each gave.
+fn close_while_held(
+    amy: &mut Peer<Storage>,
+    point: protocol::service::seams::Point,
+    rid: RepoId,
+    purpose: node::gate::Purpose,
+    trigger: impl FnOnce(&mut Peer<Storage>),
+) -> (
+    Result<(), node::gate::Busy>,
+    bool,
+    Result<(), node::gate::Busy>,
+) {
+    use node::gate::{Quarantine, RepoState};
+    use protocol::service::seams;
+
+    let gate = amy.repositories().clone();
+    seams::hold(point, rid);
+    let _release = Release(point, rid);
+    let closing = std::thread::spawn(move || {
+        let _release = Release(point, rid);
+        let until = time::Instant::now() + time::Duration::from_secs(10);
+        while !seams::waiting(point, rid) {
+            assert!(
+                time::Instant::now() < until,
+                "the work never reached {point:?}"
+            );
+            std::thread::sleep(time::Duration::from_millis(5));
+        }
+        let namespace = RepoState::Quarantined(Quarantine::Namespace);
+        let busy = gate.close(rid, namespace, time::Duration::from_millis(200));
+        let admitted = gate.admit(rid, purpose).is_some();
+        seams::release(point, rid);
+        (
+            busy,
+            admitted,
+            gate.close(rid, namespace, time::Duration::from_secs(10)),
+        )
+    });
+    trigger(amy);
+    closing.join().unwrap()
+}
+
+#[test]
+// Review of heartwood #7, round 2: a refs announcement holds its pass until
+// it is queued. A close to a namespace quarantine while it is under way is
+// busy, and returns once it is done.
+fn gate_closing_waits_for_a_refs_announcement_under_way() {
+    use node::gate::{Busy, Purpose};
+    use protocol::service::seams::Point;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer(tmp.path());
+    let nid = *amy.nid();
+    let rid = *amy.inventory().iter().next().unwrap();
+    let bob = Peer::bob();
+    amy.connect_to(&bob);
+    amy.receive(*bob.nid(), Message::Subscribe(Subscribe::all()));
+    amy.messages(*bob.nid()).for_each(drop);
+
+    let (cmd, result) = Command::announce_refs(rid, [nid].into());
+    let (busy, admitted, closed) =
+        close_while_held(&mut amy, Point::Announce, rid, Purpose::Announce, |amy| {
+            amy.command(cmd)
+        });
+    assert_eq!(busy, Err(Busy { rid, passes: 1 }));
+    assert!(!admitted, "a new announcement was admitted");
+    assert_eq!(closed, Ok(()));
+    // Admitted before the close, it was made.
+    assert!(result.try_recv().unwrap().is_ok());
+    assert_eq!(refs_of(amy.messages(*bob.nid()), rid, nid), 1);
+}
+
+#[test]
+// Review of heartwood #7, round 2: an inventory holds its passes until it is
+// queued, both a new peer's initial inventory and an announcement. A close to
+// a namespace quarantine while one is under way is busy, and returns once it
+// is done.
+fn gate_closing_waits_for_an_inventory_under_way() {
+    use node::gate::{Busy, Purpose};
+    use protocol::service::seams::Point;
+
+    let eve = Peer::eve();
+    for announce in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut amy = gated_peer(tmp.path());
+        let rid = *amy.inventory().iter().next().unwrap();
+        let bob = Peer::bob();
+        amy.connect_to(&bob);
+        amy.messages(*bob.nid()).for_each(drop);
+
+        let (busy, admitted, closed) =
+            close_while_held(&mut amy, Point::Inventory, rid, Purpose::Inventory, |amy| {
+                if announce {
+                    amy.command(Command::AnnounceInventory);
+                } else {
+                    amy.connected(*eve.nid(), eve.address(), Link::Inbound);
+                }
+            });
+        assert_eq!(busy, Err(Busy { rid, passes: 1 }), "announce: {announce}");
+        assert!(!admitted, "announce: {announce}");
+        assert_eq!(closed, Ok(()), "announce: {announce}");
+    }
+}

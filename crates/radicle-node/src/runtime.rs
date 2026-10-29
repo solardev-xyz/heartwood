@@ -26,6 +26,7 @@ use radicle::node::address;
 use radicle::node::address::Store as _;
 use radicle::node::dial::Gate;
 use radicle::node::events::Emitter;
+use radicle::node::gate::RepoGate;
 use radicle::node::notifications;
 use radicle::node::policy::config as policy;
 use radicle::node::{NodeId, routing};
@@ -38,6 +39,7 @@ use crate::control;
 use crate::reactor;
 use crate::reactor::Reactor;
 use crate::resolver;
+use crate::wire;
 use crate::wire::{Stopped, Wire};
 use crate::worker;
 
@@ -158,6 +160,7 @@ impl Runtime {
     /// for it ([`radicle::node::dial::Open`] keeps the node's own behaviour).
     ///
     /// This function spawns threads.
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         home: Home,
         config: radicle::node::Config,
@@ -166,6 +169,7 @@ impl Runtime {
         signals: mpsc::Receiver<Signal>,
         secret_key: SigningKey,
         gate: Arc<dyn Gate>,
+        repositories: RepoGate,
     ) -> Result<Runtime, Error> {
         let id = NodeId::from(*secret_key.public_key());
         let alias = config.alias.clone();
@@ -251,8 +255,8 @@ impl Runtime {
             announcement,
             emitter.clone(),
             gate.clone(),
-        );
-        service.initialize(clock)?;
+        )
+        .with_repositories(repositories.clone());
 
         let (worker_send, worker_recv) =
             crossbeam_channel::bounded::<worker::Task>(MAX_PENDING_TASKS);
@@ -270,8 +274,24 @@ impl Runtime {
         // dialled at start resolves like any other.
         let outbound = usize::from(config.limits.connection.outbound).max(1);
         let mut resolvers = None;
+        let mut initialized = Ok(());
         let reactor = Reactor::with(
             |controller| {
+                // The gate tells the service of every change of a
+                // repository's state, through the reactor: from before the
+                // service initializes, which reads the states as they are
+                // then, so that no change is missed.
+                let gated = controller.clone();
+                repositories.listen(move |rid, state| {
+                    gated
+                        .cmd(wire::Control::User(service::Command::Gate(rid, state)))
+                        .ok();
+                });
+                if let Err(e) = service.initialize(clock) {
+                    let reason = e.to_string();
+                    initialized = Err(e);
+                    return Err(io::Error::other(reason));
+                }
                 let (queue, workers) = resolver::spawn(
                     gate.clone(),
                     controller,
@@ -293,7 +313,9 @@ impl Runtime {
                 Ok(wire)
             },
             thread::name(&id, "service"),
-        )?;
+        );
+        initialized?;
+        let reactor = reactor?;
         let resolvers = resolvers.ok_or_else(|| io::Error::other("no resolver pool"))?;
         let handle = Handle::new(home.clone(), socket.clone(), reactor.controller(), emitter);
 
@@ -315,6 +337,7 @@ impl Runtime {
                 fetch,
                 policy,
                 policies_db: home.node().join(node::POLICIES_DB_FILE),
+                repositories,
             },
         )?;
         let control = socket.map(Self::bind).transpose()?;
