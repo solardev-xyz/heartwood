@@ -19,13 +19,15 @@
 //!   strictly, within [`cache::LIMITS`]: a COB that doesn't load, whatever
 //!   heartwood's own load would leave out of it, quarantines its
 //!   repository's cache.
-//! - **The escape.** A unit the last process ended during
+//! - **The escape.** A unit a process ended during
 //!   ([`State::interrupted`]) runs again in its smallest form: one ref at a
 //!   time for the refs that namespace unit held, one remote and one COB tip
 //!   at a time for what that scan unit held, and one COB a batch for the
-//!   COBs that batch held. A unit in progress when two processes ended
-//!   quarantines its repository instead of running a third time. A unit that
-//!   fails with an error quarantines it at once.
+//!   COBs that batch held. Each unit keeps its history of starts until it
+//!   completes, whatever other units run or processes end in between: a
+//!   unit in progress when two processes ended quarantines its repository
+//!   instead of running a third time. A unit that fails with an error
+//!   quarantines it at once.
 //! - **Failures outside any one repository,** of the storage directory, the
 //!   progress state or the quarantine record, are an [`Error`]: nothing is
 //!   deleted to make the start succeed.
@@ -342,9 +344,9 @@ struct Batch {
     taken: usize,
 }
 
-/// The step of a repair that runs in its smallest form, because the last
-/// process ended during one of its units, and for how many more pieces: as
-/// many as that unit held in its usual form.
+/// The step of a repair that runs in its smallest form, because a process
+/// ended during one of its units, and for how many more pieces: as many as
+/// that unit held in its usual form.
 enum Small {
     /// The check of this namespace, one ref a unit.
     Namespace { namespace: NodeId, left: usize },
@@ -359,7 +361,9 @@ struct Begun {
     repo: Repository,
     version: Oid,
     done: BTreeSet<Step>,
-    small: Option<Small>,
+    /// The steps that run in their smallest form: one for each of its
+    /// units a process ended during, that hasn't completed since.
+    small: Vec<Small>,
 }
 
 /// What a repair did.
@@ -467,13 +471,15 @@ impl Repair {
     fn begin<S>(&mut self, cx: &mut Context<'_, S>) -> Result<Progress, Error> {
         super::enable_fsync()?;
         let rid = self.rid;
-        // The unit the last process ended during, if it is this repository's:
-        // read before this repair's first unit could take it.
+        // The units of this repository processes ended during, as this one
+        // opened the state.
         let small = cx
             .state
             .interrupted()
+            .iter()
             .filter(|interrupted| interrupted.unit.rid == rid)
-            .and_then(|interrupted| small(&interrupted.unit));
+            .filter_map(|interrupted| small(&interrupted.unit))
+            .collect::<Vec<_>>();
         let unit = Unit {
             rid,
             kind: kind::BEGIN.to_owned(),
@@ -651,14 +657,17 @@ impl Repair {
         }
 
         // The check's next refs, from its checkpoint.
-        let limit = match &mut begun.small {
-            Some(Small::Namespace { namespace, left })
-                if *namespace == pass.namespace && *left > 0 =>
-            {
+        let limit = match begun.small.iter_mut().find_map(|small| match small {
+            Small::Namespace { namespace, left } if *namespace == pass.namespace && *left > 0 => {
+                Some(left)
+            }
+            _ => None,
+        }) {
+            Some(left) => {
                 *left -= 1;
                 1
             }
-            _ => namespace::UNIT_REFS,
+            None => namespace::UNIT_REFS,
         };
         let unit = Unit {
             rid,
@@ -724,12 +733,15 @@ impl Repair {
             if at.complete {
                 self.rebuild = Rebuild::List;
             } else {
-                let (remotes, tips) = match &mut begun.small {
-                    Some(Small::Scan { left }) if *left > 0 => {
+                let (remotes, tips) = match begun.small.iter_mut().find_map(|small| match small {
+                    Small::Scan { left } if *left > 0 => Some(left),
+                    _ => None,
+                }) {
+                    Some(left) => {
                         *left -= 1;
                         (1, 1)
                     }
-                    _ => (cache::SCAN_REMOTES, cache::SCAN_TIPS),
+                    None => (cache::SCAN_REMOTES, cache::SCAN_TIPS),
                 };
                 let unit = Unit {
                     rid,
@@ -764,12 +776,15 @@ impl Repair {
                     .state
                     .cache_checkpoint(&rid, version)?
                     .unwrap_or_default();
-                let limit = match &mut begun.small {
-                    Some(Small::Cache { left }) if *left > 0 => {
+                let limit = match begun.small.iter_mut().find_map(|small| match small {
+                    Small::Cache { left } if *left > 0 => Some(left),
+                    _ => None,
+                }) {
+                    Some(left) => {
                         *left -= 1;
                         1
                     }
-                    _ => cache::BATCH_COBS,
+                    None => cache::BATCH_COBS,
                 };
                 let unit = Unit {
                     rid,
@@ -1721,6 +1736,24 @@ mod tests {
         assert_eq!(log.positions(kind::NAMESPACE).len(), 1);
         assert_eq!(log.positions(kind::CACHE_LIST).len(), 5 + 1);
         assert_eq!(f.live(rid), written_all(&f.repo()));
+
+        // Review of heartwood #23, round 1: processes ended during both, the
+        // namespace's unit and a COB, one after the other. Both run in their
+        // smallest form.
+        f.cut_off(
+            &Unit {
+                rid,
+                kind: kind::NAMESPACE.to_owned(),
+                position: format!("{nid}:"),
+            },
+            1,
+        );
+        f.cut_off(&unit, 1);
+        let log = Log::default();
+        let report = f.run_as_alice(&log);
+        assert!(report.newly_quarantined.is_empty());
+        assert_eq!(log.positions(kind::NAMESPACE).len(), names);
+        assert_eq!(log.positions(kind::CACHE_LIST).len(), 5 + 1);
     }
 
     #[test]
@@ -1861,6 +1894,40 @@ mod tests {
         assert_eq!(log.positions(kind::CACHE_LIST).len(), 0);
         assert_eq!(report.namespaces, 1);
         assert!(f.live(rid).is_empty());
+    }
+
+    #[test]
+    // Review of heartwood #23, round 1: processes that end in turn during
+    // two units of a repository, a cache listing and the earlier ref-locks
+    // unit, can't keep resetting the listing's count. The listing was
+    // started by two processes that ended during it: its third start is
+    // refused, and the repository quarantined.
+    fn crashes_alternating_between_two_units_still_quarantine_the_third_start() {
+        let f = fixture();
+        let rid = f.rid();
+        let listing = Unit {
+            rid,
+            kind: kind::CACHE_LIST.to_owned(),
+            position: "issue:".to_owned(),
+        };
+        let locks = Unit {
+            rid,
+            kind: kind::REF_LOCKS.to_owned(),
+            position: String::new(),
+        };
+        f.cut_off(&listing, 1);
+        f.cut_off(&locks, 1);
+        f.cut_off(&listing, 1);
+        let log = Log::default();
+        let report = f.run_as_alice(&log);
+        assert_eq!(report.newly_quarantined, [rid]);
+        let record = &report.first[0];
+        assert_eq!(record.kind, quarantine::Kind::Cache);
+        assert_eq!(record.unit.as_deref(), Some("cache-list@issue:"));
+        assert_eq!(record.evidence, "in progress when two processes ended");
+        // The ref-locks unit ran again, its second start, and completed.
+        assert_eq!(log.positions(kind::REF_LOCKS).len(), 1);
+        assert_eq!(log.positions(kind::CACHE_LIST).len(), 0);
     }
 
     #[test]
