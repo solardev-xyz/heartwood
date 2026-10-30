@@ -735,7 +735,14 @@ impl Identity {
         Ok(())
     }
 
-    /// Try to adopt an active revision as the current one.
+    /// Try to adopt an active revision as the current one, and then, as the
+    /// current one changes, each of its children that meets the quorum.
+    ///
+    /// The cascade runs from an explicit stack, not by recursion, so that a
+    /// chain of pending revisions as long as its delegates make it can't
+    /// exhaust the stack once its first revision is adopted (Security R-22).
+    /// Each revision's children are taken in the order the recursion took
+    /// them, each one's own cascade before the next.
     ///
     /// # Panics
     ///
@@ -744,79 +751,81 @@ impl Identity {
     ///
     /// If the parent revision of the revision with given ID does not exist.
     fn adopt(&mut self, id: RevisionId) {
-        if self.current == id {
-            return;
-        }
-
-        let candidate = self.revision(&id).expect("revision exists");
-
-        assert_eq!(candidate.state, State::Active);
-
-        let parent = candidate.parent.expect("revision has parent");
-        if parent != self.current {
-            log::debug!(
-                "Cannot adopt revision {} because its parent {} is not the current revision {}.",
-                id,
-                parent,
-                self.current
-            );
-            return;
-        }
-
-        let votes = candidate.accepted().count();
-        if !self.is_majority(votes) {
-            log::trace!(
-                "Revision {} has {} votes, but needs {} to be adopted.",
-                id,
-                votes,
-                self.majority()
-            );
-            return;
-        }
-
-        for sibling in self.siblings_of(&id).copied().collect::<Vec<_>>() {
-            let Some(revision) = self.revisions.get_mut(&sibling) else {
-                continue;
-            };
-
-            if revision.state != State::Active {
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            if self.current == id {
                 continue;
             }
 
-            log::debug!(
-                "Adoption of {} causes {} (a sibling) to be rejected.",
-                id,
-                sibling
-            );
+            let candidate = self.revision(&id).expect("revision exists");
 
-            revision.state = State::Rejected(RejectedBy::Sibling(id));
+            assert_eq!(candidate.state, State::Active);
 
-            self.cascade(sibling, State::Rejected(RejectedBy::Parent));
-        }
+            let parent = candidate.parent.expect("revision has parent");
+            if parent != self.current {
+                log::debug!(
+                    "Cannot adopt revision {} because its parent {} is not the current revision {}.",
+                    id,
+                    parent,
+                    self.current
+                );
+                continue;
+            }
 
-        self.current = id;
-        self.revision_mut(&id)
-            .expect("current revision exists")
-            .state = State::Accepted;
+            let votes = candidate.accepted().count();
+            if !self.is_majority(votes) {
+                log::trace!(
+                    "Revision {} has {} votes, but needs {} to be adopted.",
+                    id,
+                    votes,
+                    self.majority()
+                );
+                continue;
+            }
 
-        // Re-evaluate active children under the new quorum rules.
-        // Because `self.current` just changed, the delegate list
-        // might have changed, thus `self.majority()` might have changed.
-        let children_to_adopt = self
-            .children_of(&id)
-            .filter(|child| {
-                self.revisions.get(child).is_some_and(|r| {
-                    r.state == State::Active
-                        && self
-                            .is_majority(r.accepted().filter(|did| self.is_delegate(did)).count())
+            for sibling in self.siblings_of(&id).copied().collect::<Vec<_>>() {
+                let Some(revision) = self.revisions.get_mut(&sibling) else {
+                    continue;
+                };
+
+                if revision.state != State::Active {
+                    continue;
+                }
+
+                log::debug!(
+                    "Adoption of {} causes {} (a sibling) to be rejected.",
+                    id,
+                    sibling
+                );
+
+                revision.state = State::Rejected(RejectedBy::Sibling(id));
+
+                self.cascade(sibling, State::Rejected(RejectedBy::Parent));
+            }
+
+            self.current = id;
+            self.revision_mut(&id)
+                .expect("current revision exists")
+                .state = State::Accepted;
+
+            // Re-evaluate active children under the new quorum rules.
+            // Because `self.current` just changed, the delegate list
+            // might have changed, thus `self.majority()` might have changed.
+            let children_to_adopt = self
+                .children_of(&id)
+                .filter(|child| {
+                    self.revisions.get(child).is_some_and(|r| {
+                        r.state == State::Active
+                            && self.is_majority(
+                                r.accepted().filter(|did| self.is_delegate(did)).count(),
+                            )
+                    })
                 })
-            })
-            .copied()
-            .collect::<Vec<_>>();
+                .copied()
+                .collect::<Vec<_>>();
 
-        // Recursively adopt any children that now meet the quorum.
-        for child in children_to_adopt {
-            self.adopt(child);
+            // Adopt any children that now meet the quorum, the first first.
+            pending.extend(children_to_adopt.into_iter().rev());
         }
     }
 
@@ -1362,6 +1371,7 @@ mod signature {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod test {
+    mod adopt;
     mod property;
 
     use qcheck_macros::quickcheck;
