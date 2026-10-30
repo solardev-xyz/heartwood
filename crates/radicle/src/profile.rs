@@ -48,7 +48,8 @@ pub mod env {
     pub const RAD_SOCKET: &str = "RAD_SOCKET";
     /// Passphrase for the encrypted Radicle secret key.
     pub const RAD_PASSPHRASE: &str = "RAD_PASSPHRASE";
-    /// RNG seed. Must be convertible to a `u64`.
+    /// RNG seed. Must be convertible to a `u64`. Only debug and test builds
+    /// honour it: it makes the randomness of hashed collections predictable.
     pub const RAD_RNG_SEED: &str = "RAD_RNG_SEED";
     /// Private key seed. Used for generating deterministic keypairs.
     pub const RAD_KEYGEN_SEED: &str = "RAD_KEYGEN_SEED";
@@ -119,57 +120,107 @@ pub mod env {
         Some(super::Passphrase::from(passphrase))
     }
 
-    /// Get a random number generator from the environment.
+    /// Get a random number generator from the environment: seeded with
+    /// [`RAD_RNG_SEED`] in a debug or test build, and randomly otherwise, or
+    /// when the seed doesn't parse.
     pub fn rng() -> fastrand::Rng {
-        if let Ok(seed) = var(RAD_RNG_SEED) {
-            let Ok(seed) = seed.parse() else {
-                panic!("env::rng: invalid seed specified in `{RAD_RNG_SEED}`");
-            };
-            fastrand::Rng::with_seed(seed)
-        } else {
-            fastrand::Rng::new()
+        match rng_seed(
+            var(RAD_RNG_SEED),
+            cfg!(any(debug_assertions, test, feature = "test")),
+        ) {
+            Some(seed) => fastrand::Rng::with_seed(seed),
+            None => fastrand::Rng::new(),
+        }
+    }
+
+    /// The seed `value` gives, if it is to be honoured, and parses. Never a
+    /// panic: a seed that doesn't parse, or that isn't honoured, is logged.
+    pub(super) fn rng_seed(value: Result<String, VarError>, honoured: bool) -> Option<u64> {
+        let value = match value {
+            Ok(value) => value,
+            Err(VarError::NotPresent) => return None,
+            Err(VarError::NotUnicode(_)) => {
+                log::warn!(target: "radicle", "Ignoring `{RAD_RNG_SEED}`: it isn't valid Unicode");
+                return None;
+            }
+        };
+        if !honoured {
+            log::warn!(target: "radicle", "Ignoring `{RAD_RNG_SEED}`: a release build doesn't take a seed");
+            return None;
+        }
+        match value.trim().parse() {
+            Ok(seed) => Some(seed),
+            Err(e) => {
+                log::warn!(target: "radicle", "Ignoring `{RAD_RNG_SEED}`, which doesn't parse as a seed: {e}");
+                None
+            }
         }
     }
 
     /// Return the seed stored in the [`RAD_KEYGEN_SEED`] environment variable,
     /// if set. Otherwise, return `None`.
     ///
-    /// # Panics
-    ///
-    /// If the environment value [`RAD_KEYGEN_SEED`] is set but malformed,
-    /// i.e., not Unicode, not hexadecimal, or not 32 bytes long.
+    /// A value that isn't Unicode, hexadecimal, or 32 bytes long is ignored,
+    /// with a warning, as if unset: never a panic.
     pub fn seed() -> Option<Seed> {
-        match var(RAD_KEYGEN_SEED) {
-            Err(VarError::NotPresent) => None,
+        keygen_seed(var(RAD_KEYGEN_SEED))
+    }
+
+    /// The key seed `value` gives, if any.
+    pub(super) fn keygen_seed(value: Result<String, VarError>) -> Option<Seed> {
+        let seed = match value {
+            Err(VarError::NotPresent) => return None,
             Err(VarError::NotUnicode(_)) => {
-                panic!("env::seed: invalid Unicode value set in `{RAD_KEYGEN_SEED}`")
+                log::warn!(target: "radicle", "Ignoring `{RAD_KEYGEN_SEED}`: it isn't valid Unicode");
+                return None;
             }
-            Ok(seed) => Some(Seed::new(
-                (0..seed.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&seed[i..i + 2], 16))
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap_or_else(|_| {
-                        panic!("env::seed: invalid hexadecimal value set in `{RAD_KEYGEN_SEED}`")
-                    })
-                    .try_into()
-                    .unwrap_or_else(|_| {
-                        panic!("env::seed: invalid seed length set in `{RAD_KEYGEN_SEED}`")
-                    }),
-            )),
+            Ok(seed) => seed,
+        };
+        let bytes = (0..seed.len())
+            .step_by(2)
+            .map(|i| {
+                seed.get(i..i + 2)
+                    .and_then(|byte| u8::from_str_radix(byte, 16).ok())
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(bytes) = bytes else {
+            log::warn!(target: "radicle", "Ignoring `{RAD_KEYGEN_SEED}`: it isn't hexadecimal");
+            return None;
+        };
+        match <[u8; Seed::BYTES]>::try_from(bytes) {
+            Ok(bytes) => Some(Seed::new(bytes)),
+            Err(_) => {
+                log::warn!(target: "radicle", "Ignoring `{RAD_KEYGEN_SEED}`: a seed is 32 bytes long");
+                None
+            }
         }
     }
 
     fn time(key: &str) -> Option<localtime::LocalTime> {
-        if let Ok(s) = var(key) {
-            match s.trim().parse::<u64>() {
-                Ok(t) => return Some(localtime::LocalTime::from_secs(t)),
+        parse_time(key, var(key))
+    }
+
+    /// The time `value` gives, in seconds since the epoch, if any. A value
+    /// that doesn't parse is ignored, with a warning, as if unset: never a
+    /// panic.
+    pub(super) fn parse_time(
+        key: &str,
+        value: Result<String, VarError>,
+    ) -> Option<localtime::LocalTime> {
+        match value {
+            Ok(s) => match s.trim().parse::<u64>() {
+                Ok(t) => Some(localtime::LocalTime::from_secs(t)),
                 Err(e) => {
-                    panic!("env::time: invalid value {s:?} for `{key}` environment variable: {e}");
+                    log::warn!(target: "radicle", "Ignoring `{key}`, whose value {s:?} isn't a time in seconds: {e}");
+                    None
                 }
+            },
+            Err(VarError::NotPresent) => None,
+            Err(VarError::NotUnicode(_)) => {
+                log::warn!(target: "radicle", "Ignoring `{key}`: it isn't valid Unicode");
+                None
             }
         }
-        None
     }
 }
 
@@ -955,5 +1006,62 @@ mod test {
         assert!(cfg.node.extra.contains_key("db"));
         assert!(cfg.node.extra.contains_key("policy"));
         assert!(cfg.node.extra.contains_key("scope"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod env_test {
+    use std::env::VarError;
+    use std::ffi::OsString;
+
+    use super::env::*;
+
+    // Security R-14: a malformed value is ignored, as if unset, never a panic.
+    #[test]
+    fn a_malformed_time_is_ignored() {
+        let set = |value: &str| parse_time(RAD_LOCAL_TIME, Ok(value.to_owned()));
+        assert_eq!(set(" 1671125284 ").unwrap().as_secs(), 1671125284);
+        assert_eq!(set("yesterday"), None);
+        assert_eq!(set("-1"), None);
+        assert_eq!(set(""), None);
+        assert_eq!(parse_time(RAD_LOCAL_TIME, Err(VarError::NotPresent)), None);
+        assert_eq!(
+            parse_time(
+                RAD_LOCAL_TIME,
+                Err(VarError::NotUnicode(OsString::from("x")))
+            ),
+            None
+        );
+    }
+
+    // Security R-14: `RAD_RNG_SEED` is honoured only where asked, and a seed
+    // that doesn't parse is ignored.
+    #[test]
+    fn an_rng_seed_is_honoured_only_in_debug_and_test_builds() {
+        assert_eq!(rng_seed(Ok("42".to_owned()), true), Some(42));
+        assert_eq!(rng_seed(Ok("42".to_owned()), false), None);
+        assert_eq!(rng_seed(Ok("forty-two".to_owned()), true), None);
+        assert_eq!(rng_seed(Err(VarError::NotPresent), true), None);
+    }
+
+    // Security R-14: a key seed that isn't Unicode, hexadecimal or 32 bytes
+    // long is ignored.
+    #[test]
+    fn a_malformed_key_seed_is_ignored() {
+        let hex = "ab".repeat(32);
+        assert!(keygen_seed(Ok(hex.clone())).is_some());
+        for bad in [
+            "zz".repeat(32),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            format!("{hex}a"),
+            "é".repeat(32),
+            String::new(),
+        ] {
+            assert!(keygen_seed(Ok(bad.clone())).is_none(), "{bad:?}");
+        }
+        assert!(keygen_seed(Err(VarError::NotPresent)).is_none());
+        assert!(keygen_seed(Err(VarError::NotUnicode(OsString::from("x")))).is_none());
     }
 }

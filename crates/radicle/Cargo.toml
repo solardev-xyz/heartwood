@@ -39,6 +39,8 @@ git2 = { workspace = true, features = ["vendored-libgit2"] }
 # A quarantine record's ID, from the operating system's generator
 # (`storage::git::reconcile::quarantine`).
 getrandom = { workspace = true }
+# `GIT_COMMITTER_DATE`, read as git reads it.
+gix-date = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 # The libgit2 `git2` builds on, for its one option `git2` doesn't wrap: fsync
 # (`storage::git::reconcile::enable_fsync`).
