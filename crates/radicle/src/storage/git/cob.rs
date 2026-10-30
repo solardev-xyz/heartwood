@@ -80,6 +80,10 @@ impl change::Storage for Repository {
     fn manifest_of(&self, id: &Oid) -> Result<cob::Manifest, Self::LoadError> {
         self.backend.manifest_of(id)
     }
+
+    fn size_of(&self, id: &Oid, limit: u64) -> Result<Option<u64>, Self::LoadError> {
+        self.backend.size_of(id, limit)
+    }
 }
 
 impl cob::object::Storage for Repository {
