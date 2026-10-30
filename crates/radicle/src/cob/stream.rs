@@ -329,6 +329,77 @@ mod tests {
     }
 
     #[test]
+    // Security R-20: an op stream skips the commits of its history that are
+    // no ops, and the ops of other COBs, in a loop, not by recursion. A
+    // history of five thousand of each streams on a 128 KiB stack.
+    fn test_skipped_commits_dont_recurse() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let tmp = tempfile::tempdir().unwrap();
+                let (repo, _) = test::fixtures::repository(tmp.path());
+                let signer = SigningKey::mock(37);
+                let root = create_entry(
+                    &repo,
+                    &signer,
+                    create_contents(["root".to_owned()].into_iter()),
+                    None,
+                );
+                let sig = git::raw::Signature::now("radicle", "radicle@localhost").unwrap();
+                let tree = repo
+                    .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+                    .unwrap();
+                let mut parent = repo.find_commit(root.id.into()).unwrap();
+                for _ in 0..5_000 {
+                    let oid = repo
+                        .commit(None, &sig, &sig, "no op", &tree, &[&parent])
+                        .unwrap();
+                    parent = repo.find_commit(oid).unwrap();
+                }
+                // Ops of another COB's type.
+                let mut other = parent.id().into();
+                for _ in 0..5_000 {
+                    other = repo
+                        .store(
+                            None,
+                            vec![other],
+                            &signer,
+                            cob::change::Template {
+                                type_name: "xyz.radicle.other".parse().unwrap(),
+                                tips: vec![],
+                                message: "Another COB's op".to_string(),
+                                embeds: vec![],
+                                contents: create_contents(["other".to_owned()].into_iter()),
+                            },
+                        )
+                        .unwrap()
+                        .id;
+                }
+                let parent = repo.find_commit(other.into()).unwrap();
+                let tip = create_entry(
+                    &repo,
+                    &signer,
+                    create_contents(["tip".to_owned()].into_iter()),
+                    Some(parent.id().into()),
+                );
+                let history = CobRange {
+                    root: root.id,
+                    until: tip.id.into(),
+                };
+                let stream = Stream::<json::Value>::new(&repo, history, typename());
+                let ops = stream
+                    .all()
+                    .unwrap()
+                    .map(|op| op.unwrap().id)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(ops, BTreeSet::from([root.id, tip.id]));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn test_all_from() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, _) = test::fixtures::repository(tmp.path());
