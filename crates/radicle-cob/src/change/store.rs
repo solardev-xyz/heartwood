@@ -50,6 +50,15 @@ pub trait Storage {
 
     /// Load only the manifest of the change entry.
     fn manifest_of(&self, id: &Oid) -> Result<Manifest, Self::LoadError>;
+
+    /// The size in bytes of what loading the change `id` reads, from its
+    /// objects' headers, without their bodies, as far as `limit`: a size
+    /// past `limit` is returned as soon as it is known, before anything more
+    /// is read. `None` if the store can't tell beforehand, as by default.
+    fn size_of(&self, id: &Oid, limit: u64) -> Result<Option<u64>, Self::LoadError> {
+        let _ = (id, limit);
+        Ok(None)
+    }
 }
 
 /// Change template, used to create a new change.

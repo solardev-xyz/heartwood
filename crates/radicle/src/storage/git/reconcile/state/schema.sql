@@ -32,3 +32,48 @@ create table if not exists "reconcile_unit" (
   "position"      text      not null,
   "attempts"      integer   not null
 ) strict;
+
+-- A cache rebuild's staged COBs: the rows publication swaps in.
+create table if not exists "rebuild_staging" (
+  "rid"           text      not null,
+  -- `issue` or `patch`.
+  "kind"          text      not null,
+  "id"            text      not null,
+  -- The COB as the cache writes it.
+  "json"          text      not null,
+  primary key ("rid", "kind", "id")
+) strict;
+
+-- A cache rebuild's worklist: each COB's tips, one a remote, taken from the
+-- remotes' verified signed refs in one scan. Bound to the repository's
+-- version, through its scan.
+create table if not exists "rebuild_worklist" (
+  "rid"           text      not null,
+  -- `issue` or `patch`.
+  "kind"          text      not null,
+  "id"            text      not null,
+  "remote"        text      not null,
+  "tip"           text      not null,
+  primary key ("rid", "kind", "id", "remote")
+) strict;
+
+-- A cache rebuild's scan of its remotes: the version it is bound to, the
+-- last remote scanned whole, the remote after it scanned in part and the
+-- last of its COB refs recorded, and whether every remote has been.
+create table if not exists "rebuild_scan" (
+  "rid"           text      primary key not null,
+  "version"       text      not null,
+  "after"         text,
+  "remote"        text,
+  "ref"           text,
+  "complete"      integer   not null
+) strict;
+
+-- A cache rebuild's checkpoint: the kind it is at, and the last COB of it
+-- staged. Bound to the repository's version.
+create table if not exists "reconcile_cache" (
+  "rid"           text      primary key not null,
+  "version"       text      not null,
+  "kind"          text      not null,
+  "after"         text
+) strict;
