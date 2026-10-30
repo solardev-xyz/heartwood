@@ -299,26 +299,38 @@ impl<K: Ord + Copy, V> Dag<K, V> {
     }
 
     /// Remove a node from the graph, and all its dependents.
+    ///
+    /// Its transitive dependents are removed without recursion, so that a
+    /// history as long as a peer makes it can't exhaust the stack (Security
+    /// R-20): depth-first, in the order the recursive removal took them.
     pub fn remove(&mut self, key: &K) -> Option<Node<K, V>> {
-        if let Some(node) = self.graph.remove(key) {
-            self.tips.remove(key);
-            self.roots.remove(key);
+        let node = self.graph.remove(key)?;
+        self.detach(key, &node);
+        let mut stack: Vec<K> = node.dependents.iter().rev().copied().collect();
+        while let Some(k) = stack.pop() {
+            if let Some(dependent) = self.graph.remove(&k) {
+                self.detach(&k, &dependent);
+                stack.extend(dependent.dependents.iter().rev().copied());
+            }
+        }
+        Some(node)
+    }
 
-            for k in &node.dependencies {
-                if let Some(dependency) = self.graph.get_mut(k) {
-                    dependency.dependents.remove(key);
+    /// Detaches `node`, just taken out of the graph under `key`, from the
+    /// tips, the roots and its dependencies. A dependency left with no
+    /// dependent becomes a tip.
+    fn detach(&mut self, key: &K, node: &Node<K, V>) {
+        self.tips.remove(key);
+        self.roots.remove(key);
 
-                    if dependency.dependents.is_empty() {
-                        self.tips.insert(*k);
-                    }
+        for k in &node.dependencies {
+            if let Some(dependency) = self.graph.get_mut(k) {
+                dependency.dependents.remove(key);
+
+                if dependency.dependents.is_empty() {
+                    self.tips.insert(*k);
                 }
             }
-            for k in &node.dependents {
-                self.remove(k);
-            }
-            Some(node)
-        } else {
-            None
         }
     }
 
@@ -504,6 +516,65 @@ mod tests {
         }
     }
 
+    /// The recursive removal the iterative one replaces, as the reference.
+    fn remove_recursively<K: Ord + Copy, V>(dag: &mut Dag<K, V>, key: &K) -> Option<Node<K, V>> {
+        if let Some(node) = dag.graph.remove(key) {
+            dag.tips.remove(key);
+            dag.roots.remove(key);
+
+            for k in &node.dependencies {
+                if let Some(dependency) = dag.graph.get_mut(k) {
+                    dependency.dependents.remove(key);
+
+                    if dependency.dependents.is_empty() {
+                        dag.tips.insert(*k);
+                    }
+                }
+            }
+            for k in &node.dependents {
+                remove_recursively(dag, k);
+            }
+            Some(node)
+        } else {
+            None
+        }
+    }
+
+    /// A random graph of up to 60 nodes, each depending on up to three
+    /// before it, with random values.
+    fn random(rng: &mut fastrand::Rng) -> (Dag<u32, u8>, u32) {
+        let mut dag = Dag::new();
+        let len = rng.u32(1..60);
+        for i in 0..len {
+            dag.node(i, rng.u8(..));
+        }
+        for i in 1..len {
+            for _ in 0..rng.usize(0..4) {
+                dag.dependency(i, rng.u32(0..i));
+            }
+        }
+        (dag, len)
+    }
+
+    #[test]
+    // Review of heartwood #21, round 1: the iterative removal returns the node
+    // the recursive one did, and leaves exactly the graph it did, its nodes,
+    // their dependencies and dependents, its tips and its roots, on random
+    // graphs, one removal after another.
+    fn removal_keeps_the_recursive_result() {
+        let mut rng = fastrand::Rng::with_seed(0x7e40);
+        for _ in 0..500 {
+            let (mut dag, len) = random(&mut rng);
+            let mut expected = dag.clone();
+            for _ in 0..rng.usize(1..4) {
+                // Keys the graph doesn't hold remove nothing.
+                let key = rng.u32(0..len + 3);
+                assert_eq!(dag.remove(&key), remove_recursively(&mut expected, &key));
+                assert_eq!(dag, expected);
+            }
+        }
+    }
+
     #[test]
     // The iterative walks visit every node in exactly the order the recursive
     // ones did, on random graphs: from each start, and in sequence.
@@ -587,6 +658,45 @@ mod tests {
                     ControlFlow::Continue(())
                 });
                 assert_eq!(seen, 5_000);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    // Review of heartwood #21, round 1: removing a node removes its
+    // transitive dependents without recursion, directly and through
+    // `prune_by`'s `Break`, on a 256 KiB stack, where the recursive removal
+    // overflowed it.
+    fn a_long_chain_is_removed_without_recursion() {
+        const LEN: u32 = 100_000;
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut dag = chain(LEN);
+                let removed = dag.remove(&1).unwrap();
+                assert_eq!(removed.key, 1);
+                assert_eq!(dag.len(), 1);
+                assert_eq!(dag.tips().map(|(k, _)| *k).collect::<Vec<_>>(), [0]);
+                assert_eq!(dag.roots().map(|(k, _)| *k).collect::<Vec<_>>(), [0]);
+                assert!(dag.get(&0).unwrap().dependents.is_empty());
+
+                // A bad change near the start of a long history: the rest of
+                // it is pruned with it.
+                let mut dag = chain(LEN);
+                let mut seen = Vec::new();
+                dag.prune(&[0], |key, _, _| {
+                    seen.push(*key);
+                    if *key == 1 {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                });
+                assert_eq!(seen, [0, 1]);
+                assert_eq!(dag.len(), 1);
+                assert_eq!(dag.tips().map(|(k, _)| *k).collect::<Vec<_>>(), [0]);
             })
             .unwrap()
             .join()

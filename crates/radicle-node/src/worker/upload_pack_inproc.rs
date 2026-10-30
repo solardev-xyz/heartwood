@@ -30,9 +30,9 @@ use std::io::{self, Read, Write};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use git2::{ObjectType, Oid, Repository};
-use sha1::{Digest, Sha1};
 use gix_packetline::blocking_io::{StreamingPeekableIter, encode};
 use gix_packetline::{Channel, PacketLineRef};
+use sha1::{Digest, Sha1};
 
 use radicle::Storage;
 use radicle::identity::RepoId;
@@ -510,7 +510,14 @@ mod tests {
         tb.insert("hello.txt", blob, 0o100644).unwrap();
         let tree = tb.write().unwrap();
         let commit = repo
-            .commit(None, &sig(), &sig(), "m", &repo.find_tree(tree).unwrap(), &[])
+            .commit(
+                None,
+                &sig(),
+                &sig(),
+                "m",
+                &repo.find_tree(tree).unwrap(),
+                &[],
+            )
             .unwrap();
 
         let objs = reachable_objects(&repo, &[commit]).unwrap();
@@ -529,7 +536,14 @@ mod tests {
         tb.insert("a", b1, 0o100644).unwrap();
         let t1 = tb.write().unwrap();
         let c1 = repo
-            .commit(None, &sig(), &sig(), "c1", &repo.find_tree(t1).unwrap(), &[])
+            .commit(
+                None,
+                &sig(),
+                &sig(),
+                "c1",
+                &repo.find_tree(t1).unwrap(),
+                &[],
+            )
             .unwrap();
         let b2 = repo.blob(b"b").unwrap();
         let mut tb = repo.treebuilder(None).unwrap();
@@ -568,7 +582,14 @@ mod tests {
         tb.insert("f", blob, 0o100644).unwrap();
         let tree = tb.write().unwrap();
         let commit = repo
-            .commit(None, &sig(), &sig(), "m", &repo.find_tree(tree).unwrap(), &[])
+            .commit(
+                None,
+                &sig(),
+                &sig(),
+                "m",
+                &repo.find_tree(tree).unwrap(),
+                &[],
+            )
             .unwrap();
 
         let objs: Vec<Oid> = reachable_objects(&repo, &[commit])
