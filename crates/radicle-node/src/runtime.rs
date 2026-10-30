@@ -286,16 +286,51 @@ impl Lifecycle {
 /// and only then releases the home's `lock`: no other node takes the home
 /// while a lookup of this one's runs, and the node's own stop needn't wait
 /// for a resolver past its limit. The thread runs nothing of the node.
+///
+/// If the operating system won't start that thread, it waits for them here
+/// instead, and the stop returns once they have ended: the resolvers and
+/// the lock are kept beside the thread's closure, not only in it, so that
+/// its failure drops neither.
 fn reap(resolving: resolver::Workers, lock: Option<NodeLock>) {
-    let reaper = std::thread::Builder::new()
-        .name("node-reaper".to_owned())
-        .spawn(move || {
+    let held = Arc::new(std::sync::Mutex::new(Some((resolving, lock))));
+    let wait = |held: &std::sync::Mutex<Option<(resolver::Workers, Option<NodeLock>)>>| {
+        let taken = held.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some((resolving, lock)) = taken {
             resolving.join();
             drop(lock);
-        });
+        }
+    };
+    let reaper = {
+        let held = Arc::clone(&held);
+        spawn_reaper(move || wait(&held))
+    };
     if let Err(e) = reaper {
-        log::error!(target: "node", "Unable to start a thread to wait for the resolvers: {e}");
+        log::error!(
+            target: "node",
+            "Unable to start a thread to wait for the resolvers, waiting for them here: {e}"
+        );
+        wait(&held);
     }
+}
+
+/// Whether the reaper's thread fails to start, as the operating system can
+/// refuse one: for a test in a process of its own.
+#[cfg(test)]
+pub(crate) static REAPER_SPAWN_FAILS: AtomicBool = AtomicBool::new(false);
+
+/// Starts the reaper's thread, unless the operating system refuses it.
+fn spawn_reaper(f: impl FnOnce() + Send + 'static) -> io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if REAPER_SPAWN_FAILS.load(Ordering::SeqCst) {
+        drop(f);
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "a thread refused, as a test asks",
+        ));
+    }
+    std::thread::Builder::new()
+        .name("node-reaper".to_owned())
+        .spawn(f)
 }
 
 impl Drop for Lifecycle {

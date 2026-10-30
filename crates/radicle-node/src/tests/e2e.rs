@@ -3938,6 +3938,155 @@ fn test_a_worker_panic_with_control_and_a_lookup_lets_go_of_the_home_last() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 3: if the thread that is to wait for a
+// resolver past its limit won't start, the stop waits for it instead, with
+// the home held: the home is let go of only once the lookup has ended, and
+// with no thread of the node left.
+fn test_a_reaper_that_won_t_start_keeps_the_home_until_the_lookup_ends() {
+    if !in_child("tests::e2e::test_a_reaper_that_won_t_start_keeps_the_home_until_the_lookup_ends")
+    {
+        return;
+    }
+    crate::runtime::REAPER_SPAWN_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
+    let tmp = tempfile::tempdir().unwrap();
+    let gate = std::sync::Arc::new(HeldGate::new(vec![]));
+    let (nid, home, runtime) = init_gated(tmp.path(), 4_349, gate.clone());
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    hold_a_lookup(&handle, &gate);
+    let released = on_release(&home, &nid);
+    // Past the time a stop waits for a resolver, the home is still held;
+    // then the lookup ends.
+    let lookup = {
+        let (gate, home) = (gate.clone(), home.clone());
+        thread::spawn(move || {
+            thread::sleep(time::Duration::from_millis(1_500));
+            let held = home.lock_node().map(drop).map_err(|e| e.kind());
+            gate.release();
+            held
+        })
+    };
+
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+    assert_eq!(
+        lookup.join().unwrap(),
+        Err(std::io::ErrorKind::WouldBlock),
+        "the home was let go of during the lookup"
+    );
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 3: a connection whose command thread won't
+// start is closed, and the listener goes on: a command already running is
+// still served and joined, a later connection is served, and every thread of
+// the node has ended when it lets go of its home.
+fn test_a_command_thread_that_won_t_start_closes_its_connection_and_the_node_goes_on() {
+    use std::io::Read as _;
+    use std::sync::atomic::Ordering;
+
+    if !in_child(
+        "tests::e2e::test_a_command_thread_that_won_t_start_closes_its_connection_and_the_node_goes_on",
+    ) {
+        return;
+    }
+    crate::control::COMMAND_LINGER.store(300, Ordering::SeqCst);
+    let tmp = tempfile::tempdir().unwrap();
+    let (nid, home, runtime) = init_gated(
+        tmp.path(),
+        4_350,
+        std::sync::Arc::new(radicle::node::dial::Open),
+    );
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    let socket = home.socket_default();
+    // An idle command, already running.
+    let mut idle = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    thread::sleep(time::Duration::from_millis(300));
+
+    // The next connection's thread won't start: it is closed.
+    crate::control::COMMAND_SPAWN_FAILS.store(true, Ordering::SeqCst);
+    let mut refused = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    refused
+        .set_read_timeout(Some(time::Duration::from_secs(5)))
+        .unwrap();
+    let mut rest = Vec::new();
+    refused.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty());
+    crate::control::COMMAND_SPAWN_FAILS.store(false, Ordering::SeqCst);
+    // The listener goes on.
+    radicle::node::Node::new(&socket)
+        .config()
+        .expect("a later command is served");
+
+    let released = on_release(&home, &nid);
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+    let mut rest = Vec::new();
+    idle.read_to_end(&mut rest).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+// Review of heartwood #16, round 3: a listener that unwinds still shuts down
+// and joins the commands it serves, an idle one among them, and the node
+// lets go of its home only once they have ended, reporting the panic.
+fn test_a_listener_that_panics_still_joins_its_commands() {
+    use std::io::Read as _;
+    use std::sync::atomic::Ordering;
+
+    if !in_child("tests::e2e::test_a_listener_that_panics_still_joins_its_commands") {
+        return;
+    }
+    crate::control::COMMAND_LINGER.store(300, Ordering::SeqCst);
+    let tmp = tempfile::tempdir().unwrap();
+    let (nid, home, runtime) = init_gated(
+        tmp.path(),
+        4_351,
+        std::sync::Arc::new(radicle::node::dial::Open),
+    );
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    let socket = home.socket_default();
+    let mut idle = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    thread::sleep(time::Duration::from_millis(300));
+
+    // The listener panics as it takes the next connection; the idle command's
+    // connection is shut down as it unwinds.
+    crate::control::LISTENER_PANICS.store(true, Ordering::SeqCst);
+    let _next = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    idle.set_read_timeout(Some(time::Duration::from_secs(5)))
+        .unwrap();
+    let mut rest = Vec::new();
+    idle.read_to_end(&mut rest).unwrap();
+
+    let released = on_release(&home, &nid);
+    handle.shutdown().unwrap();
+    let result = running.join().unwrap();
+    assert!(
+        matches!(result, Err(crate::runtime::Error::Panicked("control"))),
+        "{result:?}"
+    );
+    assert_eq!(
+        released.join().unwrap(),
+        0,
+        "the home was let go of while threads of its node ran"
+    );
+}
+
 #[test]
 // Review of heartwood #16, round 1: once a node has stopped, a shutdown asked
 // of its handle doesn't reach the control socket's path, which the next node
