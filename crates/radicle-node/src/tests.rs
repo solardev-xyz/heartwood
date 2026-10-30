@@ -2515,6 +2515,62 @@ fn gated_peer_as(tmp: &std::path::Path, id: u8) -> Peer<Storage> {
 }
 
 #[test]
+// freedom-core design 0008 ("The escape"): a repository being repaired or
+// quarantined takes no seeding policy, whatever asks, so that none is written
+// while the host removes it. It takes one again once it opens.
+fn gate_refuses_a_seed_until_the_repository_opens() {
+    use node::gate::{Quarantine, RepoState};
+
+    let mut amy = Peer::amy();
+    let rid: RepoId = arbitrary::r#gen(1);
+    let gate = amy.repositories().clone();
+    for state in [
+        RepoState::Repairing,
+        RepoState::Quarantined(Quarantine::Cache),
+        RepoState::Quarantined(Quarantine::Namespace),
+    ] {
+        gate.close(rid, state, time::Duration::ZERO).unwrap();
+        amy.command(Command::Gate(rid, state));
+        for scope in [policy::Scope::All, policy::Scope::Followed] {
+            let (cmd, seeded) = Command::seed(rid, scope);
+            amy.command(cmd);
+            let refused = seeded.recv().unwrap();
+            assert!(refused.is_err(), "{state}: {refused:?}");
+            assert!(!amy.policies().is_seeding(&rid).unwrap(), "{state}");
+        }
+    }
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+    amy.command(cmd);
+    assert!(seeded.recv().unwrap().unwrap());
+    assert!(amy.policies().is_seeding(&rid).unwrap());
+}
+
+#[test]
+// A repository's seeding policy can still change while it is closed by
+// unseeding: a removal unseeds it, and nothing seeds it back.
+fn gate_lets_a_closed_repository_be_unseeded() {
+    use node::gate::{Quarantine, RepoState};
+
+    let mut amy = Peer::amy();
+    let rid: RepoId = arbitrary::r#gen(1);
+    let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+    amy.command(cmd);
+    assert!(seeded.recv().unwrap().unwrap());
+
+    let gate = amy.repositories().clone();
+    let state = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, state, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, state));
+    let (cmd, unseeded) = Command::unseed(rid);
+    amy.command(cmd);
+    assert!(unseeded.recv().unwrap().unwrap());
+    assert!(!amy.policies().is_seeding(&rid).unwrap());
+}
+
+#[test]
 // heartwood#14 (freedom-core design 0008): a fetch of a repository being
 // repaired waits for it to open again, then runs.
 fn gate_defers_a_fetch_until_the_repository_opens() {

@@ -979,6 +979,18 @@ where
                 self.fetch(rid, seed, vec![], config, Some(resp));
             }
             Command::Seed(rid, scope, resp) => {
+                // A repository being repaired or quarantined takes no seeding
+                // policy: the host may be removing it, and a policy written
+                // during the removal would outlive it, seeding the repository
+                // again once it opens. The pass is held across the write, so
+                // a close that has returned has every seed admitted before it
+                // written, and admits none after it.
+                let Some(_pass) = self.repositories.admit(rid, Purpose::Mutate) else {
+                    let state = self.repositories.state(&rid);
+                    debug!(target: "service", "Not seeding {rid}: it is {state}");
+                    resp.err(Error::Gated { rid, state }).ok();
+                    return;
+                };
                 // Update our seeding policy.
                 let seeded = match self.seed(&rid, scope) {
                     Ok(seeded) => seeded,
