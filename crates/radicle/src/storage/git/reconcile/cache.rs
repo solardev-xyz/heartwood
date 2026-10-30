@@ -33,6 +33,8 @@ use crate::patch;
 use crate::prelude::NodeId;
 use crate::storage::git::Repository;
 use crate::storage::refs::SignedRefs;
+use crate::storage::refs::sigrefs::SignedRefsReader;
+use crate::storage::refs::sigrefs::read::{Budget, Tip as SigrefsTip};
 
 /// COBs a batch stages at most, in its usual form, whatever it is asked
 /// for. Its smallest form stages one.
@@ -55,6 +57,9 @@ pub const MAX_SIGNED_REFS: u64 = 8 * 1024 * 1024;
 
 /// Bytes a remote's signed refs commit, or its tree, may take, at most.
 const MAX_SIGNED_REFS_OBJECT: u64 = 64 * 1024;
+
+/// Bytes a remote's `signature` blob takes: an Ed25519 signature's.
+const SIGNATURE_BYTES: u64 = 64;
 
 /// What one COB may take to materialize. One past any of these doesn't
 /// load: it is a cache error, never an exhausted process.
@@ -215,14 +220,28 @@ pub enum Error {
 /// more tips than a unit takes is resumed after the last one recorded.
 ///
 /// A remote's signed refs are verified as they are read: ones that don't
-/// verify, or that take more than [`MAX_SIGNED_REFS`] bytes, fail the scan.
-/// It returns whether every remote has been scanned.
+/// verify, or that take more than [`MAX_SIGNED_REFS`] bytes, fail the scan,
+/// and so does one whose history takes more than the reader's default
+/// [`Budget`] to read (Security R-21). It returns whether every remote has
+/// been scanned.
 pub fn scan(
     repo: &Repository,
     state: &mut super::state::State,
     version: git::Oid,
     remotes: usize,
     tips: usize,
+) -> Result<bool, Error> {
+    scan_within(repo, state, version, remotes, tips, Budget::DEFAULT)
+}
+
+/// [`scan`], reading each remote's signed refs within `budget`.
+pub fn scan_within(
+    repo: &Repository,
+    state: &mut super::state::State,
+    version: git::Oid,
+    remotes: usize,
+    tips: usize,
+    budget: Budget,
 ) -> Result<bool, Error> {
     let at = state.scan(&repo.id, version)?.unwrap_or_default();
     if at.complete {
@@ -254,7 +273,7 @@ pub fn scan(
             .take()
             .filter(|(partly, _)| *partly == remote)
             .map(|(_, name)| name);
-        let refs = signed_refs(repo, &remote)?;
+        let refs = signed_refs(repo, &remote, budget)?;
         let mut page = Vec::new();
         let mut last = None;
         let mut more = false;
@@ -311,8 +330,10 @@ pub fn scan(
 }
 
 /// `remote`'s signed refs in `repo`, verified: its `rad/sigrefs` commit,
-/// whose objects are measured before they are read.
-fn signed_refs(repo: &Repository, remote: &NodeId) -> Result<SignedRefs, Error> {
+/// whose objects are measured before they are read, its `refs` blob within
+/// [`MAX_SIGNED_REFS`] and its `signature` blob a signature's size, then
+/// read within `budget`, as its history may need walking.
+fn signed_refs(repo: &Repository, remote: &NodeId, budget: Budget) -> Result<SignedRefs, Error> {
     let failed = |reason: String| Error::Sigrefs {
         remote: *remote,
         reason,
@@ -348,9 +369,22 @@ fn signed_refs(repo: &Repository, remote: &NodeId) -> Result<SignedRefs, Error> 
             return Err(too_large("refs blob", refs_size, MAX_SIGNED_REFS));
         }
     }
-    SignedRefs::load_at(head.into(), *remote, repo)
-        .map_err(|e| failed(e.to_string()))?
-        .ok_or_else(|| failed("it has no signed refs".to_owned()))
+    if let Some(entry) = tree.get_name(crate::storage::refs::SIGNATURE_BLOB_PATH) {
+        let signature_size = size(entry.id())?;
+        if signature_size != SIGNATURE_BYTES {
+            return Err(failed(format!(
+                "its signature blob takes {signature_size} bytes, where a signature takes \
+                 {SIGNATURE_BYTES}"
+            )));
+        }
+    }
+    let verifier =
+        crate::crypto::VerifyingKey::try_from(remote).map_err(|e| failed(e.to_string()))?;
+    SignedRefsReader::new(repo.id, SigrefsTip::Commit(head.into()), repo, &verifier)
+        .with_budget(budget)
+        .read()
+        .map(|verified| verified.into_sigrefs_at(*remote))
+        .map_err(|e| failed(e.to_string()))
 }
 
 /// Materializes the COB `id` of `kind` from its tips in `state`'s worklist,
@@ -1152,23 +1186,30 @@ mod tests {
     }
 
     #[test]
-    // Review of heartwood #18, round 2: a remote whose signed refs take more
-    // than `MAX_SIGNED_REFS` bytes fails the scan before they are read, and
-    // so does one whose signed refs commit, or its tree, is too large.
+    // Review of heartwood #18, rounds 2 and 3: a remote whose signed refs
+    // take more than `MAX_SIGNED_REFS` bytes fails the scan before they are
+    // read, and so does one whose signed refs commit, or its tree, is too
+    // large, or whose signature blob isn't a signature's size.
     fn signed_refs_past_their_limit_fail_the_scan() {
         let mut f = fixture();
         let rid = f.repo().id;
         let eve = crate::crypto::SigningKey::mock(83);
         let author = git::raw::Signature::now("eve", "eve@example.com").unwrap();
         // A commit of `message`, whose tree holds `entries` names for a refs
-        // blob of `refs` bytes.
-        let commit = |message: &str, entries: usize, refs: usize| {
+        // blob of `refs` bytes, and a signature blob of `signature` bytes.
+        let commit = |message: &str, entries: usize, refs: usize, signature: usize| {
             let backend = &f.repo().backend;
             let blob = backend.blob(&vec![b'a'; refs]).unwrap();
             let mut tree = backend.treebuilder(None).unwrap();
             tree.insert(
                 crate::storage::refs::REFS_BLOB_PATH,
                 blob,
+                git::raw::FileMode::Blob.into(),
+            )
+            .unwrap();
+            tree.insert(
+                crate::storage::refs::SIGNATURE_BLOB_PATH,
+                backend.blob(&vec![b's'; signature]).unwrap(),
                 git::raw::FileMode::Blob.into(),
             )
             .unwrap();
@@ -1186,13 +1227,22 @@ mod tests {
                 .unwrap()
         };
         let over = MAX_SIGNED_REFS_OBJECT as usize + 1;
-        for (head, what) in [
+        let large = "more than";
+        let signature = "where a signature takes 64";
+        for (head, what, said) in [
             (
-                commit("Signed refs", 0, MAX_SIGNED_REFS as usize + 1),
+                commit("Signed refs", 0, MAX_SIGNED_REFS as usize + 1, 64),
                 "refs blob",
+                large,
             ),
-            (commit("Signed refs", over / 30, 1), "tree"),
-            (commit(&"a".repeat(over), 0, 1), "commit"),
+            (commit("Signed refs", over / 30, 1, 64), "tree", large),
+            (commit(&"a".repeat(over), 0, 1, 64), "commit", large),
+            (
+                commit("Signed refs", 0, 1, 32 * 1024 * 1024),
+                "signature blob",
+                signature,
+            ),
+            (commit("Signed refs", 0, 1, 63), "signature blob", signature),
         ] {
             f.repo()
                 .backend
@@ -1219,11 +1269,113 @@ mod tests {
                     Error::Sigrefs { remote, reason }
                         if remote == eve.public_key()
                             && reason.contains(what)
-                            && reason.contains("more than")
+                            && reason.contains(said)
                 ),
                 "{what}: {err}"
             );
         }
+    }
+
+    #[test]
+    // Review of heartwood #18, round 3, and Security R-21: a remote whose
+    // signed refs head has the old format, whose history every reader walks,
+    // fails the scan once that history takes more than the reader's budget,
+    // rather than being walked whole. Within the budget it scans.
+    fn an_old_format_history_past_the_budget_fails_the_scan() {
+        use crate::crypto::signature::Signer as _;
+
+        let mut f = fixture();
+        let rid = f.repo().id;
+        let eve = crate::crypto::SigningKey::mock(84);
+        let author = git::raw::Signature::now("eve", "eve@example.com").unwrap();
+        // 65 commits, oldest first, each signing a refs blob of the old
+        // format: neither `refs/rad/root` nor a parent entry.
+        let head = {
+            let backend = &f.repo().backend;
+            let mut parent: Option<git::raw::Oid> = None;
+            for i in 0..65u8 {
+                let refs = format!("{} refs/heads/main\n", git::Oid::from_sha1([i + 1; 20]));
+                let signature: crate::crypto::Signature = eve.sign(refs.as_bytes());
+                let mut tree = backend.treebuilder(None).unwrap();
+                tree.insert(
+                    crate::storage::refs::REFS_BLOB_PATH,
+                    backend.blob(refs.as_bytes()).unwrap(),
+                    git::raw::FileMode::Blob.into(),
+                )
+                .unwrap();
+                tree.insert(
+                    crate::storage::refs::SIGNATURE_BLOB_PATH,
+                    backend.blob(&signature.to_vec()).unwrap(),
+                    git::raw::FileMode::Blob.into(),
+                )
+                .unwrap();
+                let tree = backend.find_tree(tree.write().unwrap()).unwrap();
+                let parents = parent.map(|p| backend.find_commit(p).unwrap());
+                parent = Some(
+                    backend
+                        .commit(
+                            None,
+                            &author,
+                            &author,
+                            "sigrefs",
+                            &tree,
+                            &parents.iter().collect::<Vec<_>>(),
+                        )
+                        .unwrap(),
+                );
+            }
+            parent.unwrap()
+        };
+        f.repo()
+            .backend
+            .reference(
+                &format!("refs/namespaces/{}/refs/rad/sigrefs", eve.public_key()),
+                head,
+                true,
+                "test",
+            )
+            .unwrap();
+        let version = f.version();
+        let scan_in = |f: &mut Fixture, commits: usize| {
+            f.state.begin(&rid, version).unwrap();
+            f.state.clear_repository(&rid).unwrap();
+            f.state.begin(&rid, version).unwrap();
+            scan_within(
+                &f.alice.repo,
+                &mut f.state,
+                version,
+                SCAN_REMOTES,
+                SCAN_TIPS,
+                Budget {
+                    commits,
+                    ..Budget::DEFAULT
+                },
+            )
+        };
+        // The head alone, then the walk over all 65, the head among them.
+        let err = scan_in(&mut f, 65).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Sigrefs { remote, reason }
+                    if remote == eve.public_key() && reason.contains("65 commits")
+            ),
+            "{err}"
+        );
+        assert!(scan_in(&mut f, 66).unwrap());
+        // The default budget scans it too.
+        f.state.clear_repository(&rid).unwrap();
+        f.state.begin(&rid, version).unwrap();
+        assert!(
+            scan(
+                &f.alice.repo,
+                &mut f.state,
+                version,
+                SCAN_REMOTES,
+                SCAN_TIPS
+            )
+            .unwrap()
+        );
     }
 
     #[test]
