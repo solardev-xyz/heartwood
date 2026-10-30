@@ -111,9 +111,9 @@ pub(crate) struct Workers(Vec<thread::JoinHandle<()>>);
 
 impl Workers {
     /// Waits up to `limit` for the workers to end. They end once the wire is
-    /// gone (the queue closes) and their current call returns. A worker still
-    /// in a resolver call past `limit` is left to end on its own, and logged.
-    pub fn join_within(self, limit: Duration) {
+    /// gone (the queue closes) and their current call returns. It returns
+    /// the workers still in a resolver call past `limit`, and logs them.
+    pub fn join_within(self, limit: Duration) -> Workers {
         let deadline = Instant::now() + limit;
         let mut left = self.0;
         while !left.is_empty() && Instant::now() < deadline {
@@ -132,28 +132,44 @@ impl Workers {
         if !left.is_empty() {
             log::warn!(
                 target: "wire",
-                "{} resolver thread(s) still in a resolver call; leaving them to end on their own",
+                "{} resolver thread(s) still in a resolver call; waiting for them to end",
                 left.len()
             );
+        }
+        Workers(left)
+    }
+
+    /// Whether every worker has been joined.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Waits for every worker to end, however long its resolver call takes.
+    pub fn join(self) {
+        for worker in self.0 {
+            if worker.join().is_err() {
+                log::error!(target: "wire", "A resolver thread panicked");
+            }
         }
     }
 }
 
-/// Starts `threads` workers, resolving through `gate` the jobs of a queue
-/// that holds at most `queue`, and handing their answers back to the
-/// reactor through `controller`.
+/// Starts `threads` workers, named `name`, resolving through `gate` the jobs
+/// of a queue that holds at most `queue`, and handing their answers back to
+/// the reactor through `controller`.
 pub(crate) fn spawn(
     gate: Arc<dyn Gate>,
     controller: Controller,
     threads: usize,
     queue: usize,
+    name: String,
 ) -> io::Result<(Resolvers, Workers)> {
     let (jobs, queued) = chan::bounded::<Job>(queue);
     let mut workers = Vec::with_capacity(threads);
     for _ in 0..threads.max(1) {
         let (queued, gate, controller) = (queued.clone(), gate.clone(), controller.clone());
         let worker = thread::Builder::new()
-            .name("resolver".to_owned())
+            .name(name.clone())
             .spawn(move || work(queued, gate.as_ref(), controller))?;
         workers.push(worker);
     }

@@ -3,6 +3,8 @@ use std::io::BufReader;
 use std::io::LineWriter;
 use std::io::prelude::*;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, net, time};
 
 #[cfg(unix)]
@@ -23,6 +25,27 @@ use crate::runtime::thread;
 /// Maximum timeout for waiting for node events.
 const MAX_TIMEOUT: time::Duration = time::Duration::MAX;
 
+/// How long the listener waits, when no connection is pending, before it
+/// looks again, and checks whether it is to stop.
+const LISTEN_POLL: time::Duration = time::Duration::from_millis(50);
+
+/// How long a command's thread stays, in milliseconds, once its command has
+/// returned: for a test in a process of its own, to see that the thread is
+/// joined, not merely ended by the time its node lets go of its home.
+#[cfg(test)]
+pub(crate) static COMMAND_LINGER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a command's thread fails to start, as the operating system can
+/// refuse one: for a test in a process of its own.
+#[cfg(test)]
+pub(crate) static COMMAND_SPAWN_FAILS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the listener panics once it has taken a connection: for a test
+/// in a process of its own, of what an unwind leaves running.
+#[cfg(test)]
+pub(crate) static LISTENER_PANICS: AtomicBool = AtomicBool::new(false);
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("failed to bind control socket listener: {0}")]
@@ -33,8 +56,19 @@ pub enum Error {
     Node(#[from] runtime::handle::Error),
 }
 
-/// Listen for commands on the control socket, and process them.
-pub fn listen<E, H>(listener: UnixListener, handle: H) -> Result<(), Error>
+/// Listen for commands on the control socket, and process them, each on a
+/// thread of its own, until `stop` is set.
+///
+/// The listener doesn't block on its socket: it looks for a connection
+/// every [`LISTEN_POLL`], and checks `stop` in between. Once it is set, it
+/// shuts down the connections of the commands still running, so that a read
+/// or a write they wait on ends, joins their threads, and returns. A
+/// command waiting on the node itself ends once the node has stopped: its
+/// handle fails, and an event stream ends as the node closes it.
+///
+/// It does the same if it unwinds ([`Commands`]). A connection whose thread
+/// the operating system won't start is closed, and the listener goes on.
+pub fn listen<E, H>(listener: UnixListener, handle: H, stop: Arc<AtomicBool>) -> Result<(), Error>
 where
     H: Handle<Error = runtime::handle::Error> + 'static,
     H::Sessions: serde::Serialize,
@@ -43,13 +77,30 @@ where
 {
     log::debug!(target: "control", "Control thread listening on socket..");
     let nid = handle.nid()?;
+    listener.set_nonblocking(true).map_err(Error::Bind)?;
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(mut stream) => {
+    let mut commands = Commands::default();
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Err(e) = stream.set_nonblocking(false) {
+                    log::warn!(target: "control", "Failed to set up an incoming connection: {e}");
+                    continue;
+                }
+                let control = match stream.try_clone() {
+                    Ok(control) => control,
+                    Err(e) => {
+                        log::warn!(target: "control", "Failed to set up an incoming connection: {e}");
+                        continue;
+                    }
+                };
+                #[cfg(test)]
+                if LISTENER_PANICS.load(Ordering::SeqCst) {
+                    panic!("the listener panics, as a test asks");
+                }
                 let handle = handle.clone();
-
-                thread::spawn(&nid, "control", move || {
+                let spawned = spawn_command(&nid, move || {
+                    let mut stream = stream;
                     if let Err(e) = command(&stream, handle) {
                         log::debug!(target: "control", "Command returned error: {e}");
 
@@ -58,14 +109,87 @@ where
                         stream.flush().ok();
                         stream.shutdown(net::Shutdown::Both).ok();
                     }
+                    #[cfg(test)]
+                    std::thread::sleep(time::Duration::from_millis(
+                        COMMAND_LINGER.load(Ordering::SeqCst),
+                    ));
                 });
+                match spawned {
+                    Ok(thread) => commands.0.push((control, thread)),
+                    // The command's closure, and its end of the connection,
+                    // are dropped with the error: the connection closes.
+                    Err(e) => {
+                        log::warn!(
+                            target: "control",
+                            "Unable to start a thread for a control connection, closing it: {e}"
+                        );
+                        control.shutdown(net::Shutdown::Both).ok();
+                    }
+                }
             }
-            Err(e) => log::warn!(target: "control", "Failed to accept incoming connection: {e}"),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(LISTEN_POLL),
+            Err(e) => {
+                log::warn!(target: "control", "Failed to accept incoming connection: {e}");
+                std::thread::sleep(LISTEN_POLL);
+            }
         }
+        // The commands that have ended are joined, so that their handles
+        // don't pile up.
+        commands.join_ended();
     }
     log::debug!(target: "control", "Exiting control loop..");
-
+    // `commands` shuts the rest down, and joins them, as it is dropped.
     Ok(())
+}
+
+/// Starts a command's thread, unless the operating system refuses it.
+fn spawn_command<F>(nid: &NodeId, f: F) -> io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    if COMMAND_SPAWN_FAILS.load(Ordering::SeqCst) {
+        drop(f);
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "a thread refused, as a test asks",
+        ));
+    }
+    thread::try_spawn(nid, "control", f)
+}
+
+/// The commands a listener serves: each one's connection, and its thread.
+/// Dropped, as the listener returns or unwinds, it shuts their connections
+/// down, so that a read or a write they wait on ends, and joins them.
+#[derive(Default)]
+struct Commands(Vec<(UnixStream, std::thread::JoinHandle<()>)>);
+
+impl Commands {
+    /// Joins the commands that have ended.
+    fn join_ended(&mut self) {
+        let (ended, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|(_, thread)| thread.is_finished());
+        for (_, thread) in ended {
+            if thread.join().is_err() {
+                log::error!(target: "control", "A control command's thread panicked");
+            }
+        }
+        self.0 = running;
+    }
+}
+
+impl Drop for Commands {
+    fn drop(&mut self) {
+        for (stream, _) in &self.0 {
+            stream.shutdown(net::Shutdown::Both).ok();
+        }
+        for (_, thread) in self.0.drain(..) {
+            if thread.join().is_err() {
+                log::error!(target: "control", "A control command's thread panicked");
+            }
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -302,7 +426,7 @@ mod tests {
         thread::spawn({
             let handle = handle.clone();
 
-            move || listen(listener, handle)
+            move || listen(listener, handle, Default::default())
         });
 
         for rid in &rids {
@@ -352,7 +476,7 @@ mod tests {
         thread::spawn({
             let handle = crate::test::handle::Handle::default();
 
-            move || crate::control::listen(listener, handle)
+            move || crate::control::listen(listener, handle, Default::default())
         });
 
         // Wait for node to be online.
