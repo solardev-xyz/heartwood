@@ -3765,7 +3765,6 @@ fn test_a_resolver_in_a_lookup_is_joined_before_the_home_is_let_go_of() {
 
 /// A runtime for a node of `seed` on `tmp`, with its default control socket,
 /// dialling through `gate`.
-#[cfg(target_os = "linux")]
 fn init_gated(
     tmp: &std::path::Path,
     seed: usize,
@@ -3790,6 +3789,46 @@ fn init_gated(
     )
     .unwrap();
     (nid, home, runtime)
+}
+
+#[test]
+// The control socket takes a connection as soon as it arrives. Twenty
+// commands in a row, each on a connection of its own, as the CLI sends them,
+// take well under the 50 ms each could otherwise wait to be taken, the
+// listener's interval for checking whether it is to stop. `rad init` races
+// a seed's fetch, subscribing to events only after its `seed` and
+// `addInventory` have started it, and that wait made it lose.
+fn test_control_connections_are_taken_at_once() {
+    use radicle::node::Handle as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, home, runtime) = init_gated(
+        tmp.path(),
+        4_352,
+        std::sync::Arc::new(radicle::node::dial::Open),
+    );
+    let handle = runtime.handle.clone();
+    let running = thread::spawn(move || runtime.run());
+    let control = radicle::node::Node::new(home.socket_default());
+    // The first command waits for the node to listen.
+    let until = time::Instant::now() + time::Duration::from_secs(10);
+    while control.clone().config().is_err() {
+        assert!(time::Instant::now() < until, "the node never listened");
+        thread::sleep(time::Duration::from_millis(10));
+    }
+
+    let started = time::Instant::now();
+    for _ in 0..20 {
+        control.clone().config().unwrap();
+    }
+    let took = started.elapsed();
+    assert!(
+        took < time::Duration::from_millis(300),
+        "twenty commands took {took:?}"
+    );
+
+    handle.shutdown().unwrap();
+    running.join().unwrap().unwrap();
 }
 
 /// Two connections to the control socket at `path`, each keeping a command

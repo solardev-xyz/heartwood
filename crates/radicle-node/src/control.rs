@@ -26,7 +26,8 @@ use crate::runtime::thread;
 const MAX_TIMEOUT: time::Duration = time::Duration::MAX;
 
 /// How long the listener waits, when no connection is pending, before it
-/// looks again, and checks whether it is to stop.
+/// checks whether it is to stop. On Unix it waits on the socket, and takes a
+/// connection as soon as one arrives.
 const LISTEN_POLL: time::Duration = time::Duration::from_millis(50);
 
 /// How long a command's thread stays, in milliseconds, once its command has
@@ -59,8 +60,10 @@ pub enum Error {
 /// Listen for commands on the control socket, and process them, each on a
 /// thread of its own, until `stop` is set.
 ///
-/// The listener doesn't block on its socket: it looks for a connection
-/// every [`LISTEN_POLL`], and checks `stop` in between. Once it is set, it
+/// The listener doesn't block on its socket for long: it waits up to
+/// [`LISTEN_POLL`] for a connection, and checks `stop` in between. On Unix
+/// the wait ends as soon as a connection arrives, so that a command isn't
+/// held up by it. Once it is set, it
 /// shuts down the connections of the commands still running, so that a read
 /// or a write they wait on ends, joins their threads, and returns. A
 /// command waiting on the node itself ends once the node has stopped: its
@@ -127,7 +130,7 @@ where
                     }
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(LISTEN_POLL),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => await_connection(&listener),
             Err(e) => {
                 log::warn!(target: "control", "Failed to accept incoming connection: {e}");
                 std::thread::sleep(LISTEN_POLL);
@@ -140,6 +143,43 @@ where
     log::debug!(target: "control", "Exiting control loop..");
     // `commands` shuts the rest down, and joins them, as it is dropped.
     Ok(())
+}
+
+/// Waits up to [`LISTEN_POLL`] for a connection to `listener`, returning as
+/// soon as one is pending.
+#[cfg(unix)]
+fn await_connection(listener: &UnixListener) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let mut fds = [PollFd::new(listener, PollFlags::IN)];
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: LISTEN_POLL.as_nanos() as _,
+    };
+    if poll(&mut fds, Some(&timeout)).is_err() {
+        std::thread::sleep(LISTEN_POLL);
+    }
+}
+
+/// Waits up to [`LISTEN_POLL`] for a connection to `listener`, returning as
+/// soon as one is pending: with `WSAPoll`, as `uds_windows` sockets are
+/// Winsock's.
+#[cfg(windows)]
+fn await_connection(listener: &UnixListener) {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, WSAPOLLFD, WSAPoll};
+
+    let mut fd = WSAPOLLFD {
+        fd: listener.as_raw_socket() as usize,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    // SAFETY: one `WSAPOLLFD`, for the listener's socket, which `listener`
+    // keeps open while this runs.
+    let ready = unsafe { WSAPoll(&mut fd, 1, LISTEN_POLL.as_millis() as i32) };
+    if ready < 0 {
+        std::thread::sleep(LISTEN_POLL);
+    }
 }
 
 /// Starts a command's thread, unless the operating system refuses it.
