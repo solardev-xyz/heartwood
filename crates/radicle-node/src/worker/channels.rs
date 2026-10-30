@@ -33,10 +33,6 @@ impl ChannelsConfig {
         }
     }
 
-    pub fn with_timeout(self, timeout: time::Duration) -> Self {
-        Self { timeout, ..self }
-    }
-
     pub fn with_reader_limit(self, reader_limit: FetchPackSizeLimit) -> Self {
         Self {
             reader_limit,
@@ -167,6 +163,7 @@ impl<T: AsRef<[u8]>> Channels<T> {
         self.receiver.is_empty()
     }
 
+    #[cfg(test)]
     pub fn send(&self, event: ChannelEvent<T>) -> io::Result<()> {
         self.sender.send(event)
     }
@@ -359,7 +356,6 @@ mod test {
         let (sender, _commands) = chan::unbounded();
         let handle = Handle::new(
             Home::new(tmp.path().join("home")).unwrap(),
-            None,
             Controller::new(sender, waker),
             Default::default(),
         );

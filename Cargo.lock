@@ -3055,6 +3055,7 @@ dependencies = [
  "radicle-signals",
  "radicle-systemd",
  "radicle-windows",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",
