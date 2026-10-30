@@ -560,6 +560,20 @@ impl FetchState {
                                 continue;
                             }
                         }
+                        // Its stored history takes more than a read may
+                        // (Security R-21): the remote is refused, as for
+                        // signed refs that don't load.
+                        Err(
+                            err @ radicle::storage::refs::sigrefs::read::error::Read::Exhausted(_),
+                        ) => {
+                            log::debug!("Pruning non-delegate {remote} tips due to: {err}");
+                            self.prune(&remote);
+                            failures.push(sigrefs::Validation::Read {
+                                remote,
+                                source: err,
+                            });
+                            continue;
+                        }
                         Err(err) => return Err(error::Protocol::Refs(err)),
                         Ok(None) => {
                             // We see signed references for this non-delegate for the first time.
@@ -615,6 +629,23 @@ impl FetchState {
                                 self.prune(&remote);
                                 continue;
                             }
+                        }
+                        // Its stored history takes more than a read may
+                        // (Security R-21): the delegate is refused, and
+                        // counts as failed, as for signed refs that don't
+                        // load.
+                        Err(
+                            err @ radicle::storage::refs::sigrefs::read::error::Read::Exhausted(_),
+                        ) => {
+                            log::debug!("Pruning delegate {remote} tips due to: {err}");
+                            self.prune(&remote);
+                            valid_delegates.remove(&remote);
+                            failed_delegates.insert(remote);
+                            failures.push(sigrefs::Validation::Read {
+                                remote,
+                                source: err,
+                            });
+                            continue;
                         }
                         Err(err) => return Err(error::Protocol::Refs(err)),
                         Ok(None) => {

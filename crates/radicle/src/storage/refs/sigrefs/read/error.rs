@@ -29,6 +29,47 @@ pub enum Read {
         actual: FeatureLevel,
         commit: Oid,
     },
+    /// The history took more than the reader's budget to read: the remote is
+    /// refused.
+    #[error(transparent)]
+    Exhausted(Exhausted),
+}
+
+impl Read {
+    /// `err`, as the read's error: an exhausted budget as itself.
+    pub(super) fn from_commit(err: Commit) -> Self {
+        match err {
+            Commit::Exhausted(e) => Self::Exhausted(e),
+            e => Self::Commit(e),
+        }
+    }
+}
+
+/// A [`crate::storage::refs::sigrefs::read::Budget`] spent: reading the
+/// signed references' history would take more commits, or more bytes, than
+/// it allows.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+#[error("reading the signed references' history takes more than its {limit} {what}")]
+pub struct Exhausted {
+    pub what: &'static str,
+    pub limit: u64,
+}
+
+impl Exhausted {
+    pub(super) fn commits(limit: usize) -> Self {
+        Self {
+            what: "commits",
+            limit: limit as u64,
+        }
+    }
+
+    pub(super) fn bytes(limit: u64) -> Self {
+        Self {
+            what: "bytes",
+            limit,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -49,6 +90,8 @@ pub enum Commit {
     TooManyParents(Parent),
     #[error(transparent)]
     Read(object::error::ReadCommit),
+    #[error(transparent)]
+    Exhausted(Exhausted),
 }
 
 #[derive(Debug, Error)]
@@ -84,6 +127,8 @@ pub enum Tree {
     ParseSignature(crypto::signature::Error),
     #[error(transparent)]
     MissingBlobs(#[from] MissingBlobs),
+    #[error(transparent)]
+    Exhausted(Exhausted),
 }
 
 #[derive(Debug, Error)]
@@ -107,6 +152,8 @@ pub enum IdentityRoot {
     Blob(object::error::ReadBlob),
     #[error("missing repository identity commit '{commit}'")]
     MissingIdentity { commit: Oid },
+    #[error(transparent)]
+    Exhausted(Exhausted),
 }
 
 #[derive(Debug, Error)]
