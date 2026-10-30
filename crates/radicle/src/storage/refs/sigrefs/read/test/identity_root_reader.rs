@@ -4,7 +4,7 @@ use radicle_oid::Oid;
 use crate::git;
 use crate::storage::refs::sigrefs::VerifiedCommit;
 use crate::storage::refs::sigrefs::read::{
-    IdentityRoot, IdentityRootReader, SignedRefsReader, Tip, error,
+    Budget, IdentityRoot, IdentityRootReader, SignedRefsReader, Spending, Tip, error,
 };
 use crate::storage::refs::{IDENTITY_ROOT, Refs};
 
@@ -74,6 +74,7 @@ fn read_ok_some() {
     let result = IdentityRootReader::new(
         &Refs::from(refs_with_identity(identity_root).into_iter()),
         &repo,
+        &Spending::new(Budget::DEFAULT),
     )
     .read()
     .unwrap();
@@ -96,8 +97,12 @@ fn read_ok_none() {
         .with_refs(root, refs.clone())
         .with_signature(root, 1);
 
-    let result = IdentityRootReader::new(&Refs::from(refs.into_iter()), &repo)
-        .read()
-        .unwrap();
+    let result = IdentityRootReader::new(
+        &Refs::from(refs.into_iter()),
+        &repo,
+        &Spending::new(Budget::DEFAULT),
+    )
+    .read()
+    .unwrap();
     assert_eq!(result, None);
 }

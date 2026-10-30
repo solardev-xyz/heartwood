@@ -5,6 +5,7 @@ mod iter;
 #[cfg(test)]
 mod test;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -62,6 +63,89 @@ impl VerifiedCommit {
     }
 }
 
+/// History commits a [`SignedRefsReader`] reads at most, in [`Budget::DEFAULT`]:
+/// the head, and both walks of an old-format history together.
+///
+/// The longest `rad/sigrefs` history of any remote of the busiest
+/// repositories on seed.radicle.xyz, measured 2026-10-30, is 12,380 commits.
+/// The longest whose head has the old format, and so is walked, is 645.
+pub const MAX_HISTORY_COMMITS: usize = 16_384;
+
+/// Bytes of objects a [`SignedRefsReader`] reads at most, in
+/// [`Budget::DEFAULT`]: commits, trees, `refs`, `signature` and identity
+/// blobs, each measured before it is read.
+///
+/// A walk of the longest old-format history measured with
+/// [`MAX_HISTORY_COMMITS`] reads some 8 MB; one of the 12,380-commit history,
+/// were its head of the old format, some 1.1 GB.
+pub const MAX_HISTORY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What a [`SignedRefsReader`] may read, at most, before it refuses the
+/// history with [`error::Read::Exhausted`]: a remote's history is as long as
+/// its key makes it, and an old-format head has every reader walk it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Commits read, each counted before it is.
+    pub commits: usize,
+    /// Bytes of objects read, each object measured before it is.
+    pub bytes: u64,
+}
+
+impl Budget {
+    pub const DEFAULT: Self = Self {
+        commits: MAX_HISTORY_COMMITS,
+        bytes: MAX_HISTORY_BYTES,
+    };
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// What a read has spent of its [`Budget`], so far.
+pub(super) struct Spending {
+    budget: Budget,
+    commits: Cell<usize>,
+    bytes: Cell<u64>,
+}
+
+impl Spending {
+    pub(super) fn new(budget: Budget) -> Self {
+        Self {
+            budget,
+            commits: Cell::new(0),
+            bytes: Cell::new(0),
+        }
+    }
+
+    /// Counts a commit about to be read, unless the budget has none left.
+    fn commit(&self) -> Result<(), error::Exhausted> {
+        let commits = self.commits.get();
+        if commits >= self.budget.commits {
+            return Err(error::Exhausted::commits(self.budget.commits));
+        }
+        self.commits.set(commits + 1);
+        Ok(())
+    }
+
+    /// The bytes left to read.
+    fn left(&self) -> u64 {
+        self.budget.bytes.saturating_sub(self.bytes.get())
+    }
+
+    /// Counts `bytes` read.
+    fn spend(&self, bytes: u64) {
+        self.bytes.set(self.bytes.get().saturating_add(bytes));
+    }
+
+    /// The exhaustion of the byte budget.
+    fn out_of_bytes(&self) -> error::Exhausted {
+        error::Exhausted::bytes(self.budget.bytes)
+    }
+}
+
 /// A [`SignedRefsReader`] reads and verifies a commit chain for a `rad/sigrefs`
 /// entry.
 ///
@@ -77,6 +161,7 @@ pub struct SignedRefsReader<'a, Repository, Verifier = VerifyingKey> {
     tip: Tip,
     repository: &'a Repository,
     verifier: &'a Verifier,
+    budget: Budget,
 }
 
 /// Describe where to start a [`SignedRefsReader`]'s commit chain.
@@ -131,14 +216,21 @@ where
     Repository: object::Reader + reference::Reader,
     Verifier: signature::Verifier<crypto::Signature>,
 {
-    /// Construct a new [`SignedRefsReader`].
+    /// Construct a new [`SignedRefsReader`], within [`Budget::DEFAULT`].
     pub fn new(rid: RepoId, tip: Tip, repository: &'a Repository, verifier: &'a Verifier) -> Self {
         Self {
             rid,
             tip,
             repository,
             verifier,
+            budget: Budget::DEFAULT,
         }
+    }
+
+    /// The reader, within `budget` rather than the default.
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Read a [`VerifiedCommit`] using the [`SignedRefsReader`], from a
@@ -165,13 +257,23 @@ where
     ///   signatures. This means that any repeated signatures will be skipped,
     ///   and the commit returned will be the first valid commit, that was not a
     ///   replay.
+    ///
+    /// # Bounds
+    ///
+    /// It reads within its [`Budget`]: every commit is counted, and every
+    /// object measured, before it is read, the head's and both walks'
+    /// together. Past either limit, it fails with [`error::Read::Exhausted`],
+    /// whatever the history would have given, and a caller refuses the
+    /// remote, as for any other error. A history within the budget reads as
+    /// it always did, its downgrade check included.
     pub fn read(self) -> Result<VerifiedCommit, error::Read> {
         const ONE: NonZeroUsize = NonZeroUsize::new(1).expect("one is non-zero");
         const SIGNATURES_COLLECTED: &str = "all signatures were collected";
 
-        let mut head = CommitReader::new(self.resolve_tip()?, self.repository)
+        let spending = Spending::new(self.budget);
+        let mut head = CommitReader::new(self.resolve_tip()?, self.repository, &spending)
             .read()
-            .map_err(error::Read::Commit)?
+            .map_err(error::Read::from_commit)?
             .verify(self.rid, self.verifier)
             .map_err(error::Read::Verify)?;
 
@@ -212,37 +314,38 @@ where
         //
         // `level` is the feature level of the history, which is
         // the maximum feature level over all commits in the history.
-        let (seen, levels) = iter::Walk::new(head.commit.oid, self.repository).try_fold(
-            (
-                HashMap::<HashSignature, NonEmpty<Oid>>::new(),
-                FeatureLevels::new(),
-            ),
-            |(mut seen, mut levels), commit| {
-                let commit = commit.map_err(error::Read::Commit)?;
+        let (seen, levels) = iter::Walk::new(head.commit.oid, self.repository, &spending)
+            .try_fold(
+                (
+                    HashMap::<HashSignature, NonEmpty<Oid>>::new(),
+                    FeatureLevels::new(),
+                ),
+                |(mut seen, mut levels), commit| {
+                    let commit = commit.map_err(error::Read::from_commit)?;
 
-                seen.entry(HashSignature(commit.signature))
-                    .and_modify(|value| value.push(commit.oid))
-                    .or_insert_with(|| NonEmpty::new(commit.oid));
+                    seen.entry(HashSignature(commit.signature))
+                        .and_modify(|value| value.push(commit.oid))
+                        .or_insert_with(|| NonEmpty::new(commit.oid));
 
-                // Before `commit` can be interpreted for feature detection,
-                // it must be verified. In particular, we do not want to
-                // detect features on commits that have an invalid signature.
-                // However, if we have already reached the maximum level,
-                // this is not required anymore, since it cannot increase any
-                // further.
-                if levels.max() < FeatureLevel::LATEST {
-                    let commit = commit
-                        .verify(self.rid, self.verifier)
-                        .map_err(error::Read::Verify)?;
+                    // Before `commit` can be interpreted for feature detection,
+                    // it must be verified. In particular, we do not want to
+                    // detect features on commits that have an invalid signature.
+                    // However, if we have already reached the maximum level,
+                    // this is not required anymore, since it cannot increase any
+                    // further.
+                    if levels.max() < FeatureLevel::LATEST {
+                        let commit = commit
+                            .verify(self.rid, self.verifier)
+                            .map_err(error::Read::Verify)?;
 
-                    if commit.level > FeatureLevel::None {
-                        levels.insert(&commit);
+                        if commit.level > FeatureLevel::None {
+                            levels.insert(&commit);
+                        }
                     }
-                }
 
-                Ok((seen, levels))
-            },
-        )?;
+                    Ok((seen, levels))
+                },
+            )?;
 
         let level = levels.max();
 
@@ -272,9 +375,9 @@ where
 
         // The second walk can start from the parent of `head`. We do not need to
         // verify `head` twice, and we already know that the parent exists.
-        for commit in iter::Walk::new(parent, self.repository) {
+        for commit in iter::Walk::new(parent, self.repository, &spending) {
             let verified = commit
-                .map_err(error::Read::Commit)?
+                .map_err(error::Read::from_commit)?
                 .verify(self.rid, self.verifier)
                 .map_err(error::Read::Verify)?;
 
@@ -448,24 +551,36 @@ impl Commit {
     }
 }
 
-pub(super) struct CommitReader<'a, Repository: object::Reader> {
+pub(super) struct CommitReader<'a, 's, Repository: object::Reader> {
     commit: Oid,
     repository: &'a Repository,
+    spending: &'s Spending,
 }
 
-impl<'a, Repo: object::Reader> CommitReader<'a, Repo> {
-    pub(super) fn new(commit: Oid, repository: &'a Repo) -> Self {
-        Self { commit, repository }
+impl<'a, 's, Repo: object::Reader> CommitReader<'a, 's, Repo> {
+    pub(super) fn new(commit: Oid, repository: &'a Repo, spending: &'s Spending) -> Self {
+        Self {
+            commit,
+            repository,
+            spending,
+        }
     }
 
     pub(super) fn read(self) -> Result<Commit, error::Commit> {
+        self.spending.commit().map_err(error::Commit::Exhausted)?;
         let commit = self.read_commit_data()?;
-        let Tree { refs, signature } = TreeReader::new(self.commit, self.repository)
+        let Tree { refs, signature } = TreeReader::new(self.commit, self.repository, self.spending)
             .read()
-            .map_err(error::Commit::Tree)?;
-        let identity_root = IdentityRootReader::new(&refs, self.repository)
+            .map_err(|e| match e {
+                error::Tree::Exhausted(e) => error::Commit::Exhausted(e),
+                e => error::Commit::Tree(e),
+            })?;
+        let identity_root = IdentityRootReader::new(&refs, self.repository, self.spending)
             .read()
-            .map_err(error::Commit::IdentityRoot)?;
+            .map_err(|e| match e {
+                error::IdentityRoot::Exhausted(e) => error::Commit::Exhausted(e),
+                e => error::Commit::IdentityRoot(e),
+            })?;
         let parent = Self::get_parent(&commit).transpose()?;
 
         Ok(Commit {
@@ -478,11 +593,17 @@ impl<'a, Repo: object::Reader> CommitReader<'a, Repo> {
     }
 
     fn read_commit_data(&self) -> Result<CommitData<Oid, Oid>, error::Commit> {
-        let bytes = self
+        let bytes = match self
             .repository
-            .read_commit(&self.commit)
-            .map_err(error::Commit::Read)?
-            .ok_or(error::Commit::Missing { oid: self.commit })?;
+            .read_commit_within(&self.commit, self.spending.left())
+        {
+            Err(object::error::ReadCommit::TooLarge(_)) => {
+                return Err(error::Commit::Exhausted(self.spending.out_of_bytes()));
+            }
+            read => read.map_err(error::Commit::Read)?,
+        }
+        .ok_or(error::Commit::Missing { oid: self.commit })?;
+        self.spending.spend(bytes.len() as u64);
         CommitData::from_bytes(&bytes).map_err(|err| error::Commit::Parse {
             oid: self.commit,
             source: err,
@@ -514,14 +635,42 @@ struct Tree {
     signature: crypto::Signature,
 }
 
-struct TreeReader<'a, Repo: object::Reader> {
+struct TreeReader<'a, 's, Repo: object::Reader> {
     commit: Oid,
     repository: &'a Repo,
+    spending: &'s Spending,
 }
 
-impl<'a, Repo: object::Reader> TreeReader<'a, Repo> {
-    fn new(commit: Oid, repository: &'a Repo) -> Self {
-        Self { commit, repository }
+impl<'a, 's, Repo: object::Reader> TreeReader<'a, 's, Repo> {
+    fn new(commit: Oid, repository: &'a Repo, spending: &'s Spending) -> Self {
+        Self {
+            commit,
+            repository,
+            spending,
+        }
+    }
+
+    /// The blob at `path` in the commit's tree, within what the budget
+    /// leaves.
+    fn read_blob(
+        &self,
+        path: &Path,
+        failed: fn(object::error::ReadBlob) -> error::Tree,
+    ) -> Result<Option<object::Blob>, error::Tree> {
+        match self
+            .repository
+            .read_blob_within(&self.commit, path, self.spending.left())
+        {
+            Ok(Some((blob, read))) => {
+                self.spending.spend(read);
+                Ok(Some(blob))
+            }
+            Ok(None) => Ok(None),
+            Err(object::error::ReadBlob::TooLarge(_)) => {
+                Err(error::Tree::Exhausted(self.spending.out_of_bytes()))
+            }
+            Err(e) => Err(failed(e)),
+        }
     }
 
     fn read(self) -> Result<Tree, error::Tree> {
@@ -539,14 +688,8 @@ impl<'a, Repo: object::Reader> TreeReader<'a, Repo> {
         let refs_path = Path::new(REFS_BLOB_PATH);
         let sig_path = Path::new(SIGNATURE_BLOB_PATH);
 
-        let refs_bytes = self
-            .repository
-            .read_blob(commit, refs_path)
-            .map_err(error::Tree::Refs)?;
-        let sig_bytes = self
-            .repository
-            .read_blob(commit, sig_path)
-            .map_err(error::Tree::Signature)?;
+        let refs_bytes = self.read_blob(refs_path, error::Tree::Refs)?;
+        let sig_bytes = self.read_blob(sig_path, error::Tree::Signature)?;
 
         let result = match (refs_bytes, sig_bytes) {
             (None, None) => Err(error::MissingBlobs::Both {
@@ -575,14 +718,19 @@ pub(super) struct IdentityRoot {
     rid: RepoId,
 }
 
-struct IdentityRootReader<'a, 'b, Repo: object::Reader> {
+struct IdentityRootReader<'a, 'b, 's, Repo: object::Reader> {
     refs: &'a Refs,
     repository: &'b Repo,
+    spending: &'s Spending,
 }
 
-impl<'a, 'b, Repo: object::Reader> IdentityRootReader<'a, 'b, Repo> {
-    fn new(refs: &'a Refs, repository: &'b Repo) -> Self {
-        Self { refs, repository }
+impl<'a, 'b, 's, Repo: object::Reader> IdentityRootReader<'a, 'b, 's, Repo> {
+    fn new(refs: &'a Refs, repository: &'b Repo, spending: &'s Spending) -> Self {
+        Self {
+            refs,
+            repository,
+            spending,
+        }
     }
 
     fn read(self) -> Result<Option<IdentityRoot>, error::IdentityRoot> {
@@ -596,11 +744,18 @@ impl<'a, 'b, Repo: object::Reader> IdentityRootReader<'a, 'b, Repo> {
 
     fn read_blob(&self, commit: &Oid) -> Result<RepoId, error::IdentityRoot> {
         let path = Path::new("embeds").join(*doc::PATH);
-        let object::Blob { oid, .. } = self
-            .repository
-            .read_blob(commit, &path)
-            .map_err(error::IdentityRoot::Blob)?
+        let (object::Blob { oid, .. }, read) =
+            match self
+                .repository
+                .read_blob_within(commit, &path, self.spending.left())
+            {
+                Err(object::error::ReadBlob::TooLarge(_)) => {
+                    return Err(error::IdentityRoot::Exhausted(self.spending.out_of_bytes()));
+                }
+                read => read.map_err(error::IdentityRoot::Blob)?,
+            }
             .ok_or_else(|| error::IdentityRoot::MissingIdentity { commit: *commit })?;
+        self.spending.spend(read);
         Ok(RepoId::from(oid))
     }
 }

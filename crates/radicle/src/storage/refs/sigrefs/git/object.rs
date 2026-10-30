@@ -44,6 +44,51 @@ pub trait Reader {
     ///   [`Oid`] was found, but was not a commit.
     /// - [`error::ReadBlob::Other`]: failed to read the Git blob.
     fn read_blob(&self, commit: &Oid, path: &Path) -> Result<Option<Blob>, error::ReadBlob>;
+
+    /// [`Reader::read_commit`], refusing a commit that takes more than
+    /// `limit` bytes with [`error::ReadCommit::TooLarge`].
+    ///
+    /// A repository should measure the commit before it reads it, as the Git
+    /// implementations do. This default reads it first, and is for readers
+    /// that hold their objects in memory already.
+    fn read_commit_within(
+        &self,
+        oid: &Oid,
+        limit: u64,
+    ) -> Result<Option<Vec<u8>>, error::ReadCommit> {
+        let bytes = self.read_commit(oid)?;
+        if let Some(bytes) = &bytes
+            && bytes.len() as u64 > limit
+        {
+            return Err(error::ReadCommit::too_large(limit));
+        }
+        Ok(bytes)
+    }
+
+    /// [`Reader::read_blob`], within `limit` bytes for everything it reads to
+    /// find the blob and the blob itself, refusing more with
+    /// [`error::ReadBlob::TooLarge`]. It returns the blob, and how many bytes
+    /// it read.
+    ///
+    /// A repository should measure each object before it reads it: the
+    /// commit, each tree on the way to `path`, and the blob, as the Git
+    /// implementations do. This default reads the blob first, counts it
+    /// alone, and is for readers that hold their objects in memory already.
+    fn read_blob_within(
+        &self,
+        commit: &Oid,
+        path: &Path,
+        limit: u64,
+    ) -> Result<Option<(Blob, u64)>, error::ReadBlob> {
+        let Some(blob) = self.read_blob(commit, path)? else {
+            return Ok(None);
+        };
+        let size = blob.bytes.len() as u64;
+        if size > limit {
+            return Err(error::ReadBlob::too_large(limit));
+        }
+        Ok(Some((blob, size)))
+    }
 }
 
 /// Input to the [`Writer::write_tree`] method.

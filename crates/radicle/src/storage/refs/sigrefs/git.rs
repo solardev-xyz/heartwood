@@ -229,6 +229,103 @@ mod git2_impls {
                 bytes: blob.content().to_vec(),
             }))
         }
+
+        fn read_commit_within(
+            &self,
+            oid: &Oid,
+            limit: u64,
+        ) -> Result<Option<Vec<u8>>, object::error::ReadCommit> {
+            use object::error::ReadCommit;
+
+            let odb = self.odb().map_err(ReadCommit::other)?;
+            let id = git2::Oid::from(*oid);
+            match odb.read_header(id) {
+                Ok((_, kind)) if kind != git2::ObjectType::Commit => {
+                    return Err(ReadCommit::incorrect_object_error(*oid, kind));
+                }
+                Ok((size, _)) if size as u64 > limit => return Err(ReadCommit::too_large(limit)),
+                Ok(_) => {}
+                Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+                Err(e) => return Err(ReadCommit::other(e)),
+            }
+            self.read_commit(oid)
+        }
+
+        fn read_blob_within(
+            &self,
+            oid: &Oid,
+            path: &Path,
+            limit: u64,
+        ) -> Result<Option<(object::Blob, u64)>, object::error::ReadBlob> {
+            use object::error::ReadBlob;
+
+            let odb = self.odb().map_err(ReadBlob::other)?;
+            let mut read = 0u64;
+            // Each object is measured, and counted, before it is read.
+            let mut measure = |id: git2::Oid| -> Result<git2::ObjectType, ReadBlob> {
+                let (size, kind) = odb.read_header(id).map_err(ReadBlob::other)?;
+                read = read.saturating_add(size as u64);
+                if read > limit {
+                    return Err(ReadBlob::too_large(limit));
+                }
+                Ok(kind)
+            };
+
+            let id = git2::Oid::from(*oid);
+            match odb.read_header(id) {
+                Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                    return Err(ReadBlob::commit_not_found_error(*oid));
+                }
+                Err(e) => return Err(ReadBlob::other(e)),
+                Ok(_) => {}
+            }
+            measure(id)?;
+            let commit = match self.find_commit(id) {
+                Ok(c) => c,
+                Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                    return Err(ReadBlob::commit_not_found_error(*oid));
+                }
+                Err(e) => return Err(ReadBlob::other(e)),
+            };
+            measure(commit.tree_id())?;
+            let mut tree = commit.tree().map_err(ReadBlob::other)?;
+            let mut components = path.components().peekable();
+            while let Some(component) = components.next() {
+                let Some(name) = component.as_os_str().to_str() else {
+                    return Ok(None);
+                };
+                let Some((id, kind)) = tree.get_name(name).map(|entry| (entry.id(), entry.kind()))
+                else {
+                    return Ok(None);
+                };
+                if components.peek().is_some() {
+                    // A tree on the way.
+                    if kind != Some(git2::ObjectType::Tree) {
+                        return Ok(None);
+                    }
+                    measure(id)?;
+                    tree = self.find_tree(id).map_err(ReadBlob::other)?;
+                    continue;
+                }
+                let kind = measure(id)?;
+                if kind != git2::ObjectType::Blob {
+                    return Err(ReadBlob::incorrect_object_error(
+                        *oid,
+                        path.to_path_buf(),
+                        kind,
+                    ));
+                }
+                let blob = self.find_blob(id).map_err(ReadBlob::other)?;
+                return Ok(Some((
+                    object::Blob {
+                        oid: blob.id().into(),
+                        bytes: blob.content().to_vec(),
+                    },
+                    read,
+                )));
+            }
+            Ok(None)
+        }
     }
 
     impl object::Writer for git2::Repository {
