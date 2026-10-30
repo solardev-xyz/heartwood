@@ -1,6 +1,7 @@
 mod controller;
 mod listener;
 mod session;
+pub(crate) mod socks5;
 mod timer;
 mod token;
 mod transport;
