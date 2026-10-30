@@ -2,9 +2,11 @@
 //!
 //! We use the Noise XK handshake pattern to establish an encrypted stream with a remote peer.
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use std::{io, net, time};
@@ -40,7 +42,7 @@ use crate::reactor::{NoiseSession, ProtocolArtifact, SessionEvent, Socks5Session
 use crate::reactor::{Token, Tokens};
 use crate::resolver;
 use crate::worker;
-use crate::worker::channels::{ChannelEvent, ChannelsConfig};
+use crate::worker::channels::{ChannelEvent, Channels, ChannelsConfig, TrySend};
 use crate::worker::{Task, TaskResult};
 
 /// NoiseXK handshake pattern.
@@ -104,6 +106,25 @@ pub(crate) type WireSession = NoiseSession<crypto::SigningKey, Sha256, Socks5Ses
 /// Reactor action.
 type Action = reactor::Action<Listener, Transport<WireSession>>;
 
+/// How many bytes a peer's write buffer may hold before a worker's stream to
+/// it waits: the stream's data stays in its bounded channel, so its worker
+/// waits too, rather than the buffer growing with whatever the worker makes.
+pub const STREAM_BUFFER_LIMIT: usize = 512 * 1024;
+
+/// How soon a stream that waited for its peer's write buffer, or a frame that
+/// waited for its worker, tries again.
+const STREAM_RETRY: time::Duration = time::Duration::from_millis(10);
+
+/// The most streams one peer may have open with the node at once, its fetches
+/// from the node and the node's from it together.
+pub const MAX_PEER_STREAMS: usize = 16;
+
+/// The most streams open with every peer together.
+pub const MAX_STREAMS: usize = 256;
+
+/// How many stream opens a peer may have refused before it is disconnected.
+const MAX_REFUSED_OPENS: usize = 64;
+
 /// Where the wire leaves the error the service stopped the node with, for the
 /// runtime to return once the reactor has ended.
 pub type Stopped = Arc<Mutex<Option<service::Error>>>;
@@ -148,11 +169,6 @@ impl Streams {
             link,
             seq: 0,
         }
-    }
-
-    /// Get a known stream.
-    fn get(&self, stream: &StreamId) -> Option<&Stream> {
-        self.streams.get(stream)
     }
 
     /// Get a known stream, mutably.
@@ -201,7 +217,7 @@ impl Streams {
     fn shutdown(&mut self) {
         for (sid, stream) in self.streams.drain() {
             log::debug!(target: "wire", "Closing worker stream {sid}");
-            stream.channels.close().ok();
+            stream.channels.close();
         }
     }
 }
@@ -228,6 +244,12 @@ enum Peer {
         nid: NodeId,
         inbox: Deserializer<MAX_INBOX_SIZE, Frame>,
         streams: Streams,
+        /// A frame of a stream whose worker's channel was full, held until it
+        /// has room: no frame of the peer's is taken after it meanwhile, and
+        /// the peer's transport doesn't read.
+        held: Option<(StreamId, ChannelEvent)>,
+        /// How many of its stream opens were refused.
+        refused: usize,
     },
     /// The peer was scheduled for disconnection. Once the transport is handed over
     /// by the reactor, we can consider it disconnected.
@@ -271,6 +293,8 @@ impl Peer {
             nid,
             inbox: Deserializer::default(),
             streams: Streams::new(link),
+            held: None,
+            refused: 0,
         }
     }
 }
@@ -365,6 +389,10 @@ pub(crate) struct Wire<D, S> {
     next_resolution: u64,
     /// The error the service stopped the node with, once it has.
     stopped: Stopped,
+    /// Each peer's transport write buffer, as the wire sees it.
+    outboxes: HashMap<Token, Outbox>,
+    /// The streams whose data waits for their peer's write buffer to drain.
+    waiting: HashSet<(NodeId, StreamId)>,
     /// The secret its SOCKS5 credentials are derived from, per remote node.
     isolation: Isolation,
 }
@@ -445,6 +473,8 @@ where
             resolving: HashMap::new(),
             next_resolution: 0,
             stopped,
+            outboxes: HashMap::new(),
+            waiting: HashSet::new(),
             isolation: Isolation::new(),
         }
     }
@@ -743,23 +773,234 @@ where
             return;
         };
         let metrics = self.metrics.peer(remote);
+        let outbox = self.outboxes.entry(fd).or_default();
 
-        for data in s.channels.try_iter() {
-            let frame = match data {
+        let link = *link;
+        let (frames, more) = take_within(&s.channels, outbox, |event| {
+            match event {
                 ChannelEvent::Data(data) => {
                     metrics.sent_git_bytes += data.len();
                     metrics.sent_bytes += data.len();
                     Frame::<service::Message>::git(stream, data)
                 }
-                ChannelEvent::Close => Frame::control(*link, frame::Control::Close { stream }),
-                ChannelEvent::Eof => Frame::control(*link, frame::Control::Eof { stream }),
-            };
+                ChannelEvent::Close => Frame::control(link, frame::Control::Close { stream }),
+                ChannelEvent::Eof => Frame::control(link, frame::Control::Eof { stream }),
+            }
+            .encode_to_vec()
+        });
+        for frame in frames {
+            self.actions.push_back(reactor::Action::Send(fd, frame));
+        }
+        // The rest waits in the stream's channel, which is bounded: its worker
+        // waits once it is full. It is tried again soon.
+        if more {
+            if self.waiting.insert((remote, stream)) {
+                log::trace!(target: "wire", "Stream {stream} to {remote} waits for its peer's write buffer");
+            }
             self.actions
-                .push_back(reactor::Action::Send(fd, frame.encode_to_vec()));
+                .push_back(reactor::Action::SetTimer(STREAM_RETRY));
+        } else {
+            self.waiting.remove(&(remote, stream));
+        }
+    }
+
+    /// Takes the frames the peer of `token` has sent, from its inbox, in order:
+    /// a frame held for its worker first. A stream's frame whose worker's
+    /// channel is full is held, and the peer's transport stops reading until
+    /// it is delivered. Nothing here waits on a worker.
+    fn take_frames(&mut self, token: Token) {
+        // The streams open with every peer.
+        let mut open = self
+            .peers
+            .0
+            .values()
+            .map(|peer| match peer {
+                Peer::Connected { streams, .. } => streams.streams.len(),
+                Peer::Disconnecting { .. } => 0,
+            })
+            .sum::<usize>();
+        let Some(Peer::Connected {
+            nid,
+            inbox,
+            streams,
+            held,
+            refused,
+            link,
+            ..
+        }) = self.peers.get_mut(&token)
+        else {
+            return;
+        };
+        let nid = *nid;
+        let link = *link;
+        let metrics = self.metrics.peer(nid);
+        let reading = self
+            .outboxes
+            .get(&token)
+            .map(|outbox| outbox.reading.clone());
+
+        // A frame that waited for its worker goes first.
+        if let Some((stream, event)) = held.take()
+            && let Some(event) = deliver(streams, stream, event)
+        {
+            *held = Some((stream, event));
+            self.actions
+                .push_back(reactor::Action::SetTimer(STREAM_RETRY));
+            return;
+        }
+
+        loop {
+            match inbox.deserialize_next() {
+                Ok(Some(Frame {
+                    data: FrameData::Control(frame::Control::Open { stream }),
+                    ..
+                })) => {
+                    log::debug!(target: "wire", "Received `open` command for stream {stream} from {nid}");
+                    metrics.streams_opened += 1;
+                    metrics.received_fetch_requests += 1;
+                    let limits = &self.service.config().limits;
+                    let reader_limit = limits.fetch_pack_receive;
+                    let fetch_timeout: time::Duration =
+                        LocalDuration::from(limits.fetch_timeout).into();
+                    let admitted = if streams.streams.len() >= MAX_PEER_STREAMS
+                        || open >= MAX_STREAMS
+                    {
+                        log::debug!(target: "wire", "Refusing stream {stream} of {nid}: too many streams open");
+                        None
+                    } else {
+                        match streams.register(
+                            stream,
+                            ChannelsConfig::new(fetch_timeout).with_reader_limit(reader_limit),
+                        ) {
+                            Some(channels) => {
+                                let task = Task {
+                                    fetch: FetchRequest::Responder {
+                                        remote: nid,
+                                        emitter: self.service.emitter(),
+                                    },
+                                    stream,
+                                    channels,
+                                };
+                                match self.worker.try_send(task) {
+                                    Ok(()) => {
+                                        open += 1;
+                                        Some(())
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            target: "wire",
+                                            "Worker pool failed to accept incoming fetch request: {e}"
+                                        );
+                                        // Its stream goes with it.
+                                        if let Some(s) = streams.unregister(&stream) {
+                                            s.channels.close();
+                                        }
+                                        None
+                                    }
+                                }
+                            }
+                            None => {
+                                log::debug!(target: "wire", "Peer attempted to open already-open stream {stream}");
+                                continue;
+                            }
+                        }
+                    };
+                    if admitted.is_none() {
+                        // Refused: the peer is told, and one that keeps
+                        // opening streams the node refuses is disconnected.
+                        *refused += 1;
+                        let frame = Frame::<service::Message>::control(
+                            link,
+                            frame::Control::Close { stream },
+                        );
+                        self.actions
+                            .push_back(reactor::Action::Send(token, frame.encode_to_vec()));
+                        if *refused > MAX_REFUSED_OPENS {
+                            log::warn!(target: "wire", "Peer {nid} keeps opening streams the node refuses; disconnecting..");
+                            self.disconnect(
+                                token,
+                                DisconnectReason::Session(session::Error::Misbehavior),
+                            );
+                            return;
+                        }
+                    }
+                }
+                Ok(Some(Frame {
+                    data: FrameData::Control(frame::Control::Eof { stream }),
+                    ..
+                })) => {
+                    log::debug!(target: "wire", "Received `end-of-file` on stream {stream} from {nid}");
+                    if let Some(event) = deliver(streams, stream, ChannelEvent::Eof) {
+                        *held = Some((stream, event));
+                        break;
+                    }
+                }
+                Ok(Some(Frame {
+                    data: FrameData::Control(frame::Control::Close { stream }),
+                    ..
+                })) => {
+                    log::debug!(target: "wire", "Received `close` command for stream {stream} from {nid}");
+
+                    if let Some(s) = streams.unregister(&stream) {
+                        log::debug!(
+                            target: "wire",
+                            "Stream {stream} of {nid} closed with {} byte(s) sent and {} byte(s) received",
+                            s.sent_bytes, s.received_bytes
+                        );
+                        s.channels.close();
+                    }
+                }
+                Ok(Some(Frame {
+                    data: FrameData::Gossip(msg),
+                    ..
+                })) => {
+                    metrics.received_gossip_messages += 1;
+                    self.service.received_message(nid, msg);
+                }
+                Ok(Some(Frame {
+                    stream,
+                    data: FrameData::Git(data),
+                    ..
+                })) => {
+                    metrics.received_git_bytes += data.len();
+                    if let Some(event) = deliver(streams, stream, ChannelEvent::Data(data)) {
+                        *held = Some((stream, event));
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    // Buffer is empty, or message isn't complete.
+                    break;
+                }
+                Err(e) => {
+                    log::warn!(target: "wire", "Invalid gossip message from {nid}: {e}");
+
+                    if !inbox.is_empty() {
+                        log::debug!(target: "wire", "Dropping read buffer for {nid} with {} bytes", inbox.len());
+                    }
+                    self.disconnect(
+                        token,
+                        DisconnectReason::Session(session::Error::Misbehavior),
+                    );
+                    return;
+                }
+            }
+        }
+        // Held: the peer waits, and the frame is tried again soon. Otherwise
+        // it is read again.
+        let holding = held.is_some();
+        if let Some(reading) = reading {
+            reading.store(!holding, Ordering::Relaxed);
+        }
+        if holding {
+            log::trace!(target: "wire", "Peer {nid} waits for a worker to take its stream's data");
+            self.actions
+                .push_back(reactor::Action::SetTimer(STREAM_RETRY));
         }
     }
 
     fn cleanup(&mut self, token: Token) {
+        self.outboxes.remove(&token);
         if self.inbound.remove(&token) {
             log::debug!(target: "wire", token=token.0; "Cleaning up inbound peer state");
         } else if let Some(outbound) = self.outbound.remove(&token) {
@@ -773,6 +1014,73 @@ where
             log::debug!(target: "wire", token=token.0; "Tried to cleanup unknown peer");
         }
     }
+}
+
+/// Hands `event` to the worker of `stream`, without waiting: the event back
+/// if its channel is full. One for a stream that is gone, or whose worker is,
+/// is dropped.
+fn deliver(streams: &mut Streams, stream: StreamId, event: ChannelEvent) -> Option<ChannelEvent> {
+    let Some(s) = streams.get_mut(&stream) else {
+        log::debug!(target: "wire", "Ignoring frame on closed or unknown stream {stream}");
+        return None;
+    };
+    match s.channels.try_send(event) {
+        Ok(()) => None,
+        Err(TrySend::Full(event)) => Some(event),
+        Err(TrySend::Disconnected) => {
+            log::debug!(target: "wire", "Worker of stream {stream} is disconnected; dropping its frame");
+            None
+        }
+    }
+}
+
+/// A peer's transport write buffer, as the wire sees it: what the transport
+/// holds, and what was queued to it since the reactor last applied the
+/// actions, which isn't in the buffer yet.
+struct Outbox {
+    buffered: Arc<AtomicUsize>,
+    queued: usize,
+    /// Whether the transport reads from the peer ([`Transport::reading`]).
+    reading: Arc<AtomicBool>,
+}
+
+impl Default for Outbox {
+    fn default() -> Self {
+        Self {
+            buffered: Arc::default(),
+            queued: 0,
+            reading: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+impl Outbox {
+    fn holds(&self) -> usize {
+        self.buffered
+            .load(Ordering::Relaxed)
+            .saturating_add(self.queued)
+    }
+}
+
+/// The events waiting on a worker's `channels`, taken while the peer's
+/// `outbox`, with those taken, holds less than [`STREAM_BUFFER_LIMIT`], each
+/// encoded as a frame by `encode`; and whether any are left. What is taken
+/// counts as queued to it, framing included.
+fn take_within(
+    channels: &Channels,
+    outbox: &mut Outbox,
+    mut encode: impl FnMut(ChannelEvent) -> Vec<u8>,
+) -> (Vec<Vec<u8>>, bool) {
+    let mut taken = Vec::new();
+    while outbox.holds() < STREAM_BUFFER_LIMIT {
+        let Some(event) = channels.try_iter().next() else {
+            return (taken, false);
+        };
+        let frame = encode(event);
+        outbox.queued = outbox.queued.saturating_add(frame.len());
+        taken.push(frame);
+    }
+    (taken, !channels.is_empty())
 }
 
 impl<D, S> reactor::ReactionHandler for Wire<D, S>
@@ -796,6 +1104,27 @@ where
             })
             .sum();
         self.metrics.worker_queue_size = self.worker.len();
+
+        // The reactor has applied every action since the last tick: what was
+        // queued is in the peers' buffers now. The streams that waited for
+        // them try again.
+        for outbox in self.outboxes.values_mut() {
+            outbox.queued = 0;
+        }
+        for (remote, stream) in std::mem::take(&mut self.waiting) {
+            self.flush(remote, stream);
+        }
+        // So do the frames that waited for their worker.
+        let holding = self
+            .peers
+            .0
+            .iter()
+            .filter(|(_, peer)| matches!(peer, Peer::Connected { held: Some(_), .. }))
+            .map(|(token, _)| *token)
+            .collect::<Vec<_>>();
+        for token in holding {
+            self.take_frames(token);
+        }
 
         self.service.tick(LocalTime::now(), &self.metrics);
     }
@@ -873,7 +1202,15 @@ where
         }
     }
 
-    fn transport_registered(&mut self, token: Token, _transport: &Self::Transport) {
+    fn transport_registered(&mut self, token: Token, transport: &Self::Transport) {
+        self.outboxes.insert(
+            token,
+            Outbox {
+                buffered: transport.buffered(),
+                queued: 0,
+                reading: transport.reading(),
+            },
+        );
         if let Some(outbound) = self.outbound.get(&token) {
             log::debug!(target: "wire", token=token.0; "Outbound peer resource registered for {}", outbound.nid);
         } else if self.inbound.contains(&token) {
@@ -988,13 +1325,7 @@ where
                 }
             }
             SessionEvent::Data(data) => {
-                if let Some(Peer::Connected {
-                    nid,
-                    inbox,
-                    streams,
-                    ..
-                }) = self.peers.get_mut(&token)
-                {
+                if let Some(Peer::Connected { nid, inbox, .. }) = self.peers.get_mut(&token) {
                     let metrics = self.metrics.peer(*nid);
                     metrics.received_bytes += data.len();
 
@@ -1008,113 +1339,7 @@ where
 
                         return;
                     }
-
-                    loop {
-                        match inbox.deserialize_next() {
-                            Ok(Some(Frame {
-                                data: FrameData::Control(frame::Control::Open { stream }),
-                                ..
-                            })) => {
-                                log::debug!(target: "wire", "Received `open` command for stream {stream} from {nid}");
-                                metrics.streams_opened += 1;
-                                metrics.received_fetch_requests += 1;
-                                let limits = &self.service.config().limits;
-                                let reader_limit = limits.fetch_pack_receive;
-                                let fetch_timeout: time::Duration =
-                                    LocalDuration::from(limits.fetch_timeout).into();
-                                let Some(channels) = streams.register(
-                                    stream,
-                                    ChannelsConfig::new(fetch_timeout)
-                                        .with_reader_limit(reader_limit),
-                                ) else {
-                                    log::debug!(target: "wire", "Peer attempted to open already-open stream {stream}");
-                                    continue;
-                                };
-
-                                let task = Task {
-                                    fetch: FetchRequest::Responder {
-                                        remote: *nid,
-                                        emitter: self.service.emitter(),
-                                    },
-                                    stream,
-                                    channels,
-                                };
-                                if let Err(e) = self.worker.try_send(task) {
-                                    log::warn!(
-                                        target: "wire",
-                                        "Worker pool failed to accept incoming fetch request: {e}"
-                                    );
-                                }
-                            }
-                            Ok(Some(Frame {
-                                data: FrameData::Control(frame::Control::Eof { stream }),
-                                ..
-                            })) => {
-                                if let Some(s) = streams.get(&stream) {
-                                    log::debug!(target: "wire", "Received `end-of-file` on stream {stream} from {nid}");
-
-                                    if s.channels.send(ChannelEvent::Eof).is_err() {
-                                        log::debug!(target: "wire", "Worker is disconnected; cannot send `EOF`");
-                                    }
-                                } else {
-                                    log::debug!(target: "wire", "Ignoring frame on closed or unknown stream {stream}");
-                                }
-                            }
-                            Ok(Some(Frame {
-                                data: FrameData::Control(frame::Control::Close { stream }),
-                                ..
-                            })) => {
-                                log::debug!(target: "wire", "Received `close` command for stream {stream} from {nid}");
-
-                                if let Some(s) = streams.unregister(&stream) {
-                                    log::debug!(
-                                        target: "wire",
-                                        "Stream {stream} of {nid} closed with {} byte(s) sent and {} byte(s) received",
-                                        s.sent_bytes, s.received_bytes
-                                    );
-                                    s.channels.close().ok();
-                                }
-                            }
-                            Ok(Some(Frame {
-                                data: FrameData::Gossip(msg),
-                                ..
-                            })) => {
-                                metrics.received_gossip_messages += 1;
-                                self.service.received_message(*nid, msg);
-                            }
-                            Ok(Some(Frame {
-                                stream,
-                                data: FrameData::Git(data),
-                                ..
-                            })) => {
-                                if let Some(s) = streams.get_mut(&stream) {
-                                    metrics.received_git_bytes += data.len();
-                                    // Send via channel to the worker thread
-                                    if s.channels.send(ChannelEvent::Data(data)).is_err() {
-                                        log::warn!(target: "wire", "Worker is disconnected; cannot send data");
-                                    }
-                                } else {
-                                    log::debug!(target: "wire", "Ignoring frame on closed or unknown stream {stream}");
-                                }
-                            }
-                            Ok(None) => {
-                                // Buffer is empty, or message isn't complete.
-                                break;
-                            }
-                            Err(e) => {
-                                log::warn!(target: "wire", "Invalid gossip message from {nid}: {e}");
-
-                                if !inbox.is_empty() {
-                                    log::debug!(target: "wire", "Dropping read buffer for {nid} with {} bytes", inbox.len());
-                                }
-                                self.disconnect(
-                                    token,
-                                    DisconnectReason::Session(session::Error::Misbehavior),
-                                );
-                                break;
-                            }
-                        }
-                    }
+                    self.take_frames(token);
                 } else {
                     log::debug!(target: "wire", token=token.0; "Dropping message from unconnected peer");
                 }
@@ -1157,6 +1382,7 @@ where
                 // The peer transport is already disconnected and removed from the reactor;
                 // therefore there is no need to initiate a disconnection. We simply remove
                 // the peer from the map.
+                self.outboxes.remove(&token);
                 match self.peers.remove(&token) {
                     Some(mut peer) => {
                         if let Peer::Connected { streams, .. } = &mut peer {
@@ -2167,5 +2393,270 @@ mod test {
             !wire.service.fetcher().active_fetches().contains_key(&rid),
             "fetch result should have cleared active[rid]"
         );
+    }
+
+    // Security R-10: a worker's stream is taken off its channel only while
+    // its peer's write buffer has room. The rest waits in the channel, which
+    // is bounded, so its worker waits too.
+    #[test]
+    fn a_stream_waits_for_its_peer_s_write_buffer() {
+        use crate::worker::channels::Channels;
+
+        let (wire, worker) =
+            Channels::<Vec<u8>>::pair(ChannelsConfig::new(time::Duration::from_secs(1))).unwrap();
+        let chunk = 100 * 1024;
+        for _ in 0..12 {
+            worker.send(ChannelEvent::Data(vec![0; chunk])).unwrap();
+        }
+        let mut outbox = Outbox::default();
+        // Each frame is its data: room for six chunks, the last one passing
+        // the limit.
+        let raw = |event: ChannelEvent| match event {
+            ChannelEvent::Data(data) => data,
+            ChannelEvent::Eof => b"eof".to_vec(),
+            ChannelEvent::Close => b"close".to_vec(),
+        };
+        let (taken, more) = take_within(&wire, &mut outbox, raw);
+        let room = STREAM_BUFFER_LIMIT.div_ceil(chunk);
+        assert_eq!(taken.len(), room);
+        assert!(more);
+        // In the same turn, what was taken counts: nothing more is.
+        let (taken, more) = take_within(&wire, &mut outbox, raw);
+        assert!(taken.is_empty());
+        assert!(more);
+        // Nor is anything while the transport's buffer is full.
+        outbox.queued = 0;
+        outbox
+            .buffered
+            .store(STREAM_BUFFER_LIMIT, Ordering::Relaxed);
+        let (taken, more) = take_within(&wire, &mut outbox, raw);
+        assert!(taken.is_empty());
+        assert!(more);
+        // Framing counts: with 28 KiB of it a frame, two chunks fewer fit.
+        outbox.buffered.store(0, Ordering::Relaxed);
+        let framed = |event: ChannelEvent| {
+            let mut frame = vec![0; 28 * 1024];
+            frame.extend(raw(event));
+            frame
+        };
+        let (taken, more) = take_within(&wire, &mut outbox, framed);
+        assert_eq!(taken.len(), STREAM_BUFFER_LIMIT.div_ceil(chunk + 28 * 1024));
+        assert!(more);
+        // Once it drains, the rest is taken, with the stream's end.
+        outbox.queued = 0;
+        worker.send(ChannelEvent::Eof).unwrap();
+        let left = 12 - room - STREAM_BUFFER_LIMIT.div_ceil(chunk + 28 * 1024);
+        let (taken, more) = take_within(&wire, &mut outbox, raw);
+        assert_eq!(taken.len(), left + 1);
+        assert_eq!(taken.last().map(Vec::as_slice), Some(b"eof".as_slice()));
+        assert!(!more);
+    }
+
+    /// A wire whose worker queue holds `capacity` tasks, with Bob connected
+    /// inbound on token 1 and Eve on token 2, and the queue's receiver.
+    #[allow(clippy::type_complexity)]
+    fn connected(
+        capacity: usize,
+    ) -> (
+        Wire<radicle::node::Database, MockStorage>,
+        NodeId,
+        NodeId,
+        chan::Receiver<Task>,
+    ) {
+        use crate::test::peer::Peer as TestPeer;
+
+        let alice = TestPeer::with_storage("alice", 7, arbitrary::nonempty_storage(1));
+        let (bob, eve) = (TestPeer::bob(), TestPeer::eve());
+        let (worker_tx, worker_rx) = chan::bounded::<Task>(capacity);
+        let mut wire = Wire::new(
+            alice.into_service(),
+            worker_tx,
+            crypto::SigningKey::mock(100),
+            Arc::new(radicle::node::dial::Open),
+            resolver::Resolvers::closed(),
+            Stopped::default(),
+        );
+        for (token, peer) in [(Token(1), &bob), (Token(2), &eve)] {
+            let addr = NetAddr {
+                host: HostName::Ip(net::IpAddr::from([8, 8, 8, 8])),
+                port: node::DEFAULT_PORT,
+            };
+            wire.peers
+                .insert(token, Peer::connected(*peer.nid(), addr, Link::Inbound));
+            wire.outboxes.insert(token, Outbox::default());
+        }
+        (wire, *bob.nid(), *eve.nid(), worker_rx)
+    }
+
+    /// The streams `token`'s peer has open.
+    fn streams_of(
+        wire: &mut Wire<radicle::node::Database, MockStorage>,
+        token: Token,
+    ) -> &mut Streams {
+        match wire.peers.get_mut(&token) {
+            Some(Peer::Connected { streams, .. }) => streams,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn git(stream: StreamId, data: &[u8]) -> Vec<u8> {
+        Frame::<service::Message>::git(stream, data.to_vec()).encode_to_vec()
+    }
+
+    fn open(stream: StreamId) -> Vec<u8> {
+        Frame::<service::Message>::control(Link::Inbound, frame::Control::Open { stream })
+            .encode_to_vec()
+    }
+
+    fn timers(wire: &Wire<radicle::node::Database, MockStorage>) -> usize {
+        wire.actions
+            .iter()
+            .filter(|action| matches!(action, reactor::Action::SetTimer(d) if *d == STREAM_RETRY))
+            .count()
+    }
+
+    // Review of heartwood #11, round 1: a frame whose worker's channel is full
+    // is held, never waited for on the reactor: the peer's transport stops
+    // reading, other peers are served meanwhile, and the frame is delivered
+    // once the worker takes the ones before it.
+    #[test]
+    fn a_full_worker_channel_holds_the_frame_without_waiting() {
+        use reactor::ReactionHandler as _;
+
+        let (mut wire, _, _, _rx) = connected(4);
+        let stream = StreamId::git(Link::Inbound).nth(1).unwrap();
+        let worker = streams_of(&mut wire, Token(1))
+            .register(stream, ChannelsConfig::new(time::Duration::from_secs(30)))
+            .unwrap();
+        let theirs = StreamId::git(Link::Inbound).nth(2).unwrap();
+        let eves = streams_of(&mut wire, Token(2))
+            .register(theirs, ChannelsConfig::new(time::Duration::from_secs(30)))
+            .unwrap();
+
+        // Bob fills his worker's channel, and sends one frame more.
+        let mut data = Vec::new();
+        for _ in 0..crate::worker::channels::MAX_WORKER_CHANNEL_SIZE + 1 {
+            data.extend(git(stream, b"x"));
+        }
+        let started = Instant::now();
+        wire.transport_reacted(Token(1), SessionEvent::Data(data), Instant::now());
+        assert!(
+            started.elapsed() < time::Duration::from_secs(1),
+            "the reactor waited {:?} for a worker",
+            started.elapsed()
+        );
+        assert!(matches!(
+            wire.peers.get_mut(&Token(1)),
+            Some(Peer::Connected { held: Some(_), .. })
+        ));
+        assert!(!wire.outboxes[&Token(1)].reading.load(Ordering::Relaxed));
+        assert!(timers(&wire) > 0, "no retry was scheduled");
+
+        // Eve is served meanwhile.
+        wire.transport_reacted(
+            Token(2),
+            SessionEvent::Data(git(theirs, b"eve")),
+            Instant::now(),
+        );
+        assert!(matches!(eves.try_iter().next(), Some(ChannelEvent::Data(d)) if d == b"eve"));
+
+        // Still full, a tick holds it again; once the worker takes one, the
+        // held frame goes, and Bob is read again.
+        wire.tick();
+        assert!(!wire.outboxes[&Token(1)].reading.load(Ordering::Relaxed));
+        assert!(worker.try_iter().next().is_some());
+        wire.tick();
+        assert!(matches!(
+            wire.peers.get_mut(&Token(1)),
+            Some(Peer::Connected { held: None, .. })
+        ));
+        assert!(wire.outboxes[&Token(1)].reading.load(Ordering::Relaxed));
+        assert_eq!(
+            worker.try_iter().count(),
+            crate::worker::channels::MAX_WORKER_CHANNEL_SIZE
+        );
+    }
+
+    // Review of heartwood #11, round 1: a stream whose admission fails is
+    // undone, and the peer told; a peer has at most `MAX_PEER_STREAMS` open,
+    // and one that keeps opening streams the node refuses is disconnected.
+    #[test]
+    fn a_refused_open_leaves_no_stream_behind() {
+        use reactor::ReactionHandler as _;
+
+        // A worker queue of one, never taken from.
+        let (mut wire, _, _, _rx) = connected(1);
+        let mut data = Vec::new();
+        for i in 1..=10 {
+            data.extend(open(StreamId::git(Link::Inbound).nth(i).unwrap()));
+        }
+        wire.transport_reacted(Token(1), SessionEvent::Data(data), Instant::now());
+        assert_eq!(streams_of(&mut wire, Token(1)).streams.len(), 1);
+        let closes = wire
+            .actions
+            .iter()
+            .filter(|action| matches!(action, reactor::Action::Send(Token(1), _)))
+            .count();
+        assert_eq!(closes, 9, "each refused open is answered");
+
+        // Past `MAX_REFUSED_OPENS`, Bob is disconnected.
+        let mut data = Vec::new();
+        for i in 11..=11 + MAX_REFUSED_OPENS as u64 {
+            data.extend(open(StreamId::git(Link::Inbound).nth(i).unwrap()));
+        }
+        wire.transport_reacted(Token(1), SessionEvent::Data(data), Instant::now());
+        assert!(matches!(
+            wire.peers.get_mut(&Token(1)),
+            Some(Peer::Disconnecting { .. })
+        ));
+
+        // With room in the queue, a peer opens at most `MAX_PEER_STREAMS`.
+        let (mut wire, _, _, _rx) = connected(1024);
+        let mut data = Vec::new();
+        for i in 1..=MAX_PEER_STREAMS as u64 + 4 {
+            data.extend(open(StreamId::git(Link::Inbound).nth(i).unwrap()));
+        }
+        wire.transport_reacted(Token(1), SessionEvent::Data(data), Instant::now());
+        assert_eq!(
+            streams_of(&mut wire, Token(1)).streams.len(),
+            MAX_PEER_STREAMS
+        );
+    }
+
+    // Review of heartwood #11, round 1: a stream that waits for its peer's
+    // write buffer schedules a bounded wake, and a quiet reactor makes
+    // progress at the next tick, with no other event.
+    #[test]
+    fn a_waiting_stream_wakes_the_reactor_and_resumes_on_a_tick() {
+        use reactor::ReactionHandler as _;
+
+        let (mut wire, bob, _, _rx) = connected(4);
+        let stream = StreamId::git(Link::Inbound).nth(1).unwrap();
+        let worker = streams_of(&mut wire, Token(1))
+            .register(stream, ChannelsConfig::new(time::Duration::from_secs(30)))
+            .unwrap();
+        worker.send(ChannelEvent::Data(vec![1; 1024])).unwrap();
+        wire.outboxes[&Token(1)]
+            .buffered
+            .store(STREAM_BUFFER_LIMIT, Ordering::Relaxed);
+
+        wire.flush(bob, stream);
+        assert!(wire.waiting.contains(&(bob, stream)));
+        assert!(timers(&wire) > 0, "no wake was scheduled");
+        let sent = |wire: &Wire<radicle::node::Database, MockStorage>| {
+            wire.actions
+                .iter()
+                .filter(|action| matches!(action, reactor::Action::Send(Token(1), _)))
+                .count()
+        };
+        assert_eq!(sent(&wire), 0);
+
+        // The peer reads; the reactor wakes, with nothing else to do.
+        wire.outboxes[&Token(1)]
+            .buffered
+            .store(0, Ordering::Relaxed);
+        wire.tick();
+        assert_eq!(sent(&wire), 1);
+        assert!(!wire.waiting.contains(&(bob, stream)));
     }
 }

@@ -3,17 +3,20 @@ extern crate std;
 use std::borrow::ToOwned as _;
 use std::cell::RefCell;
 use std::env::VarError;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::path::PathBuf;
 use std::string::{String, ToString as _};
 use std::vec::Vec;
 
-use proto::{PrivateCredential, PublicCredential};
+use proto::{PrivateCredential, ProtoError, PublicCredential};
 use ssh_agent_lib::blocking::Client;
 pub use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto;
+use ssh_agent_lib::ssh_encoding::{Decode as _, Encode as _};
 use ssh_key::public::{Ed25519PublicKey, KeyData};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{PublicKey, Signature, SigningKey, VerifyingKey};
 
@@ -63,7 +66,7 @@ pub enum IntoSignerError {
 
 pub struct Agent {
     path: PathBuf,
-    client: Client<Stream>,
+    stream: Stream,
 }
 
 impl Agent {
@@ -85,41 +88,91 @@ impl Agent {
             }),
         }?;
 
-        let client = Client::new(
-            Stream::connect(&path).map_err(|err| ConnectError::Agent(AgentError::IO(err)))?,
-        );
+        let stream =
+            Stream::connect(&path).map_err(|err| ConnectError::Agent(AgentError::IO(err)))?;
 
-        Ok(Self { path, client })
+        Ok(Self { path, stream })
+    }
+
+    /// An agent reached through `stream`.
+    #[cfg(all(test, unix))]
+    fn with(stream: Stream) -> Self {
+        Self {
+            path: PathBuf::new(),
+            stream,
+        }
+    }
+
+    /// The agent's client, for a request that carries no secret.
+    fn client(&mut self) -> Client<&mut Stream> {
+        Client::new(&mut self.stream)
     }
 
     /// Register a key with the agent.
+    ///
+    /// The request carries the private key, so it is encoded here rather
+    /// than by `ssh-agent-lib`'s client, which encodes a request into a
+    /// buffer it never wipes. This one is wiped once the request is sent, and
+    /// is sized beforehand, so that it never grows and leaves a copy behind.
     pub fn register(&mut self, key: &SigningKey) -> Result<(), AgentError> {
         use ssh_key::private::{Ed25519Keypair, KeypairData};
-        self.client.add_identity(proto::AddIdentity {
+
+        let bytes = Zeroizing::new(key.to_keypair_bytes());
+        let request = proto::Request::AddIdentity(proto::AddIdentity {
             credential: PrivateCredential::Key {
-                privkey: KeypairData::Ed25519(
-                    Ed25519Keypair::from_bytes(
-                        &ed25519_dalek::SigningKey::from(key.clone()).to_keypair_bytes(),
-                    )
-                    .unwrap(),
-                ),
+                privkey: KeypairData::Ed25519(Ed25519Keypair::from_bytes(&bytes).unwrap()),
                 comment: "".into(),
             },
-        })
+        });
+        match Self::secret_request(&mut self.stream, &request)? {
+            proto::Response::Success => Ok(()),
+            _ => Err(ProtoError::UnexpectedResponse.into()),
+        }
+    }
+
+    /// Sends `request`, which carries a secret, and returns the agent's
+    /// response.
+    fn secret_request(
+        stream: &mut Stream,
+        request: &proto::Request,
+    ) -> Result<proto::Response, ProtoError> {
+        let len = request.encoded_len()?;
+        let framed = len
+            .checked_add(4)
+            .ok_or(ssh_agent_lib::ssh_encoding::Error::Overflow)?;
+        let mut message = Zeroizing::new(Vec::with_capacity(framed));
+        u32::try_from(len)
+            .map_err(|_| ssh_agent_lib::ssh_encoding::Error::Overflow)?
+            .encode(&mut *message)?;
+        request.encode(&mut *message)?;
+        debug_assert_eq!(
+            message.len(),
+            framed,
+            "a request's encoding isn't the length it gives"
+        );
+        stream.write_all(&message)?;
+        drop(message);
+
+        // The response, as `ssh-agent-lib`'s client reads it.
+        let mut len = [0; 4];
+        stream.read_exact(&mut len)?;
+        let mut response = std::vec![0; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut response)?;
+        proto::Response::decode(&mut &response[..])
     }
 
     pub fn unregister(&mut self, key: &VerifyingKey) -> Result<(), AgentError> {
-        self.client.remove_identity(proto::RemoveIdentity {
+        self.client().remove_identity(proto::RemoveIdentity {
             credential: PublicCredential::Key(Self::key_data(key)),
         })
     }
 
     pub fn unregister_all(&mut self) -> Result<(), AgentError> {
-        self.client.remove_all_identities()
+        self.client().remove_all_identities()
     }
 
     pub fn sign(&mut self, key: &VerifyingKey, data: &[u8]) -> Result<[u8; 64], AgentError> {
-        let sig = self.client.sign(proto::SignRequest {
+        let sig = self.client().sign(proto::SignRequest {
             credential: PublicCredential::Key(Self::key_data(key)),
             data: data.to_vec(),
             flags: 0,
@@ -146,7 +199,7 @@ impl Agent {
 
     pub fn request_identities(&mut self) -> Result<Vec<PublicKey>, AgentError> {
         Ok(self
-            .client
+            .client()
             .request_identities()?
             .into_iter()
             .filter_map(|identity| {
@@ -208,6 +261,94 @@ impl AgentSigner {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A global allocator for this crate's tests. On a thread that watches
+    /// for a secret, it looks at every block freed for that secret.
+    #[cfg(unix)]
+    mod freed {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        struct Watch;
+
+        std::thread_local! {
+            static SECRET: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+            static FOUND: Cell<usize> = const { Cell::new(0) };
+        }
+
+        // SAFETY: it allocates and frees as `System` does. Every block is
+        // zeroed as it is allocated, so that a block read as it is freed has
+        // no byte uninitialised.
+        unsafe impl GlobalAlloc for Watch {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                if let Ok(Some(secret)) = SECRET.try_with(Cell::get) {
+                    // SAFETY: `ptr` is a live block of `layout.size()`
+                    // initialised bytes until it is freed below.
+                    let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                    if block.windows(secret.len()).any(|bytes| bytes == secret) {
+                        FOUND.with(|found| found.set(found.get() + 1));
+                    }
+                }
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static WATCH: Watch = Watch;
+
+        /// Runs `f`, and counts the blocks freed on this thread meanwhile
+        /// that held `secret`.
+        pub fn watching<T>(secret: [u8; 32], f: impl FnOnce() -> T) -> (T, usize) {
+            FOUND.with(|found| found.set(0));
+            SECRET.with(|watched| watched.set(Some(secret)));
+            let out = f();
+            SECRET.with(|watched| watched.set(None));
+            (out, FOUND.with(Cell::get))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // Review of heartwood #15, round 1: registering a key with the agent
+    // frees no memory that holds the private key: the request that carries
+    // it is wiped once sent.
+    fn a_registered_key_leaves_no_copy_in_freed_memory() {
+        use std::os::unix::net::UnixStream;
+
+        let secret: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(37) ^ 0x5a);
+        // The watch itself sees a copy that isn't wiped.
+        let ((), found) = freed::watching(secret, || drop(secret.to_vec()));
+        assert_eq!(found, 1);
+
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let agent = std::thread::spawn(move || {
+            let mut len = [0; 4];
+            theirs.read_exact(&mut len).unwrap();
+            let mut request = std::vec![0; u32::from_be_bytes(len) as usize];
+            theirs.read_exact(&mut request).unwrap();
+            // `SSH_AGENT_SUCCESS`.
+            theirs.write_all(&[0, 0, 0, 1, 6]).unwrap();
+            request
+        });
+        let key = SigningKey::from_seed(crate::Seed::new(secret));
+        let mut client = Agent::with(ours);
+        let (registered, found) = freed::watching(secret, || client.register(&key));
+
+        registered.unwrap();
+        let request = agent.join().unwrap();
+        assert!(
+            request.windows(secret.len()).any(|bytes| bytes == secret),
+            "the agent wasn't sent the key"
+        );
+        assert_eq!(
+            found, 0,
+            "memory that held the private key was freed unwiped"
+        );
+    }
 
     use ssh_agent_lib::blocking::Client;
     use ssh_agent_lib::proto::{PublicCredential, SignRequest};

@@ -235,6 +235,11 @@ impl FetchPackSizeLimit {
         bytesize::ByteSize::gib(size).into()
     }
 
+    /// The limit, in bytes.
+    pub fn as_u64(&self) -> u64 {
+        self.limit.as_u64()
+    }
+
     /// Check if this limit is exceeded by the number of `bytes` provided.
     pub fn exceeded_by(&self, bytes: usize) -> bool {
         bytes >= self.limit.as_u64() as usize
