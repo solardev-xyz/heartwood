@@ -11,12 +11,19 @@
 //! - **A unit** is recorded in progress before it starts ([`State::start`]),
 //!   and its record cleared once it returns. The host's [`Watch`] is told of
 //!   each, for its watchdog. The deadline and the cancel token ([`Stop`]) are
-//!   checked between units, never within one; only a cut off batch's commit
-//!   runs after either.
+//!   checked between units, and within a COB's materialization, between its
+//!   changes; only a cut off batch's commit runs after either. A COB stopped
+//!   within is not staged, and runs again.
+//! - **The cache rebuild** takes each COB's tips from its remotes' verified
+//!   signed refs alone, scanned into a worklist first, and loads it
+//!   strictly, within [`cache::LIMITS`]: a COB that doesn't load, whatever
+//!   heartwood's own load would leave out of it, quarantines its
+//!   repository's cache.
 //! - **The escape.** A unit the last process ended during
 //!   ([`State::interrupted`]) runs again in its smallest form: one ref at a
-//!   time for the refs that namespace unit held, and one COB a batch for the
-//!   COBs that batch held. A unit in progress when two processes ended
+//!   time for the refs that namespace unit held, one remote at a time for
+//!   the remotes that scan unit held, and one COB a batch for the COBs that
+//!   batch held. A unit in progress when two processes ended
 //!   quarantines its repository instead of running a third time. A unit that
 //!   fails with an error quarantines it at once.
 //! - **Failures outside any one repository,** of the storage directory, the
@@ -72,12 +79,16 @@ pub mod kind {
     /// Re-signing the running identity's namespace. Its position is the
     /// namespace.
     pub const RESIGN: &str = "resign";
-    /// Listing a cache batch's COBs. Its position is the checkpoint it lists
-    /// from, `<kind>:<id>`.
+    /// Scanning the next remotes' verified signed refs into the cache
+    /// rebuild's worklist. Its position is the last remote scanned before it.
+    pub const CACHE_SCAN: &str = "cache-scan";
+    /// Listing a cache batch's COBs from the worklist. Its position is the
+    /// checkpoint it lists from, `<kind>:<id>`.
     pub const CACHE_LIST: &str = "cache-list";
-    /// Materializing one COB. Its position is the COB, `<kind>:<id>`.
+    /// Materializing one COB, and staging its row. Its position is the COB,
+    /// `<kind>:<id>`.
     pub const CACHE: &str = "cache";
-    /// Committing a batch with its checkpoint. Its position is the
+    /// Recording a batch's checkpoint, its rows staged. Its position is the
     /// checkpoint.
     pub const CACHE_COMMIT: &str = "cache-commit";
     /// Publishing a rebuilt cache.
@@ -88,7 +99,8 @@ pub mod kind {
 const BEGIN_STEP: &str = "begin";
 
 /// When a run stops between units: once its token is set, or its cutoff
-/// passed. No unit starts after either, but a cut off batch's commit.
+/// passed. No unit starts after either, but a cut off batch's commit, and a
+/// COB being materialized stops between its changes.
 #[derive(Clone, Debug, Default)]
 pub struct Stop {
     pub cancel: Arc<AtomicBool>,
@@ -306,6 +318,9 @@ struct Pass {
 
 /// Where a COB cache rebuild stands.
 enum Rebuild {
+    /// The remotes are to be scanned into the worklist, unless they have
+    /// been at this version.
+    Scan,
     /// The next batch is to be listed.
     List,
     /// A batch's COBs are being materialized.
@@ -314,13 +329,12 @@ enum Rebuild {
     Publish,
 }
 
-/// A batch in progress: its COBs left to materialize, its rows so far, and
-/// where it stands.
+/// A batch in progress: its COBs left to materialize, and where it stands.
+/// Each COB's row is staged as it is materialized.
 struct Batch {
     ids: VecDeque<ObjectId>,
     /// Whether COBs of its kind remain after it.
     more: bool,
-    rows: Vec<cache::Row>,
     at: cache::Checkpoint,
     /// How many of its COBs have been materialized.
     taken: usize,
@@ -332,6 +346,8 @@ struct Batch {
 enum Small {
     /// The check of this namespace, one ref a unit.
     Namespace { namespace: NodeId, left: usize },
+    /// The cache rebuild's scan, one remote a unit.
+    Scan { left: usize },
     /// The cache rebuild, one COB a batch.
     Cache { left: usize },
 }
@@ -386,7 +402,7 @@ impl Repair {
             publication: Publication::Start,
             begun: None,
             pass: None,
-            rebuild: Rebuild::List,
+            rebuild: Rebuild::Scan,
             did: Did::default(),
         }
     }
@@ -404,7 +420,7 @@ impl Repair {
             publication: Publication::Online,
             begun: None,
             pass: None,
-            rebuild: Rebuild::List,
+            rebuild: Rebuild::Scan,
             did: Did::default(),
         }
     }
@@ -700,7 +716,47 @@ impl Repair {
         let version = begun.version;
         let step = Step::Cache.as_str();
 
+        if let Rebuild::Scan = self.rebuild {
+            // A scan finished at this version, by an earlier process, holds.
+            let at = cx.state.scan(&rid, version)?.unwrap_or_default();
+            if at.complete {
+                self.rebuild = Rebuild::List;
+            } else {
+                let limit = match &mut begun.small {
+                    Some(Small::Scan { left }) if *left > 0 => {
+                        *left -= 1;
+                        1
+                    }
+                    _ => cache::SCAN_REMOTES,
+                };
+                let unit = Unit {
+                    rid,
+                    kind: kind::CACHE_SCAN.to_owned(),
+                    position: at.after.map(|after| after.to_string()).unwrap_or_default(),
+                };
+                let repo = &begun.repo;
+                let ran = cx.unit(&unit, |state| {
+                    cached(cache::scan(repo, state, version, limit))
+                })?;
+                return match ran {
+                    Ran::Done(Cached::Done(complete)) => {
+                        if complete {
+                            self.rebuild = Rebuild::List;
+                        }
+                        Ok(Progress::More)
+                    }
+                    // A scan doesn't stop within.
+                    Ran::Done(Cached::Stopped) => Ok(Progress::More),
+                    Ran::Failed(failed) => {
+                        cx.quarantined(rid, quarantine::Kind::Cache, step, &unit, failed)
+                    }
+                    Ran::Stopped(ending) => Ok(Progress::Stopped(ending)),
+                };
+            }
+        }
+
         match &mut self.rebuild {
+            Rebuild::Scan => Ok(Progress::More),
             Rebuild::List => {
                 let at = cx
                     .state
@@ -718,8 +774,7 @@ impl Repair {
                     kind: kind::CACHE_LIST.to_owned(),
                     position: cache_position(at.kind, at.after.as_ref()),
                 };
-                let repo = &begun.repo;
-                match cx.unit(&unit, |_| Ok(list(repo, at, limit)))? {
+                match cx.unit(&unit, |state| list(state, rid, at, limit).map(Ok))? {
                     Ran::Done(Some(batch)) => self.rebuild = Rebuild::Batch(batch),
                     Ran::Done(None) => self.rebuild = Rebuild::Publish,
                     Ran::Failed(failed) => {
@@ -730,7 +785,8 @@ impl Repair {
                 Ok(Progress::More)
             }
             Rebuild::Batch(batch) => {
-                // The batch's next COB, materialized.
+                // The batch's next COB, materialized from its tips in the
+                // worklist, and its row staged.
                 if let Some(&id) = batch.ids.front() {
                     let kind = batch.at.kind;
                     let unit = Unit {
@@ -739,42 +795,57 @@ impl Repair {
                         position: cache_position(kind, Some(&id)),
                     };
                     let repo = &begun.repo;
-                    let ran = cx.unit(&unit, |_| {
-                        Ok(cache::materialize(repo, kind, id).map_err(|e| e.to_string()))
+                    let stop = cx.stop;
+                    let ran = cx.unit(&unit, |state| {
+                        let stopped = || stop.now().is_some();
+                        let row = match cached(cache::materialize(repo, state, kind, id, &stopped))?
+                        {
+                            Ok(Cached::Done(row)) => row,
+                            Ok(Cached::Stopped) => return Ok(Ok(Cached::Stopped)),
+                            Err(evidence) => return Ok(Err(evidence)),
+                        };
+                        if let Some(row) = row {
+                            state.stage_row(&rid, &row)?;
+                        }
+                        Ok(Ok(Cached::Done(())))
                     })?;
-                    return match ran {
-                        Ran::Done(row) => {
+                    let ending = match ran {
+                        Ran::Done(Cached::Done(())) => {
                             batch.ids.pop_front();
-                            batch.rows.extend(row);
                             batch.at.after = Some(id);
                             batch.taken += 1;
-                            Ok(Progress::More)
+                            return Ok(Progress::More);
                         }
                         Ran::Failed(failed) => {
-                            cx.quarantined(rid, quarantine::Kind::Cache, step, &unit, failed)
+                            return cx.quarantined(
+                                rid,
+                                quarantine::Kind::Cache,
+                                step,
+                                &unit,
+                                failed,
+                            );
                         }
-                        Ran::Stopped(ending) => {
-                            // Cut off: what the batch materialized is committed
-                            // with its checkpoint, in the time kept for it.
-                            if batch.taken > 0 {
-                                let rows = std::mem::take(&mut batch.rows);
-                                let at = batch.at.clone();
-                                if let Some(progress) = commit(cx, rid, version, rows, at)? {
-                                    return Ok(progress);
-                                }
-                            }
-                            self.rebuild = Rebuild::List;
-                            Ok(Progress::Stopped(ending))
-                        }
+                        // Stopped within: the COB isn't staged.
+                        Ran::Done(Cached::Stopped) => cx.stop.now().unwrap_or(Ending::Cancelled),
+                        Ran::Stopped(ending) => ending,
                     };
+                    // Cut off: the COBs the batch staged are recorded with its
+                    // checkpoint, in the time kept for it.
+                    if batch.taken > 0 {
+                        let at = batch.at.clone();
+                        if let Some(progress) = commit(cx, rid, version, at)? {
+                            return Ok(progress);
+                        }
+                    }
+                    self.rebuild = Rebuild::List;
+                    return Ok(Progress::Stopped(ending));
                 }
-                // The batch is done: commit it with the next checkpoint.
+                // The batch is done: record the next checkpoint.
                 let next = match (batch.more, batch.at.kind.next()) {
                     (false, Some(kind)) => cache::Checkpoint { kind, after: None },
                     _ => batch.at.clone(),
                 };
-                let rows = std::mem::take(&mut batch.rows);
-                if let Some(progress) = commit(cx, rid, version, rows, next)? {
+                if let Some(progress) = commit(cx, rid, version, next)? {
                     return Ok(progress);
                 }
                 self.rebuild = Rebuild::List;
@@ -806,14 +877,31 @@ impl Repair {
     }
 }
 
-/// Commits a batch's `rows` with the checkpoint `next`, as a unit that runs
-/// whatever the stop says: the work it records is done. `Some` if it
-/// quarantined the repository instead.
+/// What a cache unit gave: its result, or a stop within it.
+enum Cached<T> {
+    Done(T),
+    Stopped,
+}
+
+/// A cache unit's work from what [`cache`] returned: an error of the
+/// progress state is outside the repository, a stop is no failure, and any
+/// other error is the unit's evidence.
+fn cached<T>(result: Result<T, cache::Error>) -> Work<Cached<T>> {
+    match result {
+        Ok(value) => Ok(Ok(Cached::Done(value))),
+        Err(cache::Error::Stopped) => Ok(Ok(Cached::Stopped)),
+        Err(cache::Error::State(e)) => Err(Error::State(e)),
+        Err(e) => Ok(Err(e.to_string())),
+    }
+}
+
+/// Records `next` as the rebuild's checkpoint, the batch's rows staged
+/// before it, as a unit that runs whatever the stop says: the work it
+/// records is done. `Some` if it quarantined the repository instead.
 fn commit<S>(
     cx: &mut Context<'_, S>,
     rid: RepoId,
     version: Oid,
-    rows: Vec<cache::Row>,
     next: cache::Checkpoint,
 ) -> Result<Option<Progress>, Error> {
     let unit = Unit {
@@ -822,7 +910,7 @@ fn commit<S>(
         position: cache_position(next.kind, next.after.as_ref()),
     };
     let ran = cx.run_unit(&unit, |state| {
-        state.stage(&rid, version, &rows, &next)?;
+        state.save_cache_checkpoint(&rid, version, &next)?;
         Ok(Ok(()))
     })?;
     match ran {
@@ -840,21 +928,20 @@ fn commit<S>(
     }
 }
 
-/// The next batch of COBs after `at`, at most `limit`, of its kind or a
-/// later one: `None` once none remains.
+/// The next batch of COBs in `rid`'s worklist after `at`, at most `limit`,
+/// of its kind or a later one: `None` once none remains.
 fn list(
-    repo: &Repository,
+    state: &State,
+    rid: RepoId,
     mut at: cache::Checkpoint,
     limit: usize,
-) -> Result<Option<Batch>, String> {
+) -> Result<Option<Batch>, Error> {
     loop {
-        let (ids, more) =
-            cache::next(repo, at.kind, at.after.as_ref(), limit).map_err(|e| e.to_string())?;
+        let (ids, more) = state.worklist(&rid, at.kind, at.after.as_ref(), limit)?;
         if !ids.is_empty() {
             return Ok(Some(Batch {
                 ids: ids.into(),
                 more,
-                rows: Vec::new(),
                 at,
                 taken: 0,
             }));
@@ -874,8 +961,8 @@ fn cache_position(kind: cache::Kind, after: Option<&ObjectId>) -> String {
 }
 
 /// The step that runs in its smallest form after `unit` was cut off, if
-/// any: a namespace's check, or the cache rebuild. Every other unit is
-/// already one piece.
+/// any: a namespace's check, the cache rebuild's scan, or its batches.
+/// Every other unit is already one piece.
 fn small(unit: &Unit) -> Option<Small> {
     match unit.kind.as_str() {
         kind::NAMESPACE => {
@@ -885,6 +972,9 @@ fn small(unit: &Unit) -> Option<Small> {
                 left: namespace::UNIT_REFS,
             })
         }
+        kind::CACHE_SCAN => Some(Small::Scan {
+            left: cache::SCAN_REMOTES,
+        }),
         kind::CACHE_LIST | kind::CACHE | kind::CACHE_COMMIT => Some(Small::Cache {
             left: cache::BATCH_COBS,
         }),
@@ -1237,9 +1327,18 @@ mod tests {
 
         /// The repository's COBs of `kind`, in order.
         fn ids(&self, kind: Cob) -> Vec<ObjectId> {
-            cache::next(&self.repo(), kind, None, cache::BATCH_COBS)
-                .unwrap()
-                .0
+            let mut ids = Vec::new();
+            let infix = format!("/refs/cobs/{}/", kind.typename());
+            for r in self.repo().backend.references().unwrap() {
+                let r = r.unwrap();
+                let Some(name) = r.name().ok().filter(|name| name.contains(&infix)) else {
+                    continue;
+                };
+                ids.push(name.rsplit('/').next().unwrap().parse().unwrap());
+            }
+            ids.sort();
+            ids.dedup();
+            ids
         }
 
         fn live(&self, rid: RepoId) -> BTreeMap<(Cob, String), String> {
@@ -1325,6 +1424,17 @@ mod tests {
 
     fn position(kind: Cob, id: &ObjectId) -> String {
         format!("{kind}:{id}")
+    }
+
+    /// How many rows `rid`'s rebuild has staged, in the database `db`.
+    fn staged(db: &std::path::Path, rid: RepoId) -> i64 {
+        let db = sqlite::open(db).unwrap();
+        let mut stmt = db
+            .prepare("SELECT COUNT(*) AS n FROM rebuild_staging WHERE rid = ?1")
+            .unwrap();
+        stmt.bind((1, &rid)).unwrap();
+        assert_eq!(stmt.next().unwrap(), sqlite::State::Row);
+        stmt.read::<i64, _>("n").unwrap()
     }
 
     #[test]
@@ -1451,28 +1561,30 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_run_finishes_its_unit_commits_its_batch_and_the_next_resumes() {
+    fn a_stopped_run_commits_its_batch_and_the_next_resumes() {
         let f = fixture();
         let rid = f.rid();
         let (issues, patches) = (f.ids(Cob::Issue), f.ids(Cob::Patch));
         assert_eq!((issues.len(), patches.len()), (3, 2));
         let stop = Stop::default();
-        // Shutdown arrives during the second COB.
-        let log = Log::cancelling(&stop, kind::CACHE, 2);
+        // Shutdown arrives as the third COB starts: it stops within, before
+        // its first change.
+        let log = Log::cancelling(&stop, kind::CACHE, 3);
         let report = f.run(Some(&[f.nid()]), &f.alice.signer, &stop, &log);
         assert_eq!(report.ending, Ending::Cancelled);
         assert_eq!((report.namespaces, report.caches), (1, 0));
-        // The COB finished, and the batch so far was committed with its
-        // checkpoint; then nothing more.
+        // The third COB wasn't staged. The two before it were, and the batch
+        // so far was committed with its checkpoint; then nothing more.
         let kinds = log.kinds();
         assert_eq!(
-            kinds[kinds.len() - 3..],
-            [kind::CACHE, kind::CACHE, kind::CACHE_COMMIT]
+            kinds[kinds.len() - 4..],
+            [kind::CACHE, kind::CACHE, kind::CACHE, kind::CACHE_COMMIT]
         );
         assert_eq!(
             log.positions(kind::CACHE_COMMIT),
             [position(Cob::Issue, &issues[1])]
         );
+        assert_eq!(staged(&f.db, rid), 2);
         assert!(f.live(rid).is_empty(), "published before it was done");
         assert_eq!(
             State::open(&f.db)
@@ -1485,13 +1597,18 @@ mod tests {
             })
         );
 
-        // The next run resumes there.
+        // The next run resumes there, its scan done.
         let log = Log::default();
         let report = f.run_as_alice(&log);
         assert_eq!(report.ending, Ending::Done);
         assert_eq!((report.locks, report.namespaces, report.caches), (0, 0, 1));
         assert_eq!(
-            log.count(&[kind::REF_LOCKS, kind::NAMESPACE_BEGIN, kind::NAMESPACE]),
+            log.count(&[
+                kind::REF_LOCKS,
+                kind::NAMESPACE_BEGIN,
+                kind::NAMESPACE,
+                kind::CACHE_SCAN
+            ]),
             0
         );
         assert_eq!(
@@ -1516,7 +1633,7 @@ mod tests {
         f.unsigned(&nid);
         let issues = f.ids(Cob::Issue);
         let stop = Stop::default();
-        let log = Log::cancelling(&stop, kind::CACHE, 1);
+        let log = Log::cancelling(&stop, kind::CACHE, 2);
         let report = f.run(Some(&[nid]), &f.alice.signer, &stop, &log);
         assert_eq!(report.ending, Ending::Cancelled);
         assert_eq!(report.resigned, [rid]);
@@ -1533,7 +1650,8 @@ mod tests {
                 kind::REF_LOCKS,
                 kind::NAMESPACE_BEGIN,
                 kind::NAMESPACE,
-                kind::RESIGN
+                kind::RESIGN,
+                kind::CACHE_SCAN
             ]),
             0
         );
@@ -1590,6 +1708,78 @@ mod tests {
         assert_eq!(log.positions(kind::NAMESPACE).len(), 1);
         assert_eq!(log.positions(kind::CACHE_LIST).len(), 5 + 1);
         assert_eq!(f.live(rid), written_all(&f.repo()));
+    }
+
+    #[test]
+    // The cache rebuild's scan, cut off, runs again one remote a unit.
+    fn a_scan_cut_off_runs_again_one_remote_a_unit() {
+        let f = fixture();
+        let rid = f.rid();
+        // Bob comments on the first issue: a second remote, with signed refs.
+        let bob = SigningKey::mock(80);
+        {
+            let repo = f.repo();
+            let mut issues = issue::Cache::no_cache(&repo, &bob).unwrap();
+            let mut issue = issues.get_mut(&f.ids(Cob::Issue)[0]).unwrap();
+            let root = *issue.root().0;
+            issue.comment("Bob's comment", root, []).unwrap();
+        }
+        let mut remotes = [f.nid(), *bob.public_key()];
+        remotes.sort();
+
+        // In the usual form, one unit scans both remotes.
+        let log = Log::default();
+        f.run_as_alice(&log);
+        assert_eq!(log.positions(kind::CACHE_SCAN), [""]);
+
+        let unit = Unit {
+            rid,
+            kind: kind::CACHE_SCAN.to_owned(),
+            position: String::new(),
+        };
+        f.cut_off(&unit, 1);
+        let log = Log::default();
+        let report = f.run_as_alice(&log);
+        assert!(report.newly_quarantined.is_empty());
+        assert_eq!(
+            log.positions(kind::CACHE_SCAN),
+            [String::new(), remotes[0].to_string()]
+        );
+        // Bob's comment is in the rebuilt issue, as heartwood writes it.
+        assert_eq!(f.live(rid), written_all(&f.repo()));
+    }
+
+    #[test]
+    // A remote whose signed refs don't verify fails the scan, and quarantines
+    // the repository's cache: none of its tips is read.
+    fn a_remote_whose_signed_refs_don_t_verify_quarantines_its_repository() {
+        let f = fixture();
+        let rid = f.rid();
+        let eve = SigningKey::mock(82);
+        let repo = f.repo();
+        repo.backend
+            .reference(
+                &format!("refs/namespaces/{}/refs/rad/sigrefs", eve.public_key()),
+                f.sigrefs(&f.nid()).unwrap(),
+                true,
+                "test",
+            )
+            .unwrap();
+
+        let report = f.run_as_alice(&Log::default());
+        assert_eq!(report.ending, Ending::Done);
+        assert_eq!(report.newly_quarantined, [rid]);
+        let record = &report.first[0];
+        assert_eq!(record.kind, quarantine::Kind::Cache);
+        assert_eq!(record.step, "cache");
+        assert_eq!(record.unit.as_deref(), Some("cache-scan@"));
+        assert!(
+            record.evidence.contains(&eve.public_key().to_string()),
+            "{}",
+            record.evidence
+        );
+        assert_eq!(report.caches, 0);
+        assert!(f.live(rid).is_empty());
     }
 
     #[test]
