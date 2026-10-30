@@ -1049,11 +1049,11 @@ mod tests {
             unit: unit.clone(),
             attempts: 1,
         };
-        assert_eq!(state.interrupted(), [interrupted.clone()]);
+        assert_eq!(state.interrupted(), std::slice::from_ref(&interrupted));
         assert_eq!(state.in_progress().unwrap(), Some(interrupted.clone()));
         // The one after still counts it as started once.
         let mut state = reopen(state);
-        assert_eq!(state.interrupted(), [interrupted.clone()]);
+        assert_eq!(state.interrupted(), std::slice::from_ref(&interrupted));
         assert_eq!(state.start(&other).unwrap(), 1);
         state.end().unwrap();
         assert_eq!(state.start(&unit).unwrap(), 2);
