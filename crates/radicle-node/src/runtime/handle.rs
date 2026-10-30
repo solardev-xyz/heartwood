@@ -1,15 +1,9 @@
 use std::collections::HashSet;
 use std::net;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::{fmt, io, time};
-
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-#[cfg(windows)]
-use uds_windows::UnixStream;
 
 use protocol::service;
 use protocol::service::QueryState;
@@ -18,7 +12,7 @@ use radicle::crypto::PublicKey;
 use radicle::identity::RepoId;
 use radicle::node::events::{Event, Events};
 use radicle::node::policy;
-use radicle::node::{Alias, Command, FetchResult};
+use radicle::node::{Alias, FetchResult};
 use radicle::node::{Config, NodeId};
 use radicle::node::{ConnectOptions, ConnectResult, Seeds};
 use radicle::profile::Home;
@@ -73,10 +67,6 @@ impl<T> From<mpsc::SendError<T>> for Error {
 pub struct Handle {
     pub(crate) home: Home,
 
-    /// Path to the control socket in use, if the node has one: shutdown
-    /// stops its listener through it.
-    pub(crate) socket: Option<PathBuf>,
-
     pub(crate) controller: reactor::Controller,
 
     /// Whether or not a shutdown was initiated. Prevents attempting to shutdown twice.
@@ -102,7 +92,6 @@ impl Clone for Handle {
     fn clone(&self) -> Self {
         Self {
             home: self.home.clone(),
-            socket: self.socket.clone(),
             controller: self.controller.clone(),
             shutdown: self.shutdown.clone(),
             emitter: self.emitter.clone(),
@@ -111,19 +100,21 @@ impl Clone for Handle {
 }
 
 impl Handle {
-    pub fn new(
-        home: Home,
-        socket: Option<PathBuf>,
-        controller: reactor::Controller,
-        emitter: Emitter<Event>,
-    ) -> Self {
+    pub fn new(home: Home, controller: reactor::Controller, emitter: Emitter<Event>) -> Self {
         Self {
             home,
-            socket,
             controller,
             shutdown: Arc::default(),
             emitter,
         }
+    }
+
+    /// Marks the node as stopped, once it has: a shutdown asked of any of its
+    /// handles after that does nothing, and its event streams end, so that a
+    /// control command that streams them returns.
+    pub(crate) fn ended(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.emitter.close();
     }
 
     pub fn worker_result(&mut self, result: TaskResult) -> Result<(), io::Error> {
@@ -362,16 +353,8 @@ impl radicle::node::Handle for Handle {
         {
             return Ok(());
         }
-        // Send a shutdown request to our own control socket, if there is one. This is the only
-        // way to kill the control thread gracefully. Since the control thread may have called
-        // this function, the control socket may already be disconnected. Ignore errors. A node
-        // without a control socket has no control thread to stop.
-        if let Some(socket) = self.socket {
-            UnixStream::connect(socket)
-                .and_then(|sock| Command::Shutdown.to_writer(sock))
-                .ok();
-        }
-
+        // The control socket's listener is stopped by the node's lifecycle,
+        // once the node has stopped.
         self.controller
             .shutdown()
             .map_err(|_| Error::ChannelDisconnected)
