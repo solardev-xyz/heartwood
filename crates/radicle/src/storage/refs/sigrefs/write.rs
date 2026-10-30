@@ -408,7 +408,8 @@ where
             return Ok(None);
         };
 
-        let verified = CommitReader::new(oid, self.repository)
+        let spending = super::read::Spending::new(super::read::Budget::DEFAULT);
+        let verified = CommitReader::new(oid, self.repository, &spending)
             .read()
             .map_err(error::Head::Commit)?
             .verify(self.rid, self.verifier)
