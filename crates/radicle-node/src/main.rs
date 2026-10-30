@@ -359,9 +359,11 @@ fn execute(options: Options) -> Result<(), ExecutionError> {
     };
 
     let socket = home.socket_from_env();
+    // A control socket left by a node that ended uncleanly is removed by the
+    // runtime, once it holds the home's node lock: removing one here, before
+    // that, could remove the socket of a node that runs.
     if options.force {
-        log::debug!(target: "node", "Removing existing control socket..");
-        std::fs::remove_file(&socket).ok();
+        log::debug!(target: "node", "Stale control sockets are removed at start: `--force` is no longer needed");
     }
     Runtime::init(
         home,

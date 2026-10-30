@@ -201,13 +201,23 @@ impl Events {
 /// Publishes events to subscribers.
 #[derive(Debug, Clone)]
 pub struct Emitter<T> {
-    subscribers: Arc<Mutex<Vec<mpsc::SyncSender<T>>>>,
+    subscribers: Arc<Mutex<Subscribers<T>>>,
+}
+
+/// An emitter's subscribers, and whether it has closed.
+#[derive(Debug)]
+struct Subscribers<T> {
+    senders: Vec<mpsc::SyncSender<T>>,
+    closed: bool,
 }
 
 impl<T> Default for Emitter<T> {
     fn default() -> Emitter<T> {
         Emitter {
-            subscribers: Default::default(),
+            subscribers: Arc::new(Mutex::new(Subscribers {
+                senders: Vec::new(),
+                closed: false,
+            })),
         }
     }
 }
@@ -221,6 +231,7 @@ impl<T: Clone> Emitter<T> {
         self.subscribers
             .lock()
             .unwrap()
+            .senders
             .retain(|s| s.try_send(event.clone()).is_ok());
     }
 
@@ -232,25 +243,42 @@ impl<T: Clone> Emitter<T> {
         #[allow(clippy::unwrap_used)]
         let mut subscribers = self.subscribers.lock().unwrap();
         for event in events {
-            subscribers.retain(|s| s.try_send(event.clone()).is_ok());
+            subscribers
+                .senders
+                .retain(|s| s.try_send(event.clone()).is_ok());
         }
     }
 
-    /// Subscribe to events stream.
+    /// Subscribe to events stream. Once the emitter has closed, the stream
+    /// is empty, and ends at once.
     pub fn subscribe(&self) -> mpsc::Receiver<T> {
         let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_EVENTS);
         // SAFETY: We deliberately propagate panics from other threads holding the lock.
         #[allow(clippy::unwrap_used)]
         let mut subs = self.subscribers.lock().unwrap();
-        subs.push(sender);
+        if !subs.closed {
+            subs.senders.push(sender);
+        }
 
         receiver
+    }
+
+    /// Ends every subscription, once each has had what was emitted before:
+    /// a subscriber waiting for an event is woken, and its stream ends. It
+    /// emits nothing more, and a later subscription ends at once. A node
+    /// closes it as it stops.
+    pub fn close(&self) {
+        // SAFETY: We deliberately propagate panics from other threads holding the lock.
+        #[allow(clippy::unwrap_used)]
+        let mut subs = self.subscribers.lock().unwrap();
+        subs.closed = true;
+        subs.senders.clear();
     }
 
     /// Number of subscribers.
     pub fn subscriptions(&self) -> usize {
         // SAFETY: We deliberately propagate panics from other threads holding the lock.
         #[allow(clippy::unwrap_used)]
-        self.subscribers.lock().unwrap().len()
+        self.subscribers.lock().unwrap().senders.len()
     }
 }

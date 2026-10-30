@@ -224,6 +224,13 @@ pub mod env {
     }
 }
 
+/// The lock of a home's node ([`Home::lock_node`]): while it is held, no
+/// other node runs on the home.
+#[derive(Debug)]
+pub struct NodeLock {
+    _file: fs::File,
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
@@ -734,6 +741,35 @@ impl Home {
     /// The `/node` directory under [`Home::path`].
     pub fn node(&self) -> PathBuf {
         self.path.join("node")
+    }
+
+    /// Takes the lock of the node on this home, on `node/node.lock`, unless
+    /// another node, in this process or another, holds it: then
+    /// `io::ErrorKind::WouldBlock`. It is held until the [`NodeLock`] drops,
+    /// and the operating system releases it when the process ends, however
+    /// it ends, so it is never stale.
+    pub fn lock_node(&self) -> io::Result<NodeLock> {
+        let path = self.node().join(node::NODE_LOCK_FILE);
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // No sharing: while it is open, no other handle opens it.
+            options.share_mode(0);
+        }
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            // `ERROR_SHARING_VIOLATION`: another handle has it open.
+            #[cfg(windows)]
+            Err(e) if e.raw_os_error() == Some(32) => {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, e));
+            }
+            Err(e) => return Err(e),
+        };
+        #[cfg(unix)]
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(NodeLock { _file: file })
     }
 
     /// The `/cobs` directory under [`Home::path`].
