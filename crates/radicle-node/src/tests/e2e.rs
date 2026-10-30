@@ -4227,6 +4227,263 @@ fn test_a_control_socket_is_its_user_s_alone_whatever_the_umask() {
     );
 }
 
+/// A SOCKS5 connection's handshake, as a proxy saw it.
+#[derive(Debug, Default)]
+struct Handshake {
+    greeting: Vec<u8>,
+    credentials: Option<(Vec<u8>, Vec<u8>)>,
+    /// The `CONNECT` request's address and port, as sent.
+    target: Vec<u8>,
+}
+
+/// A SOCKS5 proxy that records the handshakes of the first `count`
+/// connections it takes within ten seconds, then refuses each connection.
+fn recording_proxy(count: usize) -> (std::net::SocketAddr, thread::JoinHandle<Vec<Handshake>>) {
+    use std::io::{Read as _, Write as _};
+
+    fn record(stream: &mut std::net::TcpStream) -> std::io::Result<Handshake> {
+        let read = |stream: &mut std::net::TcpStream, len: usize| {
+            let mut buf = vec![0; len];
+            stream.read_exact(&mut buf).map(|()| buf)
+        };
+        let mut handshake = Handshake {
+            greeting: read(stream, 3)?,
+            ..Handshake::default()
+        };
+        match handshake.greeting[2] {
+            0 => stream.write_all(&[5, 0])?,
+            2 => {
+                stream.write_all(&[5, 2])?;
+                let _version = read(stream, 1)?;
+                let len = read(stream, 1)?[0];
+                let username = read(stream, len.into())?;
+                let len = read(stream, 1)?[0];
+                let password = read(stream, len.into())?;
+                handshake.credentials = Some((username, password));
+                stream.write_all(&[1, 0])?;
+            }
+            _ => {
+                stream.write_all(&[5, 0xff])?;
+                return Ok(handshake);
+            }
+        }
+        let request = read(stream, 4)?;
+        let addr = match request[3] {
+            1 => read(stream, 4 + 2)?,
+            4 => read(stream, 16 + 2)?,
+            _ => {
+                let len = read(stream, 1)?;
+                [len.clone(), read(stream, usize::from(len[0]) + 2)?].concat()
+            }
+        };
+        handshake.target = [&request[3..], &addr].concat();
+        // Connection refused.
+        stream.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])?;
+        Ok(handshake)
+    }
+
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let recorded = thread::spawn(move || {
+        let deadline = time::Instant::now() + time::Duration::from_secs(10);
+        let mut recorded = Vec::new();
+        while recorded.len() < count && time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(time::Duration::from_secs(5)))
+                        .unwrap();
+                    recorded.push(record(&mut stream).unwrap_or_default());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        recorded
+    });
+    (addr, recorded)
+}
+
+/// A gate that allows every address, and isolates streams if asked to.
+#[derive(Debug)]
+struct Isolating(bool);
+
+impl radicle::node::dial::Gate for Isolating {
+    fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+        true
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        radicle::node::dial::Open.resolve(host, port)
+    }
+
+    fn isolates_streams(&self) -> bool {
+        self.0
+    }
+}
+
+/// Has `alice` dial, through `proxy`, Bob twice, at two addresses, and Eve
+/// once, and returns each handshake the proxy saw, by its target's port.
+fn dial_through(
+    tmp: &std::path::Path,
+    isolates: bool,
+) -> std::collections::BTreeMap<u16, Handshake> {
+    let (proxy, recorded) = recording_proxy(3);
+    let mut cfg = config::relay("alice");
+    cfg.proxy = Some(proxy);
+    let alice = Node::init(tmp, cfg, 13).spawn_with_gate(std::sync::Arc::new(Isolating(isolates)));
+    let [bob, eve] = [41, 42]
+        .map(|seed| *SigningKey::from_seed(radicle::crypto::Seed::new([seed; 32])).public_key());
+    let connect = |nid, port| {
+        alice
+            .handle
+            .command(service::Command::Connect(
+                nid,
+                format!("192.0.2.1:{port}").parse().unwrap(),
+                ConnectOptions {
+                    persistent: false,
+                    timeout: time::Duration::from_secs(5),
+                },
+            ))
+            .unwrap();
+    };
+    connect(bob, 8776);
+    connect(eve, 8778);
+    // Bob again, once his first connection has failed.
+    thread::sleep(time::Duration::from_secs(1));
+    connect(bob, 8777);
+    let recorded = recorded.join().unwrap();
+    alice.shutdown();
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+    recorded
+        .into_iter()
+        .map(|handshake| {
+            // An IPv4 address, `192.0.2.1`, then the port.
+            assert_eq!(handshake.target[..5], [1, 192, 0, 2, 1], "{handshake:?}");
+            let port = u16::from_be_bytes([handshake.target[5], handshake.target[6]]);
+            (port, handshake)
+        })
+        .collect()
+}
+
+/// The environment variable that names the test a process of its own runs.
+const OWN_PROCESS: &str = "RAD_E2E_OWN_PROCESS";
+
+/// Whether this process is the one of its own that runs the test `name`.
+/// If it isn't, the test runs again in such a process, and fails unless it
+/// passes there: a test that sets what a whole process shares, its logger,
+/// runs its body there.
+fn in_own_process(name: &str) -> bool {
+    if std::env::var(OWN_PROCESS).as_deref() == Ok(name) {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1", "--nocapture"])
+        .env(OWN_PROCESS, name)
+        .env_remove("RUST_LOG")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{name} failed in a process of its own: {status}"
+    );
+    false
+}
+
+/// A logger that keeps every record, at every level.
+struct Captured(std::sync::Mutex<Vec<String>>);
+
+impl log::Log for Captured {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("{} {}", record.target(), record.args()));
+    }
+
+    fn flush(&self) {}
+}
+
+// Not `test_log`'s: this test's process keeps its own logger.
+#[core::prelude::v1::test]
+// Review of heartwood #19, round 1: the SOCKS5 handshake is logged at trace
+// level by its acts' lengths only, so a node's credentials, its derived
+// passwords among them, never reach its logs.
+fn test_a_node_logs_no_socks_credentials() {
+    if !in_own_process("tests::e2e::test_a_node_logs_no_socks_credentials") {
+        return;
+    }
+    static LOGS: std::sync::LazyLock<Captured> =
+        std::sync::LazyLock::new(|| Captured(std::sync::Mutex::new(Vec::new())));
+    log::set_logger(&*LOGS).unwrap();
+    log::set_max_level(log::LevelFilter::Trace);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = dial_through(tmp.path(), true);
+    let logs = LOGS.0.lock().unwrap().join("\n");
+    // The handshake was logged at trace level.
+    assert!(
+        logs.contains("socks5 Sending handshake act on read: "),
+        "{logs}"
+    );
+    for handshake in seen.values() {
+        let (username, password) = handshake.credentials.as_ref().unwrap();
+        let password = String::from_utf8(password.clone()).unwrap();
+        assert!(!logs.contains(&password), "a password was logged");
+        // Nor as the bytes of an act.
+        for secret in [username.as_slice(), password.as_bytes()] {
+            let bytes = format!("{secret:02x?}");
+            assert!(
+                !logs.contains(bytes.trim_matches(['[', ']'])),
+                "credentials were logged as bytes"
+            );
+        }
+    }
+}
+
+#[test]
+// Security R-12, part 4: a node whose gate asks for stream isolation asks
+// its SOCKS5 proxy with username and password only, and with credentials of
+// each remote node's own: the same for each of Bob's connections, and others
+// for Eve's.
+fn test_a_node_isolates_each_peer_s_streams_through_its_proxy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = dial_through(tmp.path(), true);
+    for handshake in seen.values() {
+        assert_eq!(handshake.greeting, [5, 1, 2], "username and password only");
+        let (username, password) = handshake.credentials.as_ref().unwrap();
+        assert_eq!(username, b"radicle");
+        assert_eq!(password.len(), 64);
+    }
+    let password = |port| &seen[&port].credentials.as_ref().unwrap().1;
+    assert_eq!(
+        password(8776),
+        password(8777),
+        "Bob's connections share theirs"
+    );
+    assert_ne!(password(8776), password(8778), "Eve's are her own");
+}
+
+#[test]
+// Security R-12, part 4: with a gate that doesn't ask for isolation, a node
+// asks its SOCKS5 proxy with no authentication, as it always has.
+fn test_a_node_asks_its_proxy_with_no_authentication_unless_its_gate_isolates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = dial_through(tmp.path(), false);
+    for handshake in seen.values() {
+        assert_eq!(handshake.greeting, [5, 1, 0]);
+        assert!(handshake.credentials.is_none());
+    }
+}
+
 /// A dial gate that refuses every target, and counts those it was asked
 /// about.
 #[derive(Debug, Default)]
