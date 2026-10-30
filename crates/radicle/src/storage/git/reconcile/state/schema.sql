@@ -24,13 +24,18 @@ create table if not exists "reconcile_namespace" (
   primary key ("rid", "namespace")
 ) strict;
 
--- The unit in progress: one row at most.
-create table if not exists "reconcile_unit" (
-  "id"            integer   primary key not null check ("id" = 1),
+-- The units started and not completed since, a row each: how many
+-- processes have started each one. A unit's row goes once it completes. A
+-- unit some process ended during keeps its row, whatever units run, or end
+-- processes, in between.
+create table if not exists "reconcile_attempt" (
   "rid"           text      not null,
   "kind"          text      not null,
   "position"      text      not null,
-  "attempts"      integer   not null
+  "attempts"      integer   not null,
+  -- The order the units were last started in.
+  "started"       integer   not null,
+  primary key ("rid", "kind", "position")
 ) strict;
 
 -- A cache rebuild's staged COBs: the rows publication swaps in.

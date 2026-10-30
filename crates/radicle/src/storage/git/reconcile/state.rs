@@ -51,7 +51,16 @@ pub enum Error {
     /// as absent.
     #[error("a symbolic ref resolves through {0:?}, a ref whose name isn't UTF-8")]
     Undecodable(String),
+    /// As many units as a state keeps histories of ([`MAX_INTERRUPTED`]) were
+    /// each started and never completed: processes ended during each. No
+    /// other unit starts, so that the record stays bounded.
+    #[error("{0} units were started and never completed")]
+    Interrupted(usize),
 }
+
+/// The units a state keeps the histories of, at most: units started and not
+/// completed since. A start past it fails closed ([`Error::Interrupted`]).
+pub const MAX_INTERRUPTED: usize = 1_024;
 
 /// A step of one repository's repair, recorded once it is finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -120,8 +129,9 @@ pub struct Unit {
     pub position: String,
 }
 
-/// The unit in progress, and how many processes have started it: a unit
-/// still recorded when a process starts was cut off when the last one ended.
+/// A unit started and not completed since, and how many processes have
+/// started it: a unit still recorded when a process starts was cut off when
+/// a process ended during it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InProgress {
     pub unit: Unit,
@@ -219,6 +229,11 @@ fn target(reference: &git::raw::Reference, name: &[u8]) -> Result<Vec<u8>, Error
 /// Reconciliation's progress, in `cobs/cache.db`.
 pub struct State {
     db: sql::ConnectionThreadSafe,
+    /// The units processes ended during, as this one found them when it
+    /// opened, the most recently started first.
+    interrupted: Vec<InProgress>,
+    /// The unit this process started last, until it ends.
+    running: Option<Unit>,
 }
 
 impl fmt::Debug for State {
@@ -234,8 +249,17 @@ impl State {
         let mut db = sql::Connection::open_thread_safe(path)?;
         db.set_busy_timeout(DB_WRITE_TIMEOUT.as_millis() as usize)?;
         db.execute("PRAGMA synchronous = FULL;")?;
-        transaction(&db, |db| db.execute(SCHEMA))?;
-        Ok(Self { db })
+        transaction(&db, |db| {
+            db.execute(SCHEMA)?;
+            migrate_unit(db)
+        })?;
+        let mut state = Self {
+            db,
+            interrupted: Vec::new(),
+            running: None,
+        };
+        state.interrupted = state.histories()?;
+        Ok(state)
     }
 
     /// Begins, or resumes, the repair of `rid` at its `version`: the steps
@@ -345,58 +369,106 @@ impl State {
         Ok(())
     }
 
-    /// The unit in progress when the last process ended, if one was.
-    pub fn in_progress(&self) -> Result<Option<InProgress>, Error> {
-        let stmt = self
-            .db
-            .prepare("SELECT rid, kind, position, attempts FROM reconcile_unit WHERE id = 1")?;
-        let Some(row) = stmt.into_iter().next() else {
-            return Ok(None);
-        };
-        let row = row?;
-        Ok(Some(InProgress {
-            unit: Unit {
-                rid: row.try_read::<RepoId, _>("rid")?,
-                kind: row.try_read::<&str, _>("kind")?.to_owned(),
-                position: row.try_read::<&str, _>("position")?.to_owned(),
-            },
-            attempts: row
-                .try_read::<i64, _>("attempts")?
-                .clamp(0, u32::MAX.into()) as u32,
-        }))
+    /// Every unit started and not completed since, the most recently
+    /// started first.
+    pub fn histories(&self) -> Result<Vec<InProgress>, Error> {
+        let stmt = self.db.prepare(
+            "SELECT rid, kind, position, attempts FROM reconcile_attempt
+             ORDER BY started DESC",
+        )?;
+        let mut histories = Vec::new();
+        for row in stmt.into_iter() {
+            let row = row?;
+            histories.push(InProgress {
+                unit: Unit {
+                    rid: row.try_read::<RepoId, _>("rid")?,
+                    kind: row.try_read::<&str, _>("kind")?.to_owned(),
+                    position: row.try_read::<&str, _>("position")?.to_owned(),
+                },
+                attempts: row
+                    .try_read::<i64, _>("attempts")?
+                    .clamp(0, u32::MAX.into()) as u32,
+            });
+        }
+        Ok(histories)
     }
 
-    /// Records `unit` as in progress, before it starts: how many processes
-    /// have now started it, one more than before if it was already the unit
-    /// in progress.
+    /// The unit started last and not completed since: the one running, or
+    /// else the last one a process ended during.
+    pub fn in_progress(&self) -> Result<Option<InProgress>, Error> {
+        Ok(self.histories()?.into_iter().next())
+    }
+
+    /// The units processes ended during, as this one opened the state: each
+    /// started and not completed since, the most recently started first.
+    pub fn interrupted(&self) -> &[InProgress] {
+        &self.interrupted
+    }
+
+    /// Records `unit` as started, before it starts, in one durable
+    /// transaction: how many processes have now started it. That is one more
+    /// than its history says, if processes ended during it before, whatever
+    /// units ran or processes ended in between, and one otherwise. No other
+    /// unit's history changes.
+    ///
+    /// A unit that has no history yet, when [`MAX_INTERRUPTED`] units have
+    /// one, fails closed with [`Error::Interrupted`].
     pub fn start(&mut self, unit: &Unit) -> Result<u32, Error> {
-        transaction(&self.db, |db| {
-            let attempts = match self.in_progress()? {
-                Some(InProgress {
-                    unit: recorded,
-                    attempts,
-                }) if recorded == *unit => attempts.saturating_add(1),
-                _ => 1,
-            };
+        let attempts = transaction(&self.db, |db| {
+            let mut count = db.prepare(
+                "SELECT
+                   (SELECT COUNT(*) FROM reconcile_attempt) AS histories,
+                   (SELECT attempts FROM reconcile_attempt
+                     WHERE rid = ?1 AND kind = ?2 AND position = ?3) AS attempts,
+                   (SELECT COALESCE(MAX(started), 0) FROM reconcile_attempt) AS last",
+            )?;
+            count.bind((1, &unit.rid))?;
+            count.bind((2, unit.kind.as_str()))?;
+            count.bind((3, unit.position.as_str()))?;
+            let row = count
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Invalid("no count of unit histories".to_owned()))??;
+            let histories = row.try_read::<i64, _>("histories")?.max(0) as usize;
+            let before = row.try_read::<Option<i64>, _>("attempts")?;
+            let last = row.try_read::<i64, _>("last")?;
+            if before.is_none() && histories >= MAX_INTERRUPTED {
+                return Err(Error::Interrupted(histories));
+            }
+            let attempts = before.unwrap_or(0).clamp(0, u32::MAX.into()) as u32;
+            let attempts = attempts.saturating_add(1);
             let mut stmt = db.prepare(
-                "INSERT INTO reconcile_unit (id, rid, kind, position, attempts)
-                 VALUES (1, ?1, ?2, ?3, ?4)
-                 ON CONFLICT (id) DO UPDATE SET
-                   rid = excluded.rid, kind = excluded.kind,
-                   position = excluded.position, attempts = excluded.attempts",
+                "INSERT INTO reconcile_attempt (rid, kind, position, attempts, started)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (rid, kind, position) DO UPDATE SET
+                   attempts = excluded.attempts, started = excluded.started",
             )?;
             stmt.bind((1, &unit.rid))?;
             stmt.bind((2, unit.kind.as_str()))?;
             stmt.bind((3, unit.position.as_str()))?;
             stmt.bind((4, i64::from(attempts)))?;
+            stmt.bind((5, last.saturating_add(1)))?;
             stmt.next()?;
             Ok(attempts)
-        })
+        })?;
+        self.running = Some(unit.clone());
+        Ok(attempts)
     }
 
-    /// Records that the unit in progress has ended.
+    /// Records that the unit this process started last has completed: its
+    /// history is removed, and only its. Another unit's history, of a process
+    /// that ended during it, stays until that unit completes.
     pub fn end(&mut self) -> Result<(), Error> {
-        self.db.execute("DELETE FROM reconcile_unit")?;
+        let Some(unit) = self.running.take() else {
+            return Ok(());
+        };
+        let mut stmt = self.db.prepare(
+            "DELETE FROM reconcile_attempt WHERE rid = ?1 AND kind = ?2 AND position = ?3",
+        )?;
+        stmt.bind((1, &unit.rid))?;
+        stmt.bind((2, unit.kind.as_str()))?;
+        stmt.bind((3, unit.position.as_str()))?;
+        stmt.next()?;
         Ok(())
     }
 
@@ -727,15 +799,35 @@ impl State {
             db.execute(
                 "DELETE FROM reconcile_namespace;
                  DELETE FROM reconcile_repository;
-                 DELETE FROM reconcile_unit;
+                 DELETE FROM reconcile_attempt;
                  DELETE FROM rebuild_staging;
                  DELETE FROM reconcile_cache;
                  DELETE FROM rebuild_worklist;
                  DELETE FROM rebuild_scan;",
             )?;
-            Ok(())
-        })
+            Ok::<_, Error>(())
+        })?;
+        self.interrupted.clear();
+        self.running = None;
+        Ok(())
     }
+}
+
+/// Moves the record of an earlier state, which kept one unit in progress at
+/// most (`reconcile_unit`), into the units' histories, and drops it.
+fn migrate_unit(db: &sql::Connection) -> Result<(), Error> {
+    let mut exists =
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reconcile_unit'")?;
+    if exists.next()? != sql::State::Row {
+        return Ok(());
+    }
+    drop(exists);
+    db.execute(
+        "INSERT OR IGNORE INTO reconcile_attempt (rid, kind, position, attempts, started)
+           SELECT rid, kind, position, attempts, 1 FROM reconcile_unit;
+         DROP TABLE reconcile_unit;",
+    )?;
+    Ok(())
 }
 
 fn steps(text: &str) -> Result<BTreeSet<Step>, Error> {
@@ -917,7 +1009,9 @@ mod tests {
             })
         );
         assert_eq!(state.start(&unit).unwrap(), 2);
-        // Another unit starts at one.
+        // It completes: its history goes. Another unit starts at one.
+        state.end().unwrap();
+        assert_eq!(state.in_progress().unwrap(), None);
         let next = Unit {
             position: "z6Mk..@refs/rad/id".to_owned(),
             ..unit.clone()
@@ -926,6 +1020,187 @@ mod tests {
         state.end().unwrap();
         assert_eq!(state.in_progress().unwrap(), None);
         assert_eq!(state.start(&unit).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_cut_off_unit_s_record_outlasts_the_units_before_it_runs_again() {
+        let (tmp, mut state) = state();
+        let unit = Unit {
+            rid: rid(),
+            kind: "cache".to_owned(),
+            position: "issue:".to_owned(),
+        };
+        let other = Unit {
+            kind: "ref-locks".to_owned(),
+            position: String::new(),
+            ..unit.clone()
+        };
+        let reopen = |state: State| {
+            drop(state);
+            State::open(tmp.path().join("cache.db")).unwrap()
+        };
+        state.start(&unit).unwrap();
+        // The process ends during it. The next one runs another unit first,
+        // and ends before it reaches it again.
+        let mut state = reopen(state);
+        assert_eq!(state.start(&other).unwrap(), 1);
+        state.end().unwrap();
+        let interrupted = InProgress {
+            unit: unit.clone(),
+            attempts: 1,
+        };
+        assert_eq!(state.interrupted(), std::slice::from_ref(&interrupted));
+        assert_eq!(state.in_progress().unwrap(), Some(interrupted.clone()));
+        // The one after still counts it as started once.
+        let mut state = reopen(state);
+        assert_eq!(state.interrupted(), std::slice::from_ref(&interrupted));
+        assert_eq!(state.start(&other).unwrap(), 1);
+        state.end().unwrap();
+        assert_eq!(state.start(&unit).unwrap(), 2);
+        // It ends during it again: the next process counts a third start,
+        // after other units.
+        let mut state = reopen(state);
+        assert_eq!(state.start(&other).unwrap(), 1);
+        state.end().unwrap();
+        assert_eq!(state.start(&unit).unwrap(), 3);
+        state.end().unwrap();
+        assert_eq!(state.in_progress().unwrap(), None);
+        assert!(reopen(state).interrupted().is_empty());
+    }
+
+    /// Two units of one repository: a cache unit that comes later, and a
+    /// `begin` that comes earlier.
+    fn two_units() -> (Unit, Unit) {
+        let later = Unit {
+            rid: rid(),
+            kind: "cache".to_owned(),
+            position: "issue:".to_owned(),
+        };
+        let earlier = Unit {
+            kind: "begin".to_owned(),
+            position: String::new(),
+            ..later.clone()
+        };
+        (later, earlier)
+    }
+
+    #[test]
+    // Review of heartwood #23, round 1: a process that ends during another
+    // unit keeps the first unit's history. One process ends during the later
+    // unit, the next during the earlier one; the third resumes the earlier
+    // one, completes it, and counts the later one's second start.
+    fn a_process_that_ends_during_another_unit_keeps_the_first_unit_s_history() {
+        let (tmp, mut state) = state();
+        let path = tmp.path().join("cache.db");
+        let (later, earlier) = two_units();
+        assert_eq!(state.start(&later).unwrap(), 1);
+        drop(state);
+        let mut state = State::open(&path).unwrap();
+        assert_eq!(state.start(&earlier).unwrap(), 1);
+        drop(state);
+        let mut state = State::open(&path).unwrap();
+        assert_eq!(state.interrupted().len(), 2);
+        assert_eq!(state.start(&earlier).unwrap(), 2);
+        state.end().unwrap();
+        assert_eq!(state.start(&later).unwrap(), 2);
+        state.end().unwrap();
+        assert_eq!(state.in_progress().unwrap(), None);
+    }
+
+    #[test]
+    // Review of heartwood #23, round 1: processes that end, in turn, during
+    // two units can't keep resetting either's count. The third start of
+    // each is its third.
+    fn crashes_alternating_between_two_units_count_every_start() {
+        let (tmp, state) = state();
+        let path = tmp.path().join("cache.db");
+        drop(state);
+        let (later, earlier) = two_units();
+        for (unit, attempts) in [
+            (&later, 1),
+            (&earlier, 1),
+            (&later, 2),
+            (&earlier, 2),
+            (&later, 3),
+            (&earlier, 3),
+        ] {
+            // A process starts the unit, and ends during it.
+            let mut state = State::open(&path).unwrap();
+            assert_eq!(state.start(unit).unwrap(), attempts);
+        }
+    }
+
+    #[test]
+    // Review of heartwood #23, round 1: the histories are bounded. With
+    // `MAX_INTERRUPTED` units started and never completed, a new unit's start
+    // fails closed, while one of those units still starts; once the run is
+    // done, units start again.
+    fn the_histories_are_bounded_and_a_start_past_them_fails_closed() {
+        let (_tmp, mut state) = state();
+        let rid = rid();
+        let unit = |n: usize| Unit {
+            rid,
+            kind: "namespace".to_owned(),
+            position: format!("unit-{n}"),
+        };
+        for n in 0..MAX_INTERRUPTED {
+            assert_eq!(state.start(&unit(n)).unwrap(), 1);
+        }
+        assert_eq!(state.histories().unwrap().len(), MAX_INTERRUPTED);
+        assert!(matches!(
+            state.start(&unit(MAX_INTERRUPTED)),
+            Err(Error::Interrupted(n)) if n == MAX_INTERRUPTED
+        ));
+        assert_eq!(state.start(&unit(0)).unwrap(), 2);
+        state.clear().unwrap();
+        assert_eq!(state.start(&unit(MAX_INTERRUPTED)).unwrap(), 1);
+    }
+
+    #[test]
+    // Review of heartwood #23, round 1: an earlier state's one record of the
+    // unit in progress becomes that unit's history.
+    fn an_earlier_state_s_unit_record_becomes_its_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache.db");
+        let rid = rid();
+        {
+            let db = sql::Connection::open(&path).unwrap();
+            db.execute(
+                "CREATE TABLE reconcile_unit (
+                   id integer primary key not null check (id = 1),
+                   rid text not null, kind text not null,
+                   position text not null, attempts integer not null
+                 ) strict;",
+            )
+            .unwrap();
+            let mut stmt = db
+                .prepare(
+                    "INSERT INTO reconcile_unit (id, rid, kind, position, attempts)
+                     VALUES (1, ?1, 'cache', 'issue:', 2)",
+                )
+                .unwrap();
+            stmt.bind((1, &rid)).unwrap();
+            stmt.next().unwrap();
+        }
+        let mut state = State::open(&path).unwrap();
+        let unit = Unit {
+            rid,
+            kind: "cache".to_owned(),
+            position: "issue:".to_owned(),
+        };
+        assert_eq!(
+            state.interrupted(),
+            [InProgress {
+                unit: unit.clone(),
+                attempts: 2
+            }]
+        );
+        assert_eq!(state.start(&unit).unwrap(), 3);
+        let mut exists = state
+            .db
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'reconcile_unit'")
+            .unwrap();
+        assert_eq!(exists.next().unwrap(), sql::State::Done);
     }
 
     #[test]
