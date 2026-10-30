@@ -11,10 +11,25 @@ pub enum ReadCommit {
     #[error(transparent)]
     IncorrectObject(NotCommit),
     #[error(transparent)]
+    TooLarge(TooLarge),
+    #[error(transparent)]
     Other(Box<StdError>),
 }
 
+/// What a read within a limit refused: the objects it would read take more
+/// bytes than the limit leaves.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+#[error("the objects to read take more than the {limit} bytes left to read")]
+pub struct TooLarge {
+    pub limit: u64,
+}
+
 impl ReadCommit {
+    pub fn too_large(limit: u64) -> Self {
+        Self::TooLarge(TooLarge { limit })
+    }
+
     pub fn incorrect_object_error<K>(oid: Oid, kind: K) -> Self
     where
         K: ToString,
@@ -50,6 +65,8 @@ pub enum ReadBlob {
     #[error(transparent)]
     IncorrectObject(NotBlob),
     #[error(transparent)]
+    TooLarge(TooLarge),
+    #[error(transparent)]
     Other(Box<StdError>),
 }
 
@@ -70,6 +87,10 @@ pub struct NotBlob {
 }
 
 impl ReadBlob {
+    pub fn too_large(limit: u64) -> Self {
+        Self::TooLarge(TooLarge { limit })
+    }
+
     pub fn commit_not_found_error(oid: Oid) -> Self {
         Self::CommitNotFound(CommitNotFound { oid })
     }

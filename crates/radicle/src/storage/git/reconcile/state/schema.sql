@@ -58,11 +58,14 @@ create table if not exists "rebuild_worklist" (
 ) strict;
 
 -- A cache rebuild's scan of its remotes: the version it is bound to, the
--- last remote scanned, and whether every remote has been.
+-- last remote scanned whole, the remote after it scanned in part and the
+-- last of its COB refs recorded, and whether every remote has been.
 create table if not exists "rebuild_scan" (
   "rid"           text      primary key not null,
   "version"       text      not null,
   "after"         text,
+  "remote"        text,
+  "ref"           text,
   "complete"      integer   not null
 ) strict;
 

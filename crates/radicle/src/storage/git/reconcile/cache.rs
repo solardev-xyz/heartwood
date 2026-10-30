@@ -4,10 +4,11 @@
 //! heartwood's own `write_all` clears a repository's cache rows and writes
 //! them again in place, so a reader can see the cache half-built. Here:
 //!
-//! 1. **A scan** reads each remote's signed refs, verified, a remote at a
-//!    time, and records every COB tip they sign in a worklist bound to the
-//!    repository's version ([`scan`]). A tip no verified signed refs name is
-//!    never read.
+//! 1. **A scan** reads each remote's signed refs, verified, and records
+//!    every COB tip they sign in a worklist bound to the repository's version
+//!    ([`scan`]), a page of at most [`SCAN_TIPS`] at a time. A tip no
+//!    verified signed refs name is never read, and signed refs larger than
+//!    [`MAX_SIGNED_REFS`] fail the scan before they are.
 //! 2. **Batches** page the worklist by kind and ID. Each COB is loaded
 //!    strictly from its tips, within [`LIMITS`] ([`materialize`]): any change
 //!    that doesn't load, whose signature is invalid or whose actions don't
@@ -30,8 +31,10 @@ use crate::git;
 use crate::issue;
 use crate::patch;
 use crate::prelude::NodeId;
-use crate::storage::RemoteRepository as _;
 use crate::storage::git::Repository;
+use crate::storage::refs::SignedRefs;
+use crate::storage::refs::sigrefs::SignedRefsReader;
+use crate::storage::refs::sigrefs::read::{Budget, Tip as SigrefsTip};
 
 /// COBs a batch stages at most, in its usual form, whatever it is asked
 /// for. Its smallest form stages one.
@@ -40,6 +43,23 @@ pub const BATCH_COBS: usize = 64;
 /// Remotes a scan unit reads at most, in its usual form. Its smallest form
 /// reads one.
 pub const SCAN_REMOTES: usize = 16;
+
+/// COB tips a scan unit records at most, in its usual form, whatever the
+/// remotes it reads sign: a remote with more is recorded a page at a time,
+/// each page with the scan's checkpoint. Its smallest form records one.
+pub const SCAN_TIPS: usize = 1_024;
+
+/// Bytes a remote's signed refs may take, at most: its `refs` blob, which
+/// names every ref it signs, a line each. Past it, the remote fails the
+/// scan before its refs are read, rather than every unit reading them all.
+/// At some 100 bytes a ref, this is some 80,000 refs.
+pub const MAX_SIGNED_REFS: u64 = 8 * 1024 * 1024;
+
+/// Bytes a remote's signed refs commit, or its tree, may take, at most.
+const MAX_SIGNED_REFS_OBJECT: u64 = 64 * 1024;
+
+/// Bytes a remote's `signature` blob takes: an Ed25519 signature's.
+const SIGNATURE_BYTES: u64 = 64;
 
 /// What one COB may take to materialize. One past any of these doesn't
 /// load: it is a cache error, never an exhausted process.
@@ -134,11 +154,14 @@ impl Default for Checkpoint {
     }
 }
 
-/// Where a rebuild's scan of its remotes stands: the last remote it read,
-/// and whether it has read them all.
+/// Where a rebuild's scan of its remotes stands: the last remote whose tips
+/// are all recorded, the remote after it whose tips are partly recorded and
+/// the last of its COB refs recorded, if any, and whether every remote has
+/// been read.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scan {
     pub after: Option<NodeId>,
+    pub within: Option<(NodeId, git::fmt::RefString)>,
     pub complete: bool,
 }
 
@@ -189,62 +212,179 @@ pub enum Error {
     Invalid(String),
 }
 
-/// One unit of the scan of `repo`'s remotes, at its input `version`: up to
-/// `limit` remotes after the last one scanned, in the order of their IDs,
-/// each recorded whole with the scan's checkpoint. A remote's signed refs
-/// are verified as they are read: one that doesn't verify fails the scan.
-/// It returns whether every remote has been scanned.
+/// One unit of the scan of `repo`'s remotes, at its input `version`: in the
+/// order of their IDs, from where the scan stands, up to `remotes` remotes,
+/// and up to `tips` COB tips, at least one of each. A remote's tips are
+/// recorded in the order of their ref names, a page at a time, each page
+/// with the scan's checkpoint in one durable transaction, so a remote with
+/// more tips than a unit takes is resumed after the last one recorded.
+///
+/// A remote's signed refs are verified as they are read: ones that don't
+/// verify, or that take more than [`MAX_SIGNED_REFS`] bytes, fail the scan,
+/// and so does one whose history takes more than the reader's default
+/// [`Budget`] to read (Security R-21). It returns whether every remote has
+/// been scanned.
 pub fn scan(
     repo: &Repository,
     state: &mut super::state::State,
     version: git::Oid,
-    limit: usize,
+    remotes: usize,
+    tips: usize,
+) -> Result<bool, Error> {
+    scan_within(repo, state, version, remotes, tips, Budget::DEFAULT)
+}
+
+/// [`scan`], reading each remote's signed refs within `budget`.
+pub fn scan_within(
+    repo: &Repository,
+    state: &mut super::state::State,
+    version: git::Oid,
+    remotes: usize,
+    tips: usize,
+    budget: Budget,
 ) -> Result<bool, Error> {
     let at = state.scan(&repo.id, version)?.unwrap_or_default();
     if at.complete {
         return Ok(true);
     }
-    let mut remotes = Vec::new();
+    let mut pending = Vec::new();
     for remote in repo.remote_ids()? {
         let remote = remote.map_err(|e| Error::Invalid(e.to_string()))?;
         if at.after.is_none_or(|after| remote > after) {
-            remotes.push(remote);
+            pending.push(remote);
         }
     }
-    remotes.sort();
-    remotes.dedup();
-    if remotes.is_empty() {
-        state.scanned(&repo.id, version, at.after.as_ref(), &[], true)?;
+    pending.sort();
+    pending.dedup();
+    let (mut after, mut within) = (at.after, at.within);
+    if pending.is_empty() {
+        let next = Scan {
+            after,
+            within: None,
+            complete: true,
+        };
+        state.scanned(&repo.id, version, None, &[], &next)?;
         return Ok(true);
     }
-    let count = remotes.len();
-    for (i, remote) in remotes.into_iter().take(limit.max(1)).enumerate() {
-        let refs = repo.remote(&remote).map_err(|e| Error::Sigrefs {
-            remote,
-            reason: e.to_string(),
-        })?;
-        let tips = refs
-            .refs
-            .iter()
-            .filter_map(|(name, oid)| {
-                let (typename, id) = cob::object::parse_refstr(name)?;
-                let kind = Kind::ALL
-                    .into_iter()
-                    .find(|kind| kind.typename() == &typename)?;
-                Some(Tip {
-                    kind,
-                    id,
-                    oid: *oid,
-                })
-            })
-            .collect::<Vec<_>>();
-        let last = i + 1 == count;
-        state.scanned(&repo.id, version, Some(&remote), &tips, last)?;
-        if last {
+    let count = pending.len();
+    let mut left = tips.max(1);
+    for (i, remote) in pending.into_iter().take(remotes.max(1)).enumerate() {
+        let from = within
+            .take()
+            .filter(|(partly, _)| *partly == remote)
+            .map(|(_, name)| name);
+        let refs = signed_refs(repo, &remote, budget)?;
+        let mut page = Vec::new();
+        let mut last = None;
+        let mut more = false;
+        for (name, oid) in refs.iter() {
+            if from.as_ref().is_some_and(|from| name <= from) {
+                continue;
+            }
+            let Some((typename, id)) = cob::object::parse_refstr(name) else {
+                continue;
+            };
+            let Some(kind) = Kind::ALL
+                .into_iter()
+                .find(|kind| kind.typename() == &typename)
+            else {
+                continue;
+            };
+            if page.len() == left {
+                more = true;
+                break;
+            }
+            page.push(Tip {
+                kind,
+                id,
+                oid: *oid,
+            });
+            last = Some(name.clone());
+        }
+        left -= page.len();
+        if let (true, Some(last)) = (more, last) {
+            let next = Scan {
+                after,
+                within: Some((remote, last)),
+                complete: false,
+            };
+            state.scanned(&repo.id, version, Some(&remote), &page, &next)?;
+            return Ok(false);
+        }
+        let complete = i + 1 == count;
+        after = Some(remote);
+        let next = Scan {
+            after,
+            within: None,
+            complete,
+        };
+        state.scanned(&repo.id, version, Some(&remote), &page, &next)?;
+        if complete {
             return Ok(true);
+        }
+        if left == 0 {
+            return Ok(false);
         }
     }
     Ok(false)
+}
+
+/// `remote`'s signed refs in `repo`, verified: its `rad/sigrefs` commit,
+/// whose objects are measured before they are read, its `refs` blob within
+/// [`MAX_SIGNED_REFS`] and its `signature` blob a signature's size, then
+/// read within `budget`, as its history may need walking.
+fn signed_refs(repo: &Repository, remote: &NodeId, budget: Budget) -> Result<SignedRefs, Error> {
+    let failed = |reason: String| Error::Sigrefs {
+        remote: *remote,
+        reason,
+    };
+    let backend = &repo.backend;
+    let odb = backend.odb()?;
+    let size = |oid: git::raw::Oid| {
+        odb.read_header(oid)
+            .map(|(size, _)| size as u64)
+            .map_err(|e| failed(e.to_string()))
+    };
+    let too_large = |what: &str, size: u64, max: u64| {
+        failed(format!("its {what} takes {size} bytes, more than {max}"))
+    };
+    let head = backend
+        .refname_to_id(&format!("refs/namespaces/{remote}/refs/rad/sigrefs"))
+        .map_err(|e| failed(e.to_string()))?;
+    let commit_size = size(head)?;
+    if commit_size > MAX_SIGNED_REFS_OBJECT {
+        return Err(too_large("commit", commit_size, MAX_SIGNED_REFS_OBJECT));
+    }
+    let commit = backend
+        .find_commit(head)
+        .map_err(|e| failed(e.to_string()))?;
+    let tree_size = size(commit.tree_id())?;
+    if tree_size > MAX_SIGNED_REFS_OBJECT {
+        return Err(too_large("tree", tree_size, MAX_SIGNED_REFS_OBJECT));
+    }
+    let tree = commit.tree().map_err(|e| failed(e.to_string()))?;
+    if let Some(entry) = tree.get_name(crate::storage::refs::REFS_BLOB_PATH) {
+        let refs_size = size(entry.id())?;
+        if refs_size > MAX_SIGNED_REFS {
+            return Err(too_large("refs blob", refs_size, MAX_SIGNED_REFS));
+        }
+    }
+    if let Some(entry) = tree.get_name(crate::storage::refs::SIGNATURE_BLOB_PATH) {
+        let signature_size = size(entry.id())?;
+        if signature_size != SIGNATURE_BYTES {
+            return Err(failed(format!(
+                "its signature blob takes {signature_size} bytes, where a signature takes \
+                 {SIGNATURE_BYTES}"
+            )));
+        }
+    }
+    let verifier =
+        crate::crypto::VerifyingKey::try_from(remote).map_err(|e| failed(e.to_string()))?;
+    SignedRefsReader::new(repo.id, SigrefsTip::Commit(head.into()), repo, &verifier)
+        .with_budget(budget)
+        .read()
+        .map(|verified| verified.into_sigrefs_at(*remote))
+        .map_err(|e| failed(e.to_string()))
 }
 
 /// Materializes the COB `id` of `kind` from its tips in `state`'s worklist,
@@ -476,7 +616,15 @@ mod tests {
         /// Scans the repository's remotes at its version, whole.
         fn scan(&mut self) {
             let version = self.version();
-            while !scan(&self.alice.repo, &mut self.state, version, SCAN_REMOTES).unwrap() {}
+            while !scan(
+                &self.alice.repo,
+                &mut self.state,
+                version,
+                SCAN_REMOTES,
+                SCAN_TIPS,
+            )
+            .unwrap()
+            {}
         }
 
         /// Every batch of a rebuild from `from`, with `limit` COBs each, its
@@ -966,12 +1114,12 @@ mod tests {
         }
         let version = f.version();
         f.state.begin(&rid, version).unwrap();
-        assert!(!scan(&f.alice.repo, &mut f.state, version, 1).unwrap());
+        assert!(!scan(&f.alice.repo, &mut f.state, version, 1, SCAN_TIPS).unwrap());
         drop(std::mem::replace(
             &mut f.state,
             State::open(&f.path).unwrap(),
         ));
-        assert!(scan(&f.alice.repo, &mut f.state, version, 1).unwrap());
+        assert!(scan(&f.alice.repo, &mut f.state, version, 1, SCAN_TIPS).unwrap());
         assert!(f.state.scan(&rid, version).unwrap().unwrap().complete);
         // The issue has a tip from each remote.
         assert_eq!(f.state.tips(&rid, Kind::Issue, &id).unwrap().len(), 2);
@@ -979,6 +1127,255 @@ mod tests {
         assert_eq!(f.rebuild(Checkpoint::default(), BATCH_COBS), 1);
         f.state.publish(&rid, Publication::Start).unwrap();
         assert_eq!(f.live(), written_all(f.repo()));
+    }
+
+    #[test]
+    // Review of heartwood #18, round 2: a remote's tips are recorded a page at
+    // a time, at most `tips` a unit across the remotes it reads, each page
+    // with the scan's checkpoint, and a scan cut off between pages resumes
+    // after the last tip recorded.
+    fn a_remote_s_tips_are_scanned_a_page_at_a_time() {
+        let mut f = fixture();
+        let rid = f.repo().id;
+        let ids = f.ids(Kind::Issue);
+        // Bob comments on the first issue: a second remote, with one tip.
+        let bob = crate::crypto::SigningKey::mock(80);
+        {
+            let mut issues = issue::Cache::no_cache(&*f.alice.repo, &bob).unwrap();
+            let mut issue = issues.get_mut(&ids[0]).unwrap();
+            let root = *issue.root().0;
+            issue.comment("Bob's comment", root, []).unwrap();
+        }
+        let last = (*f.alice.signer.public_key()).max(*bob.public_key());
+        let version = f.version();
+        f.state.begin(&rid, version).unwrap();
+        // The worklist's rows: a tip for each COB a remote signs.
+        let rows = |state: &State| {
+            Kind::ALL
+                .into_iter()
+                .flat_map(|kind| {
+                    let (ids, _) = state.worklist(&rid, kind, None, BATCH_COBS).unwrap();
+                    ids.into_iter().map(move |id| (kind, id))
+                })
+                .map(|(kind, id)| state.tips(&rid, kind, &id).unwrap().len())
+                .sum::<usize>()
+        };
+        // Alice's five tips and Bob's one, a tip a unit, as a new process
+        // takes each: six units, each recording one.
+        for unit in 1..=6 {
+            drop(std::mem::replace(
+                &mut f.state,
+                State::open(&f.path).unwrap(),
+            ));
+            let complete = scan(&f.alice.repo, &mut f.state, version, SCAN_REMOTES, 1).unwrap();
+            assert_eq!(complete, unit == 6, "unit {unit}");
+            assert_eq!(rows(&f.state), unit, "unit {unit}");
+            let at = f.state.scan(&rid, version).unwrap().unwrap();
+            if let Some((_, name)) = &at.within {
+                assert!(name.as_str().starts_with("refs/cobs/"), "{name}");
+            }
+        }
+        let at = f.state.scan(&rid, version).unwrap().unwrap();
+        assert_eq!((at.after, at.within, at.complete), (Some(last), None, true));
+        assert_eq!(f.state.tips(&rid, Kind::Issue, &ids[0]).unwrap().len(), 2);
+        // The worklist is whole: the rebuild is the one heartwood writes, with
+        // Bob's comment.
+        assert_eq!(f.rebuild(Checkpoint::default(), BATCH_COBS), 1);
+        f.state.publish(&rid, Publication::Start).unwrap();
+        assert_eq!(f.live(), written_all(f.repo()));
+    }
+
+    #[test]
+    // Review of heartwood #18, rounds 2 and 3: a remote whose signed refs
+    // take more than `MAX_SIGNED_REFS` bytes fails the scan before they are
+    // read, and so does one whose signed refs commit, or its tree, is too
+    // large, or whose signature blob isn't a signature's size.
+    fn signed_refs_past_their_limit_fail_the_scan() {
+        let mut f = fixture();
+        let rid = f.repo().id;
+        let eve = crate::crypto::SigningKey::mock(83);
+        let author = git::raw::Signature::now("eve", "eve@example.com").unwrap();
+        // A commit of `message`, whose tree holds `entries` names for a refs
+        // blob of `refs` bytes, and a signature blob of `signature` bytes.
+        let commit = |message: &str, entries: usize, refs: usize, signature: usize| {
+            let backend = &f.repo().backend;
+            let blob = backend.blob(&vec![b'a'; refs]).unwrap();
+            let mut tree = backend.treebuilder(None).unwrap();
+            tree.insert(
+                crate::storage::refs::REFS_BLOB_PATH,
+                blob,
+                git::raw::FileMode::Blob.into(),
+            )
+            .unwrap();
+            tree.insert(
+                crate::storage::refs::SIGNATURE_BLOB_PATH,
+                backend.blob(&vec![b's'; signature]).unwrap(),
+                git::raw::FileMode::Blob.into(),
+            )
+            .unwrap();
+            for i in 0..entries {
+                tree.insert(
+                    format!("entry-{i:05}"),
+                    blob,
+                    git::raw::FileMode::Blob.into(),
+                )
+                .unwrap();
+            }
+            let tree = backend.find_tree(tree.write().unwrap()).unwrap();
+            backend
+                .commit(None, &author, &author, message, &tree, &[])
+                .unwrap()
+        };
+        let over = MAX_SIGNED_REFS_OBJECT as usize + 1;
+        let large = "more than";
+        let signature = "where a signature takes 64";
+        for (head, what, said) in [
+            (
+                commit("Signed refs", 0, MAX_SIGNED_REFS as usize + 1, 64),
+                "refs blob",
+                large,
+            ),
+            (commit("Signed refs", over / 30, 1, 64), "tree", large),
+            (commit(&"a".repeat(over), 0, 1, 64), "commit", large),
+            (
+                commit("Signed refs", 0, 1, 32 * 1024 * 1024),
+                "signature blob",
+                signature,
+            ),
+            (commit("Signed refs", 0, 1, 63), "signature blob", signature),
+        ] {
+            f.repo()
+                .backend
+                .reference(
+                    &format!("refs/namespaces/{}/refs/rad/sigrefs", eve.public_key()),
+                    head,
+                    true,
+                    "test",
+                )
+                .unwrap();
+            let version = f.version();
+            f.state.begin(&rid, version).unwrap();
+            let err = scan(
+                &f.alice.repo,
+                &mut f.state,
+                version,
+                SCAN_REMOTES,
+                SCAN_TIPS,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::Sigrefs { remote, reason }
+                        if remote == eve.public_key()
+                            && reason.contains(what)
+                            && reason.contains(said)
+                ),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    // Review of heartwood #18, round 3, and Security R-21: a remote whose
+    // signed refs head has the old format, whose history every reader walks,
+    // fails the scan once that history takes more than the reader's budget,
+    // rather than being walked whole. Within the budget it scans.
+    fn an_old_format_history_past_the_budget_fails_the_scan() {
+        use crate::crypto::signature::Signer as _;
+
+        let mut f = fixture();
+        let rid = f.repo().id;
+        let eve = crate::crypto::SigningKey::mock(84);
+        let author = git::raw::Signature::now("eve", "eve@example.com").unwrap();
+        // 65 commits, oldest first, each signing a refs blob of the old
+        // format: neither `refs/rad/root` nor a parent entry.
+        let head = {
+            let backend = &f.repo().backend;
+            let mut parent: Option<git::raw::Oid> = None;
+            for i in 0..65u8 {
+                let refs = format!("{} refs/heads/main\n", git::Oid::from_sha1([i + 1; 20]));
+                let signature: crate::crypto::Signature = eve.sign(refs.as_bytes());
+                let mut tree = backend.treebuilder(None).unwrap();
+                tree.insert(
+                    crate::storage::refs::REFS_BLOB_PATH,
+                    backend.blob(refs.as_bytes()).unwrap(),
+                    git::raw::FileMode::Blob.into(),
+                )
+                .unwrap();
+                tree.insert(
+                    crate::storage::refs::SIGNATURE_BLOB_PATH,
+                    backend.blob(&signature.to_vec()).unwrap(),
+                    git::raw::FileMode::Blob.into(),
+                )
+                .unwrap();
+                let tree = backend.find_tree(tree.write().unwrap()).unwrap();
+                let parents = parent.map(|p| backend.find_commit(p).unwrap());
+                parent = Some(
+                    backend
+                        .commit(
+                            None,
+                            &author,
+                            &author,
+                            "sigrefs",
+                            &tree,
+                            &parents.iter().collect::<Vec<_>>(),
+                        )
+                        .unwrap(),
+                );
+            }
+            parent.unwrap()
+        };
+        f.repo()
+            .backend
+            .reference(
+                &format!("refs/namespaces/{}/refs/rad/sigrefs", eve.public_key()),
+                head,
+                true,
+                "test",
+            )
+            .unwrap();
+        let version = f.version();
+        let scan_in = |f: &mut Fixture, commits: usize| {
+            f.state.begin(&rid, version).unwrap();
+            f.state.clear_repository(&rid).unwrap();
+            f.state.begin(&rid, version).unwrap();
+            scan_within(
+                &f.alice.repo,
+                &mut f.state,
+                version,
+                SCAN_REMOTES,
+                SCAN_TIPS,
+                Budget {
+                    commits,
+                    ..Budget::DEFAULT
+                },
+            )
+        };
+        // The head alone, then the walk over all 65, the head among them.
+        let err = scan_in(&mut f, 65).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Sigrefs { remote, reason }
+                    if remote == eve.public_key() && reason.contains("65 commits")
+            ),
+            "{err}"
+        );
+        assert!(scan_in(&mut f, 66).unwrap());
+        // The default budget scans it too.
+        f.state.clear_repository(&rid).unwrap();
+        f.state.begin(&rid, version).unwrap();
+        assert!(
+            scan(
+                &f.alice.repo,
+                &mut f.state,
+                version,
+                SCAN_REMOTES,
+                SCAN_TIPS
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1049,7 +1446,14 @@ mod tests {
             .unwrap();
         let version = f.version();
         f.state.begin(&rid, version).unwrap();
-        let err = scan(&f.alice.repo, &mut f.state, version, SCAN_REMOTES).unwrap_err();
+        let err = scan(
+            &f.alice.repo,
+            &mut f.state,
+            version,
+            SCAN_REMOTES,
+            SCAN_TIPS,
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, Error::Sigrefs { remote, .. } if remote == eve.public_key()),
             "{err}"

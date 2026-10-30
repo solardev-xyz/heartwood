@@ -1080,6 +1080,24 @@ impl sigrefs::git::object::Reader for Repository {
     ) -> Result<Option<sigrefs::git::object::Blob>, sigrefs::git::object::error::ReadBlob> {
         self.backend.read_blob(commit, path)
     }
+
+    fn read_commit_within(
+        &self,
+        oid: &Oid,
+        limit: u64,
+    ) -> Result<Option<Vec<u8>>, sigrefs::git::object::error::ReadCommit> {
+        self.backend.read_commit_within(oid, limit)
+    }
+
+    fn read_blob_within(
+        &self,
+        commit: &Oid,
+        path: &Path,
+        limit: u64,
+    ) -> Result<Option<(sigrefs::git::object::Blob, u64)>, sigrefs::git::object::error::ReadBlob>
+    {
+        self.backend.read_blob_within(commit, path, limit)
+    }
 }
 
 impl sigrefs::git::object::Writer for Repository {

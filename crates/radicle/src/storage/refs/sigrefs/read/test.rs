@@ -1,5 +1,6 @@
 mod mock;
 
+mod budget;
 mod commit_reader;
 mod identity_root_reader;
 mod resolve_tip;

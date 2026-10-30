@@ -41,6 +41,16 @@ pub trait Gate: Send + Sync + fmt::Debug {
     fn proxy_resolves_names(&self) -> bool {
         false
     }
+
+    /// Whether a node that dials through a SOCKS5 proxy isolates each remote
+    /// node's connections from every other's: it gives the proxy credentials
+    /// of each remote node's own (RFC 1929), and only those, so that a proxy
+    /// that won't take them fails the dial rather than sharing its circuits.
+    /// `false` unless a gate says otherwise: the node asks with no
+    /// authentication, as it always has.
+    fn isolates_streams(&self) -> bool {
+        false
+    }
 }
 
 /// How long a dial waits for its name to resolve, unless a gate says otherwise.

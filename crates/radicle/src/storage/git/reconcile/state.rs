@@ -448,9 +448,9 @@ impl State {
     /// The scan of `rid`'s remotes for its cache rebuild, if one was recorded
     /// at its `version`: otherwise the scan starts over.
     pub fn scan(&self, rid: &RepoId, version: Oid) -> Result<Option<cache::Scan>, Error> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT version, after, complete FROM rebuild_scan WHERE rid = ?1")?;
+        let mut stmt = self.db.prepare(
+            "SELECT version, after, remote, ref, complete FROM rebuild_scan WHERE rid = ?1",
+        )?;
         stmt.bind((1, rid))?;
         let Some(row) = stmt.into_iter().next() else {
             return Ok(None);
@@ -467,22 +467,38 @@ impl State {
                     .map_err(|e| Error::Invalid(e.to_string()))
             })
             .transpose()?;
+        let within = match (
+            row.try_read::<Option<&str>, _>("remote")?,
+            row.try_read::<Option<&str>, _>("ref")?,
+        ) {
+            (Some(remote), Some(name)) => Some((
+                remote
+                    .parse::<NodeId>()
+                    .map_err(|e| Error::Invalid(e.to_string()))?,
+                crate::git::fmt::RefString::try_from(name)
+                    .map_err(|e| Error::Invalid(e.to_string()))?,
+            )),
+            _ => None,
+        };
         let complete = row.try_read::<i64, _>("complete")? != 0;
-        Ok(Some(cache::Scan { after, complete }))
+        Ok(Some(cache::Scan {
+            after,
+            within,
+            complete,
+        }))
     }
 
-    /// Adds the COB tips of `remote`, scanned whole, to `rid`'s worklist at
-    /// its `version`, and moves its scan past `remote`, in one durable
-    /// transaction: a remote is in the worklist whole, or not at all. A
-    /// `complete` scan has no remote left; one with no remote at all is
-    /// recorded with none.
+    /// Adds `tips`, of `remote`, to `rid`'s worklist at its `version`, and
+    /// records `next` as its scan's checkpoint, in one durable transaction: a
+    /// page of a remote's tips is in the worklist with the checkpoint after
+    /// it, or not at all. A scan with no remote at all is recorded with none.
     pub fn scanned(
         &mut self,
         rid: &RepoId,
         version: Oid,
         remote: Option<&NodeId>,
         tips: &[cache::Tip],
-        complete: bool,
+        next: &cache::Scan,
     ) -> Result<(), Error> {
         transaction(&self.db, |db| {
             if let Some(remote) = remote {
@@ -502,15 +518,25 @@ impl State {
                 }
             }
             let mut stmt = db.prepare(
-                "INSERT INTO rebuild_scan (rid, version, after, complete) VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO rebuild_scan (rid, version, after, remote, ref, complete)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (rid) DO UPDATE SET
                    version = excluded.version, after = excluded.after,
+                   remote = excluded.remote, ref = excluded.ref,
                    complete = excluded.complete",
             )?;
             stmt.bind((1, rid))?;
             stmt.bind((2, version.to_string().as_str()))?;
-            stmt.bind((3, remote.map(|remote| remote.to_string()).as_deref()))?;
-            stmt.bind((4, i64::from(complete)))?;
+            stmt.bind((3, next.after.map(|after| after.to_string()).as_deref()))?;
+            stmt.bind((
+                4,
+                next.within
+                    .as_ref()
+                    .map(|(remote, _)| remote.to_string())
+                    .as_deref(),
+            ))?;
+            stmt.bind((5, next.within.as_ref().map(|(_, name)| name.as_str())))?;
+            stmt.bind((6, i64::from(next.complete)))?;
             stmt.next()?;
             Ok(())
         })
