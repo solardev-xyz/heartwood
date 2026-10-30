@@ -21,9 +21,9 @@
 //!   repository's cache.
 //! - **The escape.** A unit the last process ended during
 //!   ([`State::interrupted`]) runs again in its smallest form: one ref at a
-//!   time for the refs that namespace unit held, one remote at a time for
-//!   the remotes that scan unit held, and one COB a batch for the COBs that
-//!   batch held. A unit in progress when two processes ended
+//!   time for the refs that namespace unit held, one remote and one COB tip
+//!   at a time for what that scan unit held, and one COB a batch for the
+//!   COBs that batch held. A unit in progress when two processes ended
 //!   quarantines its repository instead of running a third time. A unit that
 //!   fails with an error quarantines it at once.
 //! - **Failures outside any one repository,** of the storage directory, the
@@ -80,7 +80,9 @@ pub mod kind {
     /// namespace.
     pub const RESIGN: &str = "resign";
     /// Scanning the next remotes' verified signed refs into the cache
-    /// rebuild's worklist. Its position is the last remote scanned before it.
+    /// rebuild's worklist, a page of their COB tips. Its position is where
+    /// the scan stood before it, `<after>[:<remote>:<ref>]`: the last remote
+    /// scanned whole, then the remote in progress and its last ref recorded.
     pub const CACHE_SCAN: &str = "cache-scan";
     /// Listing a cache batch's COBs from the worklist. Its position is the
     /// checkpoint it lists from, `<kind>:<id>`.
@@ -346,7 +348,7 @@ struct Batch {
 enum Small {
     /// The check of this namespace, one ref a unit.
     Namespace { namespace: NodeId, left: usize },
-    /// The cache rebuild's scan, one remote a unit.
+    /// The cache rebuild's scan, one remote and one tip a unit.
     Scan { left: usize },
     /// The cache rebuild, one COB a batch.
     Cache { left: usize },
@@ -722,21 +724,21 @@ impl Repair {
             if at.complete {
                 self.rebuild = Rebuild::List;
             } else {
-                let limit = match &mut begun.small {
+                let (remotes, tips) = match &mut begun.small {
                     Some(Small::Scan { left }) if *left > 0 => {
                         *left -= 1;
-                        1
+                        (1, 1)
                     }
-                    _ => cache::SCAN_REMOTES,
+                    _ => (cache::SCAN_REMOTES, cache::SCAN_TIPS),
                 };
                 let unit = Unit {
                     rid,
                     kind: kind::CACHE_SCAN.to_owned(),
-                    position: at.after.map(|after| after.to_string()).unwrap_or_default(),
+                    position: scan_position(&at),
                 };
                 let repo = &begun.repo;
                 let ran = cx.unit(&unit, |state| {
-                    cached(cache::scan(repo, state, version, limit))
+                    cached(cache::scan(repo, state, version, remotes, tips))
                 })?;
                 return match ran {
                     Ran::Done(Cached::Done(complete)) => {
@@ -953,6 +955,17 @@ fn list(
     }
 }
 
+/// Where a scan stands, as its unit's position: the last remote scanned
+/// whole, then the remote in progress and its last ref recorded, if any,
+/// `<after>[:<remote>:<ref>]`.
+fn scan_position(at: &cache::Scan) -> String {
+    let after = at.after.map(|after| after.to_string()).unwrap_or_default();
+    match &at.within {
+        Some((remote, name)) => format!("{after}:{remote}:{name}"),
+        None => after,
+    }
+}
+
 fn cache_position(kind: cache::Kind, after: Option<&ObjectId>) -> String {
     format!(
         "{kind}:{}",
@@ -973,7 +986,7 @@ fn small(unit: &Unit) -> Option<Small> {
             })
         }
         kind::CACHE_SCAN => Some(Small::Scan {
-            left: cache::SCAN_REMOTES,
+            left: cache::SCAN_TIPS,
         }),
         kind::CACHE_LIST | kind::CACHE | kind::CACHE_COMMIT => Some(Small::Cache {
             left: cache::BATCH_COBS,
@@ -1711,8 +1724,9 @@ mod tests {
     }
 
     #[test]
-    // The cache rebuild's scan, cut off, runs again one remote a unit.
-    fn a_scan_cut_off_runs_again_one_remote_a_unit() {
+    // The cache rebuild's scan, cut off, runs again one remote and one COB tip
+    // a unit.
+    fn a_scan_cut_off_runs_again_one_tip_a_unit() {
         let f = fixture();
         let rid = f.rid();
         // Bob comments on the first issue: a second remote, with signed refs.
@@ -1741,10 +1755,19 @@ mod tests {
         let log = Log::default();
         let report = f.run_as_alice(&log);
         assert!(report.newly_quarantined.is_empty());
-        assert_eq!(
-            log.positions(kind::CACHE_SCAN),
-            [String::new(), remotes[0].to_string()]
-        );
+        // Alice's five tips and Bob's one, a unit each, each from where the
+        // one before stopped: a remote scanned whole, or one part-way through
+        // and the last ref recorded.
+        let positions = log.positions(kind::CACHE_SCAN);
+        assert_eq!(positions.len(), 6, "{positions:?}");
+        assert_eq!(positions[0], "");
+        for position in &positions[1..] {
+            assert!(
+                remotes.iter().any(|remote| position == &remote.to_string())
+                    || position.contains(":refs/cobs/"),
+                "{position}"
+            );
+        }
         // Bob's comment is in the rebuilt issue, as heartwood writes it.
         assert_eq!(f.live(rid), written_all(&f.repo()));
     }
