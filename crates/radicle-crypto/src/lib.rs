@@ -626,8 +626,19 @@ impl Ord for SigningKey {
 impl TryFrom<[u8; dalek::ed::KEYPAIR_LENGTH]> for SigningKey {
     type Error = signature::Error;
 
+    /// The keypair's bytes are wiped once the key is made.
     fn try_from(bytes: [u8; dalek::ed::KEYPAIR_LENGTH]) -> Result<Self, Self::Error> {
-        dalek::ed::SigningKey::from_keypair_bytes(&bytes).map(Self)
+        let bytes = zeroize::Zeroizing::new(bytes);
+        Self::from_keypair_bytes(&bytes)
+    }
+}
+
+impl SigningKey {
+    /// The key whose 64-byte keypair is `bytes`, without a copy of them.
+    pub fn from_keypair_bytes(
+        bytes: &[u8; dalek::ed::KEYPAIR_LENGTH],
+    ) -> Result<Self, signature::Error> {
+        dalek::ed::SigningKey::from_keypair_bytes(bytes).map(Self)
     }
 }
 
@@ -665,8 +676,9 @@ impl cyphernet::EcSk for SigningKey {
     where
         Self: Sized,
     {
-        let mut random = [0; 32];
-        getrandom::fill(&mut random).expect("failed get random bytes from the operating system");
+        // The random secret is wiped once the key is made from it.
+        let mut random = zeroize::Zeroizing::new([0; 32]);
+        getrandom::fill(&mut *random).expect("failed get random bytes from the operating system");
         let signing_key = dalek::ed::SigningKey::from_bytes(&random);
         let verifying_key = signature::Keypair::verifying_key(&signing_key);
         (SigningKey(signing_key), VerifyingKey(verifying_key))
@@ -805,6 +817,20 @@ mod tests {
         let output_b = sk_a.diffie_hellman(&sk_b.verifying_key()).unwrap();
 
         assert_eq!(output_a, output_b);
+    }
+
+    // Security R-17: a key made from its keypair's bytes, by reference or by
+    // value, is the key they came from; a keypair whose halves don't match is
+    // refused.
+    #[test]
+    fn a_key_is_made_from_its_keypair_bytes() {
+        let key = SigningKey::mock(17);
+        let bytes = key.to_keypair_bytes();
+        assert_eq!(SigningKey::from_keypair_bytes(&bytes).unwrap(), key);
+        assert_eq!(SigningKey::try_from(bytes).unwrap(), key);
+        let mut mismatched = bytes;
+        mismatched[63] ^= 1;
+        assert!(SigningKey::from_keypair_bytes(&mismatched).is_err());
     }
 
     #[cfg(feature = "alloc")]
