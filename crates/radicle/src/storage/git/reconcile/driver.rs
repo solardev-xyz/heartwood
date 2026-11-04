@@ -102,6 +102,24 @@ pub mod kind {
 /// The step a quarantine names when a repository doesn't open.
 const BEGIN_STEP: &str = "begin";
 
+/// What the host's environment must give every repository before a repair
+/// opens one: libgit2's configuration outside any repository (its system,
+/// XDG and global files), which every open reads. One that doesn't load, a
+/// system file the process may not read for one, would fail every
+/// repository alike: it is the host's failure, an [`Error`], and no
+/// repository is quarantined for it.
+fn host_preconditions() -> Result<(), Error> {
+    #[cfg(test)]
+    if tests::HOST_FAILS.get() {
+        return Err(Error::Host(crate::git::raw::Error::from_str(
+            "the host's configuration doesn't load (test)",
+        )));
+    }
+    crate::git::raw::Config::open_default()
+        .map(drop)
+        .map_err(Error::Host)
+}
+
 /// When a run stops between units: once its token is set, or its cutoff
 /// passed. No unit starts after either, but a cut off batch's commit, and a
 /// COB being materialized stops between its changes.
@@ -192,6 +210,12 @@ pub enum Error {
     Poison { kind: String, position: String },
     #[error("a repair's step ran before it began")]
     NotBegun,
+    /// The host's environment fails every repository alike: libgit2's
+    /// configuration outside any repository doesn't load, or a repository
+    /// isn't the process's to open (libgit2's ownership check). No repository
+    /// is quarantined for it.
+    #[error("the host's environment: {0}")]
+    Host(crate::git::raw::Error),
 }
 
 /// What a step of a repair did.
@@ -470,6 +494,7 @@ impl Repair {
     /// version, as a unit.
     fn begin<S>(&mut self, cx: &mut Context<'_, S>) -> Result<Progress, Error> {
         super::enable_fsync()?;
+        host_preconditions()?;
         let rid = self.rid;
         // The units of this repository processes ended during, as this one
         // opened the state.
@@ -489,6 +514,12 @@ impl Repair {
         let ran = cx.unit(&unit, |state| {
             let repo = match storage.repository(rid) {
                 Ok(repo) => repo,
+                // Not the process's to open: the host's, not the repository's.
+                Err(crate::storage::RepositoryError::Git(e))
+                    if e.code() == crate::git::raw::ErrorCode::Owner =>
+                {
+                    return Err(Error::Host(e));
+                }
                 Err(e) => return Ok(Err(e.to_string())),
             };
             let version = match state::version(&repo) {
@@ -1120,6 +1151,11 @@ mod tests {
 
     use super::*;
     use crate::cob::migrate;
+
+    thread_local! {
+        /// Whether [`host_preconditions`] fails, on this test's thread.
+        pub(super) static HOST_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
     use crate::cob::patch::MergeTarget;
     use crate::crypto::{Signer as _, SigningKey};
     use crate::git;
@@ -1463,6 +1499,38 @@ mod tests {
         stmt.bind((1, &rid)).unwrap();
         assert_eq!(stmt.next().unwrap(), sqlite::State::Row);
         stmt.read::<i64, _>("n").unwrap()
+    }
+
+    #[test]
+    // A failure of the host's environment, libgit2's configuration outside
+    // any repository, fails every repository alike: the run is an error, as
+    // a failure outside any one repository is, and quarantines nothing. Its
+    // progress stays for the next run, which repairs once the host is fixed.
+    fn a_host_failure_quarantines_nothing_and_the_next_run_repairs() {
+        let f = fixture();
+        let nid = f.nid();
+        f.unsigned(&nid);
+        let signed = f.sigrefs(&nid);
+
+        HOST_FAILS.set(true);
+        let failed = f.try_run(
+            Some(&[nid]),
+            &f.alice.signer,
+            &Stop::default(),
+            &Log::default(),
+        );
+        HOST_FAILS.set(false);
+        assert!(matches!(failed, Err(Error::Host(_))), "{failed:?}");
+        let quarantine = Quarantine::open(&f.record).unwrap();
+        assert_eq!(quarantine.count().unwrap(), 0);
+        // Nothing was signed, and no unit was left in progress.
+        assert_eq!(f.sigrefs(&nid), signed);
+        assert_eq!(State::open(&f.db).unwrap().in_progress().unwrap(), None);
+
+        let report = f.run_as_alice(&Log::default());
+        assert_eq!(report.ending, Ending::Done);
+        assert_eq!(report.resigned, vec![f.rid()]);
+        assert_eq!(report.quarantined, 0);
     }
 
     #[test]
