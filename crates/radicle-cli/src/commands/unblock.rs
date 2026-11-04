@@ -8,11 +8,12 @@ pub use args::Args;
 
 pub fn run(args: Args, ctx: impl term::Context) -> anyhow::Result<()> {
     let profile = ctx.profile()?;
-    let mut policies = profile.policies_mut()?;
 
     let updated = match args.target {
-        BlockTarget::Node(nid) => policies.unblock_nid(&nid)?,
-        BlockTarget::Repo(rid) => policies.unblock_rid(&rid)?,
+        BlockTarget::Node(nid) => profile.policies_mut()?.unblock_nid(&nid)?,
+        // A repository's block goes only while no node runs: without it, a
+        // permissive default seeds the repository, past the node's gate.
+        BlockTarget::Repo(rid) => profile.unblock_repo(&rid)?,
     };
 
     if updated {

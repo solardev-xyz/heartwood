@@ -2549,6 +2549,64 @@ fn gate_refuses_a_seed_until_the_repository_opens() {
 }
 
 #[test]
+// Review of heartwood #26, round 2: a quarantined repository's unseed leaves it
+// seeding under a permissive default seeding policy. The removal's first step
+// (`Config::stop_seeding`, in `remove_repo`) stops it whatever the default,
+// and it stays unseeded once its gate opens. Under a blocking default, a seed
+// of the user's own seeds it anew; under a permissive one, the removal's
+// block stands, and only an unblock, with the node stopped, lifts it.
+fn gate_a_removed_repository_stays_unseeded_once_it_opens() {
+    use node::gate::{Quarantine, RepoState};
+
+    for default in [
+        policy::SeedingPolicy::Block,
+        policy::SeedingPolicy::Allow {
+            scope: policy::Scope::All,
+        },
+    ] {
+        let mut amy = Peer::amy_with(|config| config.policy = default);
+        let rid: RepoId = arbitrary::r#gen(1);
+        let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+        amy.command(cmd);
+        assert!(seeded.recv().unwrap().unwrap());
+
+        let gate = amy.repositories().clone();
+        let state = RepoState::Quarantined(Quarantine::Namespace);
+        gate.close(rid, state, time::Duration::ZERO).unwrap();
+        amy.command(Command::Gate(rid, state));
+        let (cmd, unseeded) = Command::unseed(rid);
+        amy.command(cmd);
+        assert!(unseeded.recv().unwrap().unwrap());
+        // The unseed alone leaves it seeding under a permissive default.
+        assert_eq!(
+            amy.policies().is_seeding(&rid).unwrap(),
+            default.is_allow(),
+            "{default:?}"
+        );
+
+        // The removal's first step, in the node's policy database.
+        policy::config::Config::new(
+            default,
+            policy::store::Store::open(amy.policies_path()).unwrap(),
+        )
+        .stop_seeding(&rid)
+        .unwrap();
+        gate.open(rid);
+        amy.command(Command::Gate(rid, RepoState::Open));
+        assert!(!amy.policies().is_seeding(&rid).unwrap(), "{default:?}");
+
+        let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+        amy.command(cmd);
+        assert!(seeded.recv().unwrap().is_ok());
+        assert_eq!(
+            amy.policies().is_seeding(&rid).unwrap(),
+            !default.is_allow(),
+            "{default:?}"
+        );
+    }
+}
+
+#[test]
 // Review of heartwood #26, round 1: a seed holds its pass across its policy
 // write. A close while one is written is busy, admits no new seed, and returns
 // once the seed is done: a close that has returned has every seed admitted

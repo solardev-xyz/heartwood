@@ -312,7 +312,11 @@ pub enum RemoveError {
 /// `rid`, or one with another `qid`, nothing is touched. Otherwise, in order,
 /// each step durable before the next:
 ///
-/// 1. it unseeds the repository, in `policies`;
+/// 1. it stops seeding the repository, in `policies`, whatever their default
+///    ([`policy::config::Config::stop_seeding`]): under a blocking default
+///    its policy goes, and a seed or clone after the removal seeds it anew;
+///    under a permissive one it is blocked, so that the default doesn't seed
+///    it again once its record is cleared;
 /// 2. it deletes `storage/<rid>`, following no links (a link of that name is
 ///    removed itself, a junction included), and flushes the storage
 ///    directory, so that the deletion is on disk;
@@ -324,7 +328,7 @@ pub enum RemoveError {
 /// same `qid`. Run it with the repository shut to the node.
 pub fn remove_repo(
     quarantine: &mut Quarantine,
-    policies: &mut policy::store::StoreWriter,
+    policies: &mut policy::config::Config<policy::store::Write>,
     storage: &Path,
     cache: &mut cob::cache::StoreWriter,
     rid: RepoId,
@@ -333,7 +337,7 @@ pub fn remove_repo(
     if quarantine.get(&rid)?.is_none_or(|record| record.qid != qid) {
         return Ok(Removal::NotQuarantined);
     }
-    policies.unseed(&rid)?;
+    policies.stop_seeding(&rid)?;
 
     let root = Dir::open_root(storage)?;
     let name = rid.canonical();
@@ -474,7 +478,7 @@ mod tests {
         _tmp: tempfile::TempDir,
         storage: std::path::PathBuf,
         quarantine: Quarantine,
-        policies: policy::store::StoreWriter,
+        policies: policy::config::Config<policy::store::Write>,
         cache: cob::cache::StoreWriter,
         rid: RepoId,
         record: Record,
@@ -484,10 +488,16 @@ mod tests {
     /// issue and a patch in the COB cache. And another repository, its
     /// neighbour, the same but not quarantined.
     fn removing() -> (Removing, RepoId) {
+        removing_under(policy::SeedingPolicy::Block)
+    }
+
+    /// As [`removing`], with `default` as the default seeding policy.
+    fn removing_under(default: policy::SeedingPolicy) -> (Removing, RepoId) {
         let tmp = tempfile::tempdir().unwrap();
         let storage = tmp.path().join("storage");
         let (rid, neighbour) = (rid(), rid());
-        let mut policies = policy::store::StoreWriter::memory().unwrap();
+        let mut policies =
+            policy::config::Config::new(default, policy::store::StoreWriter::memory().unwrap());
         let cache = cob::cache::StoreWriter::memory()
             .unwrap()
             .with_migrations(migrate::ignore)
@@ -596,6 +606,38 @@ mod tests {
     }
 
     #[test]
+    // Review of heartwood #26, round 2: a removal stops seeding the
+    // repository whatever the default. Under a blocking default its policy
+    // goes, and a seed after the removal seeds it anew. Under a permissive
+    // one it is blocked, so that the default doesn't seed it again once its
+    // record is cleared, and only an unblock lets it.
+    fn a_removal_stops_seeding_whatever_the_default() {
+        let (mut f, neighbour) = removing();
+        assert_eq!(f.remove(f.record.qid), Removal::Removed);
+        // No policy of its own: the store has none.
+        assert_eq!((*f.policies).seed_policy(&f.rid).unwrap(), None);
+        assert!(!f.policies.is_seeding(&f.rid).unwrap());
+        f.policies.seed(&f.rid, Scope::All).unwrap();
+        assert!(f.policies.is_seeding(&f.rid).unwrap());
+        assert!(f.intact(&neighbour));
+
+        let permissive = policy::SeedingPolicy::Allow { scope: Scope::All };
+        let (mut f, neighbour) = removing_under(permissive);
+        assert_eq!(f.remove(f.record.qid), Removal::Removed);
+        assert!(f.gone(&f.rid));
+        assert_eq!(
+            (*f.policies).seed_policy(&f.rid).unwrap().map(|p| p.policy),
+            Some(policy::SeedingPolicy::Block)
+        );
+        // A seed leaves the block: only an unblock lets the default apply.
+        f.policies.seed(&f.rid, Scope::All).unwrap();
+        assert!(!f.policies.is_seeding(&f.rid).unwrap());
+        f.policies.unblock_rid(&f.rid).unwrap();
+        assert!(f.policies.is_seeding(&f.rid).unwrap());
+        assert!(f.intact(&neighbour));
+    }
+
+    #[test]
     fn a_removal_never_acts_on_a_repository_quarantined_again() {
         let (mut f, _) = removing();
         let old = f.record.qid;
@@ -622,7 +664,7 @@ mod tests {
         for done in 1..=3 {
             let (mut f, neighbour) = removing();
             if done >= 1 {
-                f.policies.unseed(&f.rid).unwrap();
+                f.policies.stop_seeding(&f.rid).unwrap();
             }
             if done >= 2 {
                 std::fs::remove_dir_all(f.storage.join(f.rid.canonical())).unwrap();

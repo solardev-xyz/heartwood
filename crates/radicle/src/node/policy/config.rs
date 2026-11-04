@@ -141,6 +141,20 @@ impl<T> Config<T> {
     }
 }
 
+impl Config<store::Write> {
+    /// Stops seeding `rid`, whatever the default policy. Under a blocking default its policy goes,
+    /// as [`Store::unseed`] does, so that a later seed seeds it again. Under a permissive default,
+    /// which would seed it with no policy of its own, it is blocked instead, so that only an
+    /// unblock lets the default seed it again. Whether its policy changed.
+    pub fn stop_seeding(&mut self, rid: &RepoId) -> Result<bool, Error> {
+        if self.policy.is_allow() {
+            self.store.set_seed_policy(rid, Policy::Block)
+        } else {
+            self.store.unseed(rid)
+        }
+    }
+}
+
 impl<T> ops::Deref for Config<T> {
     type Target = Store<T>;
 
