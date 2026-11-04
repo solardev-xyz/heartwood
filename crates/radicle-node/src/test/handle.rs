@@ -84,6 +84,11 @@ impl radicle::node::Handle for Handle {
         Ok(self.seeding.lock().unwrap().remove(&id))
     }
 
+    fn unblock_repo(&mut self, _id: RepoId) -> Result<bool, Self::Error> {
+        // No repository is blocked here.
+        Ok(false)
+    }
+
     fn follow(&mut self, id: NodeId, _alias: Option<Alias>) -> Result<bool, Self::Error> {
         self.blocked.lock().unwrap().remove(&id);
         Ok(self.following.lock().unwrap().insert(id))

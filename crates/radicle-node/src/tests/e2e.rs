@@ -3242,6 +3242,106 @@ fn test_gate_a_namespace_quarantine_isnt_served() {
 }
 
 #[test]
+// Review of heartwood #26, round 3: under a permissive default, a removal
+// blocks the repository (`Config::stop_seeding`), and the clone path, a seed
+// and then a fetch, can't take it again while the block stands: a seed
+// doesn't lift a block. An unblock through the control socket, as `rad
+// unblock` sends it, is refused while the repository is quarantined, and taken
+// once it opens; then the clone path takes the repository again.
+fn test_gate_a_live_unblock_lets_a_removed_repository_be_cloned_again() {
+    use radicle::node::config::DefaultSeedingPolicy;
+    use radicle::node::gate::{Quarantine, RepoGate, RepoState};
+    use radicle::node::policy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = Node::init(
+        tmp.path(),
+        Config {
+            seeding_policy: DefaultSeedingPolicy::permissive(),
+            ..config::relay("alice")
+        },
+        13,
+    );
+    let mut bob = Node::init(tmp.path(), config::relay("bob"), 37);
+    let acme = bob.project("acme-unblock", "");
+    let gate = RepoGate::new();
+    let mut alice = alice.spawn_with_repositories(gate.clone());
+    let bob = bob.spawn();
+    alice.connect(&bob);
+    converge([&alice, &bob]);
+    // What `rad` talks to: the node's control socket.
+    let mut control = radicle::node::Node::new(alice.home.socket_default());
+    let until = time::Instant::now() + time::Duration::from_secs(10);
+    while control.clone().config().is_err() {
+        assert!(time::Instant::now() < until, "the node never listened");
+        thread::sleep(time::Duration::from_millis(10));
+    }
+    let clone = |control: &mut radicle::node::Node| {
+        control.seed(acme, Scope::All).unwrap();
+        control.fetch(acme, bob.id, DEFAULT_TIMEOUT, None)
+    };
+    let blocked = |alice: &NodeHandle| {
+        alice
+            .home
+            .policies_mut()
+            .unwrap()
+            .seed_policy(&acme)
+            .unwrap()
+            .map(|p| p.policy)
+            == Some(policy::SeedingPolicy::Block)
+    };
+    let result = clone(&mut control).unwrap();
+    assert!(result.is_success(), "{result:?}");
+    assert!(alice.storage.repository(acme).is_ok());
+
+    // Quarantined, and removed: the removal's first two steps, its policy and
+    // then its tree.
+    let quarantined = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(acme, quarantined, time::Duration::from_secs(5))
+        .unwrap();
+    policy::config::Config::new(
+        policy::SeedingPolicy::Allow { scope: Scope::All },
+        alice.home.policies_mut().unwrap(),
+    )
+    .stop_seeding(&acme)
+    .unwrap();
+    std::fs::remove_dir_all(alice.home.storage().join(acme.canonical())).unwrap();
+    assert!(blocked(&alice));
+
+    // While it is quarantined, the block stays.
+    let refused = control.unblock_repo(acme);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains(&quarantined.to_string())),
+        "{refused:?}"
+    );
+    assert!(blocked(&alice));
+
+    // Open, the block stands, and the clone path doesn't take it.
+    gate.open(acme);
+    let result = clone(&mut control);
+    assert!(!result.as_ref().is_ok_and(|r| r.is_success()), "{result:?}");
+    assert!(blocked(&alice));
+    assert!(alice.storage.repository(acme).is_err());
+
+    // Unblocked through the node, it is seeded again, and cloned again.
+    assert!(control.unblock_repo(acme).unwrap());
+    assert!(!blocked(&alice));
+    let result = clone(&mut control).unwrap();
+    assert!(result.is_success(), "{result:?}");
+    assert!(alice.storage.repository(acme).is_ok());
+    assert!(
+        alice
+            .home
+            .policies_mut()
+            .unwrap()
+            .is_seeding(&acme)
+            .unwrap()
+    );
+}
+
+#[test]
 // heartwood#14: closing a repository waits for a fetch of it already under
 // way, which holds its gate pass until it is done.
 fn test_gate_closing_waits_for_a_fetch_under_way() {

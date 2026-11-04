@@ -111,6 +111,11 @@ pub enum Command {
     #[serde(rename_all = "camelCase")]
     Unseed { rid: RepoId },
 
+    /// Remove the given repository's `block` seeding policy, so that the
+    /// default seeding policy applies to it again.
+    #[serde(rename_all = "camelCase")]
+    UnblockRepo { rid: RepoId },
+
     /// Follow the given node.
     #[serde(rename_all = "camelCase")]
     Follow {
@@ -204,7 +209,11 @@ impl From<Event> for CommandResult<Event> {
 }
 
 /// A success response.
+///
+/// Its one field is optional, so it denies any other: in an untagged [`CommandResult`], an error
+/// response, `{"error": ..}`, would otherwise be read as a success that updated nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Success {
     /// Whether something was updated.
@@ -279,6 +288,22 @@ mod test {
             )))
             .unwrap(),
             "{\"error\":\"entity not found\"}"
+        );
+        // A command answered with `Success` that failed is read as failed,
+        // not as one that updated nothing (heartwood #26, round 3).
+        assert_eq!(
+            json::from_str::<CommandResult<Success>>("{\"error\":\"entity not found\"}").unwrap(),
+            CommandResult::Error {
+                reason: "entity not found".to_owned()
+            }
+        );
+        assert_eq!(
+            json::from_str::<CommandResult<Success>>("{}").unwrap(),
+            CommandResult::ok()
+        );
+        assert_eq!(
+            json::from_str::<CommandResult<Success>>("{\"updated\":true}").unwrap(),
+            CommandResult::updated(true)
         );
 
         json::from_str::<CommandResult<State>>(

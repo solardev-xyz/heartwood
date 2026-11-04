@@ -2515,6 +2515,251 @@ fn gated_peer_as(tmp: &std::path::Path, id: u8) -> Peer<Storage> {
 }
 
 #[test]
+// freedom-core design 0008 ("The escape"): a repository being repaired or
+// quarantined takes no seeding policy, whatever asks, so that none is written
+// while the host removes it. It takes one again once it opens.
+fn gate_refuses_a_seed_until_the_repository_opens() {
+    use node::gate::{Quarantine, RepoState};
+
+    let mut amy = Peer::amy();
+    let rid: RepoId = arbitrary::r#gen(1);
+    let gate = amy.repositories().clone();
+    for state in [
+        RepoState::Repairing,
+        RepoState::Quarantined(Quarantine::Cache),
+        RepoState::Quarantined(Quarantine::Namespace),
+    ] {
+        gate.close(rid, state, time::Duration::ZERO).unwrap();
+        amy.command(Command::Gate(rid, state));
+        for scope in [policy::Scope::All, policy::Scope::Followed] {
+            let (cmd, seeded) = Command::seed(rid, scope);
+            amy.command(cmd);
+            let refused = seeded.recv().unwrap();
+            assert!(refused.is_err(), "{state}: {refused:?}");
+            assert!(!amy.policies().is_seeding(&rid).unwrap(), "{state}");
+        }
+    }
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+    amy.command(cmd);
+    assert!(seeded.recv().unwrap().unwrap());
+    assert!(amy.policies().is_seeding(&rid).unwrap());
+}
+
+#[test]
+// Review of heartwood #26, round 2: a quarantined repository's unseed leaves it
+// seeding under a permissive default seeding policy. The removal's first step
+// (`Config::stop_seeding`, in `remove_repo`) stops it whatever the default,
+// and it stays unseeded once its gate opens. Under a blocking default, a seed
+// of the user's own seeds it anew; under a permissive one, the removal's
+// block stands, and a seed doesn't lift it. Round 3: an unblock through the
+// node does, and the repository is seeded again.
+fn gate_a_removed_repository_stays_unseeded_once_it_opens() {
+    use node::gate::{Quarantine, RepoState};
+
+    for default in [
+        policy::SeedingPolicy::Block,
+        policy::SeedingPolicy::Allow {
+            scope: policy::Scope::All,
+        },
+    ] {
+        let mut amy = Peer::amy_with(|config| config.policy = default);
+        let rid: RepoId = arbitrary::r#gen(1);
+        let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+        amy.command(cmd);
+        assert!(seeded.recv().unwrap().unwrap());
+
+        let gate = amy.repositories().clone();
+        let state = RepoState::Quarantined(Quarantine::Namespace);
+        gate.close(rid, state, time::Duration::ZERO).unwrap();
+        amy.command(Command::Gate(rid, state));
+        let (cmd, unseeded) = Command::unseed(rid);
+        amy.command(cmd);
+        assert!(unseeded.recv().unwrap().unwrap());
+        // The unseed alone leaves it seeding under a permissive default.
+        assert_eq!(
+            amy.policies().is_seeding(&rid).unwrap(),
+            default.is_allow(),
+            "{default:?}"
+        );
+
+        // The removal's first step, in the node's policy database.
+        policy::config::Config::new(
+            default,
+            policy::store::Store::open(amy.policies_path()).unwrap(),
+        )
+        .stop_seeding(&rid)
+        .unwrap();
+        gate.open(rid);
+        amy.command(Command::Gate(rid, RepoState::Open));
+        assert!(!amy.policies().is_seeding(&rid).unwrap(), "{default:?}");
+
+        let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+        amy.command(cmd);
+        assert!(seeded.recv().unwrap().is_ok());
+        assert_eq!(
+            amy.policies().is_seeding(&rid).unwrap(),
+            !default.is_allow(),
+            "{default:?}"
+        );
+
+        // The live unblock: through the node, with the repository open. Under
+        // a blocking default the seed has replaced the removal's lack of a
+        // policy, and there is no block to remove.
+        let (cmd, unblocked) = Command::unblock_repo(rid);
+        amy.command(cmd);
+        assert_eq!(
+            unblocked.recv().unwrap().unwrap(),
+            default.is_allow(),
+            "{default:?}"
+        );
+        let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+        amy.command(cmd);
+        assert!(seeded.recv().unwrap().is_ok());
+        assert!(amy.policies().is_seeding(&rid).unwrap(), "{default:?}");
+        assert_eq!(
+            amy.policies().seed_policy(&rid).unwrap().policy,
+            policy::SeedingPolicy::Allow {
+                scope: policy::Scope::All
+            },
+            "{default:?}"
+        );
+    }
+}
+
+#[test]
+// Review of heartwood #26, round 3: under a permissive default, removing a
+// repository's block seeds it, so an unblock through the node is gated as a
+// seed is. While the repository is being repaired or quarantined, its block,
+// which the removal may have just written, stays; once it opens, it goes.
+fn gate_refuses_an_unblock_until_the_repository_opens() {
+    use node::gate::{Quarantine, RepoState};
+
+    let default = policy::SeedingPolicy::Allow {
+        scope: policy::Scope::All,
+    };
+    let mut amy = Peer::amy_with(|config| config.policy = default);
+    let rid: RepoId = arbitrary::r#gen(1);
+    let mut policies = policy::config::Config::new(
+        default,
+        policy::store::Store::open(amy.policies_path()).unwrap(),
+    );
+    assert!(policies.stop_seeding(&rid).unwrap());
+    assert!(!amy.policies().is_seeding(&rid).unwrap());
+
+    let gate = amy.repositories().clone();
+    for state in [
+        RepoState::Repairing,
+        RepoState::Quarantined(Quarantine::Cache),
+        RepoState::Quarantined(Quarantine::Namespace),
+    ] {
+        gate.close(rid, state, time::Duration::ZERO).unwrap();
+        amy.command(Command::Gate(rid, state));
+        let (cmd, unblocked) = Command::unblock_repo(rid);
+        amy.command(cmd);
+        let refused = unblocked.recv().unwrap();
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains(&state.to_string())),
+            "{state}: {refused:?}"
+        );
+        assert!(!amy.policies().is_seeding(&rid).unwrap(), "{state}");
+    }
+
+    gate.open(rid);
+    amy.command(Command::Gate(rid, RepoState::Open));
+    let (cmd, unblocked) = Command::unblock_repo(rid);
+    amy.command(cmd);
+    assert!(unblocked.recv().unwrap().unwrap());
+    assert!(amy.policies().is_seeding(&rid).unwrap());
+}
+
+#[test]
+// Review of heartwood #26, round 3: an unblock holds its pass across its
+// policy write, as a seed does. A close while one is written is busy, admits
+// no new one, and returns once it is done.
+fn gate_closing_waits_for_an_unblock_under_way() {
+    use node::gate::{Busy, Purpose};
+    use protocol::service::seams::Point;
+
+    let default = policy::SeedingPolicy::Allow {
+        scope: policy::Scope::All,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let signer = SigningKey::mock(AMY as usize);
+    let storage = fixtures::storage(tmp.path().join("amy"), &signer).unwrap();
+    let mut amy = Peer::new_with("amy", AMY, storage, |config| config.policy = default);
+    let rid: RepoId = arbitrary::r#gen(1);
+    policy::config::Config::new(
+        default,
+        policy::store::Store::open(amy.policies_path()).unwrap(),
+    )
+    .stop_seeding(&rid)
+    .unwrap();
+    let (cmd, unblocked) = Command::unblock_repo(rid);
+    let (busy, admitted, closed) =
+        close_while_held(&mut amy, Point::Unblock, rid, Purpose::Mutate, |amy| {
+            amy.command(cmd)
+        });
+    assert_eq!(busy, Err(Busy { rid, passes: 1 }));
+    assert!(!admitted, "a new unblock was admitted");
+    assert_eq!(closed, Ok(()));
+    // Admitted before the close, it was written.
+    assert!(unblocked.recv().unwrap().unwrap());
+    assert!(amy.policies().is_seeding(&rid).unwrap());
+}
+
+#[test]
+// Review of heartwood #26, round 1: a seed holds its pass across its policy
+// write. A close while one is written is busy, admits no new seed, and returns
+// once the seed is done: a close that has returned has every seed admitted
+// before it written.
+fn gate_closing_waits_for_a_seed_under_way() {
+    use node::gate::{Busy, Purpose};
+    use protocol::service::seams::Point;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer_as(tmp.path(), 204);
+    let rid: RepoId = arbitrary::r#gen(1);
+    let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+    let (busy, admitted, closed) =
+        close_while_held(&mut amy, Point::Seed, rid, Purpose::Mutate, |amy| {
+            amy.command(cmd)
+        });
+    assert_eq!(busy, Err(Busy { rid, passes: 1 }));
+    assert!(!admitted, "a new seed was admitted");
+    assert_eq!(closed, Ok(()));
+    // Admitted before the close, it was written.
+    assert!(seeded.recv().unwrap().unwrap());
+    assert!(amy.policies().is_seeding(&rid).unwrap());
+}
+
+#[test]
+// A repository's seeding policy can still change while it is closed by
+// unseeding: a removal unseeds it, and nothing seeds it back.
+fn gate_lets_a_closed_repository_be_unseeded() {
+    use node::gate::{Quarantine, RepoState};
+
+    let mut amy = Peer::amy();
+    let rid: RepoId = arbitrary::r#gen(1);
+    let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+    amy.command(cmd);
+    assert!(seeded.recv().unwrap().unwrap());
+
+    let gate = amy.repositories().clone();
+    let state = RepoState::Quarantined(Quarantine::Namespace);
+    gate.close(rid, state, time::Duration::ZERO).unwrap();
+    amy.command(Command::Gate(rid, state));
+    let (cmd, unseeded) = Command::unseed(rid);
+    amy.command(cmd);
+    assert!(unseeded.recv().unwrap().unwrap());
+    assert!(!amy.policies().is_seeding(&rid).unwrap());
+}
+
+#[test]
 // heartwood#14 (freedom-core design 0008): a fetch of a repository being
 // repaired waits for it to open again, then runs.
 fn gate_defers_a_fetch_until_the_repository_opens() {

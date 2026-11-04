@@ -8,11 +8,16 @@ pub use args::Args;
 
 pub fn run(args: Args, ctx: impl term::Context) -> anyhow::Result<()> {
     let profile = ctx.profile()?;
-    let mut policies = profile.policies_mut()?;
 
     let updated = match args.target {
-        BlockTarget::Node(nid) => policies.unblock_nid(&nid)?,
-        BlockTarget::Repo(rid) => policies.unblock_rid(&rid)?,
+        BlockTarget::Node(nid) => profile.policies_mut()?.unblock_nid(&nid)?,
+        // Without its block, a permissive default seeds the repository: it
+        // goes through the node, which checks its repository gate, or
+        // directly while no node runs.
+        BlockTarget::Repo(rid) => {
+            let mut node = radicle::Node::new(profile.socket_from_env());
+            profile.unblock_repo(rid, &mut node)?
+        }
     };
 
     if updated {

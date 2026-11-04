@@ -81,6 +81,40 @@ fn rad_block() {
 }
 
 #[test]
+// Review of heartwood #26, round 3: beside a running node, `rad unblock <rid>`
+// goes through the node, under a permissive default, and the repository is
+// cloned after it.
+fn rad_unblock_through_the_node() {
+    use radicle::node::Handle as _;
+    use radicle::node::policy::{Policy, Scope};
+
+    let mut environment = Environment::new();
+    let mut alice = environment.node("alice");
+    let mut bob = environment.node_with(radicle::node::Config {
+        seeding_policy: DefaultSeedingPolicy::permissive(),
+        ..radicle::node::Config::test(Alias::new("bob"))
+    });
+    let working = environment.tempdir().join("working");
+    let acme = alice.project("heartwood", "Radicle Heartwood Protocol & Stack");
+    // What a removal leaves under a permissive default.
+    bob.policies.set_seed_policy(&acme, Policy::Block).unwrap();
+
+    let mut alice = alice.spawn();
+    let mut bob = bob.spawn();
+    // Prevent Alice from fetching Bob's fork, as we're not testing that.
+    alice.handle.seed(acme, Scope::Followed).unwrap();
+    bob.connect(&alice).converge([&alice]);
+
+    test(
+        "examples/rad-unblock-through-the-node.md",
+        working,
+        Some(&bob.home),
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
 fn rad_seed_policy_allow_no_scope() {
     let mut environment = Environment::new();
     let alice = environment.node_with(radicle::node::Config {

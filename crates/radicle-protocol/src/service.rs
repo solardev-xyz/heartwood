@@ -979,6 +979,18 @@ where
                 self.fetch(rid, seed, vec![], config, Some(resp));
             }
             Command::Seed(rid, scope, resp) => {
+                // A repository being repaired or quarantined takes no seeding
+                // policy: the host may be removing it, and a policy written
+                // during the removal would outlive it, seeding the repository
+                // again once it opens. The pass is held across the write, so
+                // a close that has returned has every seed admitted before it
+                // written, and admits none after it.
+                let Some(_pass) = self.repositories.admit(rid, Purpose::Mutate) else {
+                    let state = self.repositories.state(&rid);
+                    debug!(target: "service", "Not seeding {rid}: it is {state}");
+                    resp.err(Error::Gated { rid, state }).ok();
+                    return;
+                };
                 // Update our seeding policy.
                 let seeded = match self.seed(&rid, scope) {
                     Ok(seeded) => seeded,
@@ -987,6 +999,8 @@ where
                         return;
                     }
                 };
+                #[cfg(any(test, feature = "test"))]
+                seams::at(seams::Point::Seed, rid);
                 resp.ok(seeded).ok();
 
                 // Let all our peers know that we're interested in this repo from now on.
@@ -1000,6 +1014,33 @@ where
                     Ok(updated) => resp.ok(updated).ok(),
                     Err(e) => resp.err(e).ok(),
                 };
+            }
+            Command::UnblockRepo(rid, resp) => {
+                // Without its block, the default seeding policy applies to the
+                // repository again, and a permissive one seeds it: under that
+                // default, an unblock is an allow, as a seed is. So it is
+                // gated as a seed is: a repository being repaired or
+                // quarantined keeps its block, which a removal may have just
+                // written, and the pass is held across the write.
+                let Some(_pass) = self.repositories.admit(rid, Purpose::Mutate) else {
+                    let state = self.repositories.state(&rid);
+                    debug!(target: "service", "Not unblocking {rid}: it is {state}");
+                    resp.err(Error::Gated { rid, state }).ok();
+                    return;
+                };
+                let unblocked = match self.policies.unblock_rid(&rid) {
+                    Ok(unblocked) => unblocked,
+                    Err(e) => {
+                        resp.err(e).ok();
+                        return;
+                    }
+                };
+                #[cfg(any(test, feature = "test"))]
+                seams::at(seams::Point::Unblock, rid);
+                // The subscription filter is unchanged. Under a blocking
+                // default the repository has no policy now, and isn't seeded;
+                // under a permissive one, the filter is already everything.
+                resp.ok(unblocked).ok();
             }
             Command::Follow(id, alias, resp) => {
                 match self.policies.follow(&id, alias.as_ref()) {
@@ -3352,6 +3393,10 @@ pub mod seams {
         /// An inventory that holds the repository, with its passes, before it
         /// is queued: a peer's initial messages, or an announcement.
         Inventory,
+        /// A seed, with its pass, once its policy is written.
+        Seed,
+        /// A repository unblock, with its pass, once its policy is written.
+        Unblock,
     }
 
     #[derive(Default)]

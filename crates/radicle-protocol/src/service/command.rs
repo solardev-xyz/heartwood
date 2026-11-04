@@ -103,6 +103,8 @@ pub enum Command {
     Seed(RepoId, Scope, Responder<bool>),
     /// Unseed the given repository.
     Unseed(RepoId, Responder<bool>),
+    /// Remove the given repository's `block` seeding policy.
+    UnblockRepo(RepoId, Responder<bool>),
     /// Follow the given node.
     Follow(NodeId, Option<Alias>, Responder<bool>),
     /// Unfollow the given node.
@@ -186,6 +188,11 @@ impl Command {
         (Self::Unseed(rid, responder), receiver)
     }
 
+    pub fn unblock_repo(rid: RepoId) -> (Self, Receiver<Result<bool>>) {
+        let (responder, receiver) = Responder::oneshot();
+        (Self::UnblockRepo(rid, responder), receiver)
+    }
+
     pub fn follow(node_id: NodeId, alias: Option<Alias>) -> (Self, Receiver<Result<bool>>) {
         let (responder, receiver) = Responder::oneshot();
         (Self::Follow(node_id, alias, responder), receiver)
@@ -218,6 +225,7 @@ impl fmt::Debug for Command {
             },
             Self::Seed(id, scope, _) => write!(f, "Seed({id}, {scope})"),
             Self::Unseed(id, _) => write!(f, "Unseed({id})"),
+            Self::UnblockRepo(id, _) => write!(f, "UnblockRepo({id})"),
             Self::Follow(id, _, _) => write!(f, "Follow({id})"),
             Self::Unfollow(id, _) => write!(f, "Unfollow({id})"),
             Self::Block(id, _) => write!(f, "Block({id})"),
