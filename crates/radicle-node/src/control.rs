@@ -339,6 +339,14 @@ where
                 return Err(CommandError::Runtime(e));
             }
         },
+        Command::UnblockRepo { rid } => match handle.unblock_repo(rid) {
+            Ok(result) => {
+                CommandResult::updated(result).to_writer(writer)?;
+            }
+            Err(e) => {
+                return Err(CommandError::Runtime(e));
+            }
+        },
         Command::Follow { nid, alias } => match handle.follow(nid, alias) {
             Ok(result) => {
                 CommandResult::updated(result).to_writer(writer)?;

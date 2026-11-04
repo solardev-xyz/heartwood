@@ -1086,6 +1086,9 @@ pub trait Handle: Clone + Sync + Send {
     fn block(&mut self, id: NodeId) -> Result<bool, Self::Error>;
     /// Un-seed the given repo and delete it from storage.
     fn unseed(&mut self, id: RepoId) -> Result<bool, Self::Error>;
+    /// Remove the given repo's `block` seeding policy, so that the default seeding policy applies
+    /// to it again: under a permissive default, it is seeded. Whether its policy changed.
+    fn unblock_repo(&mut self, id: RepoId) -> Result<bool, Self::Error>;
     /// Unfollow the given peer.
     fn unfollow(&mut self, id: NodeId) -> Result<bool, Self::Error>;
 
@@ -1393,6 +1396,13 @@ impl Handle for Node {
 
     fn unseed(&mut self, rid: RepoId) -> Result<bool, Error> {
         let mut lines = self.call::<Success>(Command::Unseed { rid }, DEFAULT_TIMEOUT)?;
+        let response = lines.next().ok_or(Error::EmptyResponse)??;
+
+        Ok(response.updated)
+    }
+
+    fn unblock_repo(&mut self, rid: RepoId) -> Result<bool, Error> {
+        let mut lines = self.call::<Success>(Command::UnblockRepo { rid }, DEFAULT_TIMEOUT)?;
         let response = lines.next().ok_or(Error::EmptyResponse)??;
 
         Ok(response.updated)

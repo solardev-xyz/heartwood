@@ -1015,6 +1015,33 @@ where
                     Err(e) => resp.err(e).ok(),
                 };
             }
+            Command::UnblockRepo(rid, resp) => {
+                // Without its block, the default seeding policy applies to the
+                // repository again, and a permissive one seeds it: under that
+                // default, an unblock is an allow, as a seed is. So it is
+                // gated as a seed is: a repository being repaired or
+                // quarantined keeps its block, which a removal may have just
+                // written, and the pass is held across the write.
+                let Some(_pass) = self.repositories.admit(rid, Purpose::Mutate) else {
+                    let state = self.repositories.state(&rid);
+                    debug!(target: "service", "Not unblocking {rid}: it is {state}");
+                    resp.err(Error::Gated { rid, state }).ok();
+                    return;
+                };
+                let unblocked = match self.policies.unblock_rid(&rid) {
+                    Ok(unblocked) => unblocked,
+                    Err(e) => {
+                        resp.err(e).ok();
+                        return;
+                    }
+                };
+                #[cfg(any(test, feature = "test"))]
+                seams::at(seams::Point::Unblock, rid);
+                // The subscription filter is unchanged. Under a blocking
+                // default the repository has no policy now, and isn't seeded;
+                // under a permissive one, the filter is already everything.
+                resp.ok(unblocked).ok();
+            }
             Command::Follow(id, alias, resp) => {
                 match self.policies.follow(&id, alias.as_ref()) {
                     Ok(seeded) => resp.ok(seeded).ok(),
@@ -3368,6 +3395,8 @@ pub mod seams {
         Inventory,
         /// A seed, with its pass, once its policy is written.
         Seed,
+        /// A repository unblock, with its pass, once its policy is written.
+        Unblock,
     }
 
     #[derive(Default)]

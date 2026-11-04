@@ -277,6 +277,12 @@ impl radicle::node::Handle for Handle {
         Ok(receiver.recv()??)
     }
 
+    fn unblock_repo(&mut self, id: RepoId) -> Result<bool, Error> {
+        let (responder, receiver) = service::command::Responder::oneshot();
+        self.command(service::Command::UnblockRepo(id, responder))?;
+        Ok(receiver.recv()??)
+    }
+
     fn announce_refs_for(
         &mut self,
         id: RepoId,

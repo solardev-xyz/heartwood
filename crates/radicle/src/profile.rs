@@ -263,9 +263,6 @@ pub enum Error {
     /// written past it.
     #[error("a node runs on this home, but doesn't answer on its control socket")]
     NodeUnreachable,
-    /// A node runs on this home: a policy that could seed a repository isn't written past it.
-    #[error("a node runs on this home: seed the repository through it, or stop it first")]
-    NodeRunning,
 }
 
 #[derive(Debug, Error)]
@@ -484,13 +481,7 @@ impl Profile {
         match node.seed(rid, scope) {
             Ok(updated) => Ok(updated),
             Err(e) if e.is_connection_err() => {
-                let _node = self.home.lock_node().map_err(|e| {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        Error::NodeUnreachable
-                    } else {
-                        Error::Io(e)
-                    }
-                })?;
+                let _node = self.lock_unanswering_node()?;
                 let mut config = self.policies_mut()?;
                 let updated = config.seed(&rid, scope)?;
 
@@ -500,21 +491,36 @@ impl Profile {
         }
     }
 
-    /// Remove a repository's `block` seeding policy, directly in the policy database, while no
-    /// node runs on this home: without it, the default seeding policy applies again, and a
-    /// permissive default seeds the repository. A running node's repository gate decides what it
-    /// seeds, so the write holds the home's node lock, and is refused with
-    /// [`Error::NodeRunning`] while a node holds it: seeding the repository through the node
-    /// ([`Profile::seed`]) replaces a block too, and the node checks it.
-    pub fn unblock_repo(&self, rid: &RepoId) -> Result<bool, Error> {
-        let _node = self.home.lock_node().map_err(|e| {
+    /// Remove a repository's `block` seeding policy by first trying to remove it through the
+    /// node, and if the node isn't running, by updating the policy database directly. Without its
+    /// block, the default seeding policy applies to the repository again, and a permissive default
+    /// seeds it. A seed doesn't lift a block: it updates only the scope of the repository's policy.
+    ///
+    /// Under a permissive default, an unblock is an allow, as a seed is, and is guarded as one:
+    /// the node refuses it while its repository gate holds the repository shut, and the policy is
+    /// written directly only with the home's node lock held across the write. While a node holds
+    /// it without answering, the unblock is refused with [`Error::NodeUnreachable`].
+    pub fn unblock_repo(&self, rid: RepoId, node: &mut Node) -> Result<bool, Error> {
+        match node.unblock_repo(rid) {
+            Ok(updated) => Ok(updated),
+            Err(e) if e.is_connection_err() => {
+                let _node = self.lock_unanswering_node()?;
+                Ok(self.policies_mut()?.unblock_rid(&rid)?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Takes the home's node lock once its node didn't answer, for a policy write that could seed
+    /// a repository: [`Error::NodeUnreachable`] while a node holds it.
+    fn lock_unanswering_node(&self) -> Result<NodeLock, Error> {
+        self.home.lock_node().map_err(|e| {
             if e.kind() == io::ErrorKind::WouldBlock {
-                Error::NodeRunning
+                Error::NodeUnreachable
             } else {
                 Error::Io(e)
             }
-        })?;
-        Ok(self.policies_mut()?.unblock_rid(rid)?)
+        })
     }
 
     /// Unseed a repository by first trying to unseed through the node, and if the node isn't
@@ -1121,12 +1127,14 @@ mod seed_test {
         assert!(profile.policies().unwrap().is_seeding(&rid).unwrap());
     }
 
-    // Review of heartwood #26, round 2: under a permissive default, removing
-    // a block seeds the repository. It isn't removed past a running node.
+    // Review of heartwood #26, rounds 2 and 3: under a permissive default,
+    // removing a block seeds the repository. An unblock that can't reach the
+    // node isn't written past a node that runs on the home; with none, it is
+    // written directly. (Through a running node, the node's tests.)
     #[test]
-    fn an_unblock_beside_a_running_node_is_refused() {
+    fn an_unblock_beside_a_node_that_doesnt_answer_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        let (mut profile, _) = profile(tmp.path());
+        let (mut profile, mut node) = profile(tmp.path());
         profile.config.node.seeding_policy = node::config::DefaultSeedingPolicy::permissive();
         let rid: RepoId = arbitrary::r#gen(1);
         profile
@@ -1137,13 +1145,16 @@ mod seed_test {
         assert!(!profile.policies().unwrap().is_seeding(&rid).unwrap());
         let lock = profile.home.lock_node().unwrap();
 
-        let refused = profile.unblock_repo(&rid);
-        assert!(matches!(refused, Err(Error::NodeRunning)), "{refused:?}");
+        let refused = profile.unblock_repo(rid, &mut node);
+        assert!(
+            matches!(refused, Err(Error::NodeUnreachable)),
+            "{refused:?}"
+        );
         assert!(!profile.policies().unwrap().is_seeding(&rid).unwrap());
 
         // With no node on the home, the block goes, and the default applies.
         drop(lock);
-        assert!(profile.unblock_repo(&rid).unwrap());
+        assert!(profile.unblock_repo(rid, &mut node).unwrap());
         assert!(profile.policies().unwrap().is_seeding(&rid).unwrap());
     }
 }
