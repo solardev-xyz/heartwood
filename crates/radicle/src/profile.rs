@@ -259,6 +259,10 @@ pub enum Error {
     CobsCache(#[from] cob::cache::Error),
     #[error(transparent)]
     Storage(#[from] storage::Error),
+    /// A node runs on this home, and doesn't answer on the control socket asked: a policy isn't
+    /// written past it.
+    #[error("a node runs on this home, but doesn't answer on its control socket")]
+    NodeUnreachable,
 }
 
 #[derive(Debug, Error)]
@@ -466,10 +470,24 @@ impl Profile {
     /// Seed a repository by first trying to seed through the node, and if the node isn't running,
     /// by updating the policy database directly. If the repo is available locally, we also add it
     /// to our inventory.
+    ///
+    /// A node that doesn't answer may still run on this home: one started without a control
+    /// socket, or with it elsewhere. That node's repository gate decides what it seeds, and a
+    /// policy written past it could outlive a removal of a repository it holds shut. So the
+    /// policy is written directly only with the home's node lock held across the write, taken
+    /// after the node didn't answer, so that no node starts in between. While a node holds it,
+    /// the seed is refused with [`Error::NodeUnreachable`].
     pub fn seed(&self, rid: RepoId, scope: Scope, node: &mut Node) -> Result<bool, Error> {
         match node.seed(rid, scope) {
             Ok(updated) => Ok(updated),
             Err(e) if e.is_connection_err() => {
+                let _node = self.home.lock_node().map_err(|e| {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        Error::NodeUnreachable
+                    } else {
+                        Error::Io(e)
+                    }
+                })?;
                 let mut config = self.policies_mut()?;
                 let updated = config.seed(&rid, scope)?;
 
@@ -1042,6 +1060,45 @@ mod test {
         assert!(cfg.node.extra.contains_key("db"));
         assert!(cfg.node.extra.contains_key("policy"));
         assert!(cfg.node.extra.contains_key("scope"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod seed_test {
+    use super::*;
+    use crate::test::arbitrary;
+
+    /// A fresh profile under `tmp`, and a node handle whose control socket
+    /// isn't there: what `rad seed` has beside a node started without one.
+    fn profile(tmp: &Path) -> (Profile, Node) {
+        let home = Home::new(tmp.join("home")).unwrap();
+        let profile = Profile::init(home, Alias::new("seeder"), None, Seed::new([9; 32])).unwrap();
+        let node = Node::new(tmp.join("no-such.sock"));
+        (profile, node)
+    }
+
+    // A node that runs on the home without answering holds its node lock: a
+    // seed that can't reach it is refused, and no policy is written past the
+    // node's repository gate (freedom-core design 0008).
+    #[test]
+    fn a_seed_beside_a_node_that_doesnt_answer_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (profile, mut node) = profile(tmp.path());
+        let rid: RepoId = arbitrary::r#gen(1);
+        let lock = profile.home.lock_node().unwrap();
+
+        let refused = profile.seed(rid, Scope::All, &mut node);
+        assert!(
+            matches!(refused, Err(Error::NodeUnreachable)),
+            "{refused:?}"
+        );
+        assert!(!profile.policies().unwrap().is_seeding(&rid).unwrap());
+
+        // With no node on the home, the policy is written directly.
+        drop(lock);
+        assert!(profile.seed(rid, Scope::All, &mut node).unwrap());
+        assert!(profile.policies().unwrap().is_seeding(&rid).unwrap());
     }
 }
 

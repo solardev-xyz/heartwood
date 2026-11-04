@@ -2549,6 +2549,31 @@ fn gate_refuses_a_seed_until_the_repository_opens() {
 }
 
 #[test]
+// Review of heartwood #26, round 1: a seed holds its pass across its policy
+// write. A close while one is written is busy, admits no new seed, and returns
+// once the seed is done: a close that has returned has every seed admitted
+// before it written.
+fn gate_closing_waits_for_a_seed_under_way() {
+    use node::gate::{Busy, Purpose};
+    use protocol::service::seams::Point;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut amy = gated_peer_as(tmp.path(), 204);
+    let rid: RepoId = arbitrary::r#gen(1);
+    let (cmd, seeded) = Command::seed(rid, policy::Scope::All);
+    let (busy, admitted, closed) =
+        close_while_held(&mut amy, Point::Seed, rid, Purpose::Mutate, |amy| {
+            amy.command(cmd)
+        });
+    assert_eq!(busy, Err(Busy { rid, passes: 1 }));
+    assert!(!admitted, "a new seed was admitted");
+    assert_eq!(closed, Ok(()));
+    // Admitted before the close, it was written.
+    assert!(seeded.recv().unwrap().unwrap());
+    assert!(amy.policies().is_seeding(&rid).unwrap());
+}
+
+#[test]
 // A repository's seeding policy can still change while it is closed by
 // unseeding: a removal unseeds it, and nothing seeds it back.
 fn gate_lets_a_closed_repository_be_unseeded() {

@@ -999,6 +999,8 @@ where
                         return;
                     }
                 };
+                #[cfg(any(test, feature = "test"))]
+                seams::at(seams::Point::Seed, rid);
                 resp.ok(seeded).ok();
 
                 // Let all our peers know that we're interested in this repo from now on.
@@ -3364,6 +3366,8 @@ pub mod seams {
         /// An inventory that holds the repository, with its passes, before it
         /// is queued: a peer's initial messages, or an announcement.
         Inventory,
+        /// A seed, with its pass, once its policy is written.
+        Seed,
     }
 
     #[derive(Default)]
