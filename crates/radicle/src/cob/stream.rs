@@ -69,7 +69,7 @@ impl CobRange {
     /// The range will be from the root, given by the [`ObjectId`], to the
     /// reference tips of all remote namespaces.
     pub fn new(typename: &TypeName, object_id: &ObjectId) -> Self {
-        let glob = crate::storage::refs::cobs(typename, object_id);
+        let glob = crate::storage::refs::cob(typename, object_id);
         Self {
             root: **object_id,
             until: iter::Until::Glob(glob),
@@ -332,7 +332,7 @@ mod tests {
     // Security R-20: an op stream skips the commits of its history that are
     // no ops, and the ops of other COBs, in a loop, not by recursion. A
     // history of five thousand of each streams on a 128 KiB stack.
-    fn test_skipped_commits_dont_recurse() {
+    fn skipped_commits_dont_recurse() {
         std::thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(|| {
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_from() {
+    fn all_from() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, _) = test::fixtures::repository(tmp.path());
         let signer = SigningKey::mock(38);
@@ -414,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_until() {
+    fn all_until() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, _) = test::fixtures::repository(tmp.path());
         let signer = SigningKey::mock(39);
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_from_until() {
+    fn all_from_until() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, _) = test::fixtures::repository(tmp.path());
         let signer = SigningKey::mock(40);
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_until() {
+    fn from_until() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, _) = test::fixtures::repository(tmp.path());
         let signer = SigningKey::mock(41);
@@ -467,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_regression_from_until() {
+    fn regression_from_until() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, _) = test::fixtures::repository(tmp.path());
         let signer = SigningKey::mock(42);
