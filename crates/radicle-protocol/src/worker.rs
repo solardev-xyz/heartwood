@@ -70,6 +70,8 @@ pub enum AuthorizationError {
     PolicyStore(#[from] radicle::node::policy::store::Error),
     #[error(transparent)]
     Repository(#[from] radicle::storage::RepositoryError),
+    #[error(transparent)]
+    IdentityDoc(#[from] radicle::storage::IdentityDocError),
     /// The repository gate holds the repository back from peers.
     #[error("repository {0} is {1}")]
     Gated(RepoId, radicle::node::gate::RepoState),

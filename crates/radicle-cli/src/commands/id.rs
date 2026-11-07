@@ -50,12 +50,10 @@ pub fn run(args: Args, ctx: impl term::Context) -> anyhow::Result<()> {
 
             if interactive.confirm(format!("Accept revision {}?", term::format::tertiary(id))) {
                 identity.accept(&revision.id)?;
+                // Accepting a revision may also adopt a queued child.
+                repo.set_identity_head_to(identity.current)?;
 
                 if let Some(revision) = identity.revision(&id) {
-                    // Update the canonical head to point to the latest accepted revision.
-                    if revision.is_accepted() && revision.id == identity.current {
-                        repo.set_identity_head_to(revision.id)?;
-                    }
                     // TODO: Different output if canonical changed?
 
                     if !args.quiet {
@@ -187,11 +185,8 @@ pub fn run(args: Args, ctx: impl term::Context) -> anyhow::Result<()> {
                 return Ok(());
             }
             let revision = update(title, description, proposal, &mut identity, &profile)?;
+            repo.set_identity_head_to(identity.current)?;
 
-            if revision.is_accepted() && revision.parent == Some(current.id) {
-                // Update the canonical head to point to the latest accepted revision.
-                repo.set_identity_head_to(revision.id)?;
-            }
             if args.quiet {
                 term::println(revision.id);
             } else {
@@ -606,7 +601,21 @@ fn print_diff(
     };
     let current = radicle::git::write_tree(&doc::PATH, current.as_bytes(), &repo)?;
     let mut opts = radicle::git::raw::DiffOptions::new();
-    opts.context_lines(u32::MAX);
+
+    {
+        #[cfg(not(windows))]
+        const CONTEXT_LINES: u32 = u32::MAX;
+
+        // `xdiff`, which is commonly used on Windows, stores the number of
+        // context lines as a signed integer and doubles the value when
+        // merging hunks. Avoid overflow. See also:
+        // - <https://github.com/git-for-windows/git/tree/main/xdiff>
+        // - <https://github.com/libgit2/xdiff>
+        #[cfg(windows)]
+        const CONTEXT_LINES: u32 = (i32::MAX / 2) as u32;
+
+        opts.context_lines(CONTEXT_LINES);
+    }
 
     let diff = repo.diff_tree_to_tree(previous.as_ref(), Some(&current), Some(&mut opts))?;
     let diff = Diff::try_from(diff)?;

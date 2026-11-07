@@ -7,8 +7,8 @@ use std::str::FromStr;
 use anyhow::Context as _;
 use chrono::prelude::*;
 
+use radicle::identity::DocAt;
 use radicle::identity::RepoId;
-use radicle::identity::{DocAt, Identity};
 use radicle::node::AliasStore as _;
 use radicle::node::policy::SeedingPolicy;
 use radicle::storage::git::{Repository, Storage};
@@ -148,8 +148,8 @@ pub fn run(args: Args, ctx: impl term::Context) -> anyhow::Result<()> {
         }
         Target::History => {
             let (repo, _) = repo(rid, storage)?;
-            let identity = Identity::load(&repo)?;
             let head = repo.identity_head()?;
+            let identity = repo.identity()?;
             let history = repo.revwalk(head)?;
 
             for oid in history {
@@ -309,10 +309,9 @@ fn tree(mut refs: Vec<String>) -> String {
 
 #[cfg(test)]
 mod test {
-    use super::*;
 
     #[test]
-    fn test_tree() {
+    fn tree() {
         let arg = vec![
             String::from("z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi/refs/heads/master"),
             String::from("z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi/refs/rad/id"),
@@ -329,7 +328,7 @@ z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi
 "#
         .trim_start();
 
-        assert_eq!(tree(arg), exp);
-        assert_eq!(tree(vec![String::new()]), "\n");
+        assert_eq!(super::tree(arg), exp);
+        assert_eq!(super::tree(vec![String::new()]), "\n");
     }
 }

@@ -26,6 +26,9 @@ no-default-features = false
 feature-depth = 1
 
 # This section is considered when running `cargo deny check advisories`
+# Upstream checks advisories with `cargo-audit` (`.cargo/audit.toml`) and
+# points `db-path` nowhere. Freedom's fork keeps `cargo deny` checking them
+# too, with the same exceptions as `.cargo/audit.toml`.
 [advisories]
 # Opt into new defaults since cargo deny 0.14.12 (2024-02-23)
 version = 2

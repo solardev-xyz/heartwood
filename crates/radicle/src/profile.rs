@@ -1037,7 +1037,7 @@ mod test {
     }
 
     #[test]
-    fn test_config() {
+    fn config() {
         let cfg = json::from_value::<Config>(json::json!({
           "publicExplorer": "https://app.radicle.example.com/nodes/$host/$rid$path",
           "preferredSeeds": [],

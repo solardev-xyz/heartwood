@@ -378,8 +378,7 @@ pub(super) fn run(
                         git,
                     ),
                     PushAction::PushRef { dst } => {
-                        let identity = stored.identity()?;
-                        let crefs = identity.doc().canonical_refs()?;
+                        let crefs = stored.identity()?.doc().canonical_refs()?;
                         let rules = crefs.rules();
                         let me = Did::from(nid);
 
@@ -836,8 +835,8 @@ where
     };
 
     if let Some(old) = old {
-        let identity = stored.identity()?;
-        let crefs = identity.doc().canonical_refs()?;
+        let doc = stored.identity()?.doc().clone();
+        let crefs = doc.canonical_refs()?;
         let rules = crefs.rules();
         let me = Did::from(nid);
 
@@ -846,11 +845,21 @@ where
         if let Some((_, rule)) = rules.matches(dst).next()
             && rule.allowed().contains(&me)
         {
-            patch_revert_all(old, head, dst, &stored.backend, &mut patches, &identity)?;
-            patch_merge_all(old, head, dst, working, &mut patches, signer, &identity)?;
+            patch_revert_all(old, head, dst, &stored.backend, &mut patches, &doc)?;
+            patch_merge_all(old, head, dst, working, &mut patches, signer, &doc)?;
         }
     }
-    Ok(Some(ExplorerResource::Tree { oid: head }))
+    // Annotated tags point to a tag object, but the explorer can only show
+    // the tree of a commit.
+    let resource = working
+        .find_object(head.into(), None)?
+        .peel_to_commit()
+        .ok()
+        .map(|commit| ExplorerResource::Tree {
+            oid: commit.id().into(),
+        });
+
+    Ok(resource)
 }
 
 /// Revert all patches that are no longer included in the base branch.
@@ -865,7 +874,7 @@ fn patch_revert_all(
         WriteAs<'_, impl crypto::Signer>,
         cob::cache::StoreWriter,
     >,
-    identity: &radicle::identity::Identity,
+    identity_doc: &identity::Doc,
 ) -> Result<(), Error> {
     // Find all commits reachable from the old OID but not from the new OID.
     let mut revwalk = stored.revwalk()?;
@@ -879,8 +888,6 @@ fn patch_revert_all(
     if dropped.is_empty() {
         return Ok(());
     }
-
-    let identity_doc = identity.doc();
 
     // Get the list of merged patches.
     let merged = patches
@@ -949,7 +956,7 @@ fn patch_merge_all<Signer>(
         cob::cache::StoreWriter,
     >,
     signer: &Signer,
-    identity: &radicle::identity::Identity,
+    identity_doc: &identity::Doc,
 ) -> Result<(), Error>
 where
     Signer: crypto::Signer,
@@ -964,8 +971,6 @@ where
     if commits.is_empty() {
         return Ok(());
     }
-
-    let identity_doc = identity.doc();
 
     let open = patches
         .opened()?

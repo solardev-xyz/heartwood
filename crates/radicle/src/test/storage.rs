@@ -10,7 +10,7 @@ use crate::crypto::ExtendedSignature;
 pub use crate::git;
 use crate::git::fmt;
 
-use crate::identity::doc::{Doc, DocAt, DocError, RawDoc, RepoId};
+use crate::identity::doc::{Doc, DocAt, RawDoc, RepoId};
 use crate::node::NodeId;
 
 pub use crate::storage::*;
@@ -100,7 +100,7 @@ impl ReadStorage for MockStorage {
             .iter()
             .map(|(rid, r)| RepositoryInfo {
                 rid: *rid,
-                head: r.head().unwrap().1,
+                head: Some(r.head().unwrap().1),
                 doc: r.doc.clone().into(),
                 refs: SignedRefsInfo::None,
                 synced_at: None,
@@ -307,11 +307,21 @@ impl ReadRepository for MockRepository {
         todo!()
     }
 
-    fn identity_doc(&self) -> Result<crate::identity::DocAt, RepositoryError> {
+    fn identity_doc(&self) -> Result<crate::identity::DocAt, IdentityDocError> {
         Ok(self.doc.clone())
     }
 
-    fn identity_doc_at(&self, _head: Oid) -> Result<crate::identity::DocAt, DocError> {
+    fn identity_from(
+        &self,
+        root: &crate::cob::ObjectId,
+    ) -> Result<std::cell::Ref<'_, crate::identity::Identity>, crate::cob::store::Error> {
+        Err(crate::cob::store::Error::NotFound(
+            crate::identity::TYPENAME.clone(),
+            *root,
+        ))
+    }
+
+    fn identity_doc_at(&self, _head: Oid) -> Result<crate::identity::DocAt, IdentityDocError> {
         Ok(self.doc.clone())
     }
 
@@ -324,10 +334,6 @@ impl ReadRepository for MockRepository {
     }
 
     fn identity_root(&self) -> Result<Oid, RepositoryError> {
-        Ok(self.doc.commit)
-    }
-
-    fn identity_root_of(&self, _remote: &RemoteId) -> Result<Oid, RepositoryError> {
         Ok(self.doc.commit)
     }
 

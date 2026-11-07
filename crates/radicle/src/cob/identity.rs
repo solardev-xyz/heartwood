@@ -115,6 +115,10 @@ pub enum ApplyError {
     /// Invalid signature over document blob.
     #[error("invalid signature from {0} for blob {1}")]
     InvalidSignature(PublicKey, Oid),
+    /// The identity document embedded in an operation that carries a [`Revision`]
+    /// action differs from the blob signed by the delegates.
+    #[error("identity document blob {embedded} does not match signed blob {signed}")]
+    DocMismatch { signed: Oid, embedded: Oid },
     /// Unauthorized action.
     #[error("not authorized to perform this action")]
     NotAuthorized,
@@ -198,8 +202,14 @@ impl std::ops::Deref for Identity {
 }
 
 impl Identity {
-    pub fn new(root: Revision) -> Self {
+    fn new(root: Revision) -> Self {
         let root_id = root.id;
+        let founder = *root.author.id();
+
+        debug_assert_eq!(
+            *root.doc.delegates(),
+            crate::identity::doc::Delegates::from(founder)
+        );
 
         Self {
             root: root_id,
@@ -503,8 +513,8 @@ impl Identity {
         let did = author.into();
 
         match action {
-            action @ (Action::RevisionAccept { revision: id, .. }
-            | Action::RevisionReject { revision: id }) => {
+            Action::RevisionAccept { revision: id, .. }
+            | Action::RevisionReject { revision: id } => {
                 let noun = match action {
                     Action::RevisionAccept { .. } => "acceptance",
                     Action::RevisionReject { .. } => "rejection",
@@ -639,7 +649,14 @@ impl Identity {
             } => {
                 debug_assert_eq!(self.revisions.get(&id), None, "revision visited twice");
 
-                let doc = Doc::from_blob(&repo.blob(blob)?)?;
+                let embedded = Doc::blob_at(id, repo)?;
+                if Oid::from(embedded.id()) != blob {
+                    return Err(ApplyError::DocMismatch {
+                        signed: blob,
+                        embedded: embedded.id().into(),
+                    });
+                }
+                let doc = Doc::from_blob(&embedded)?;
 
                 // All revisions but the first one must have a parent.
                 let parent_id = parent_id.ok_or(ApplyError::MissingParent)?;
@@ -1180,6 +1197,11 @@ impl<Repo: WriteRepository> store::Transaction<Identity, Repo> {
     }
 }
 
+/// A writable identity COB.
+///
+/// Writes persist the COB but do not update the repository's `rad/id` ref.
+/// Callers must synchronize that ref with the resulting [`Identity::current`],
+/// which can differ from the revision being accepted if a queued child is adopted.
 pub struct IdentityMut<'a, 'b, Repo, Signer: crypto::Signer> {
     pub id: ObjectId,
 
@@ -1218,6 +1240,10 @@ where
         let mut tx = Transaction::default();
         operations(&mut tx, self.store.as_ref())?;
 
+        self.commit(tx, message)
+    }
+
+    fn commit(&mut self, tx: Transaction<Identity, Repo>, message: &str) -> Result<EntryId, Error> {
         let (doc, commit) = tx.commit(message, self.id, &mut self.store)?;
         self.identity = doc;
 
@@ -1256,10 +1282,7 @@ where
             let repo = self.store.repo();
             Transaction::new_revision(title, description, doc, parent, repo, signer)?
         };
-        let (doc, commit) = tx.commit("Propose revision", self.id, &mut self.store)?;
-        self.identity = doc;
-
-        Ok(commit)
+        self.commit(tx, "Propose revision")
     }
 
     /// Accept an active revision.
@@ -1380,7 +1403,7 @@ mod test {
     use crate::crypto::{PublicKey, Signer as _, SigningKey};
     use crate::identity::Visibility;
     use crate::identity::did::Did;
-    use crate::identity::doc::PayloadId;
+    use crate::identity::doc::{GetPayload as _, PayloadId};
     use crate::rad;
     use crate::storage::ReadStorage as _;
     use crate::storage::git::Storage;
@@ -1402,7 +1425,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_updates() {
+    fn identity_updates() {
         let NodeWithRepo { node, repo } = NodeWithRepo::default();
         let bob = SigningKey::mock(103);
         let signer = &node.signer;
@@ -1465,7 +1488,81 @@ mod test {
     }
 
     #[test]
-    fn test_identity_update_rejected() {
+    fn identity_doc_at_checks_accepted_history() {
+        let NodeWithRepo { node, repo } = NodeWithRepo::default();
+        let bob = SigningKey::mock(103);
+        let mut identity = Identity::load_mut(&*repo, &node.signer).unwrap();
+        let mut doc = identity.doc().clone().edit();
+        let title = Title::new("Identity update").unwrap();
+        let r0 = identity.current;
+
+        doc.delegate(bob.public_key().into());
+        let r1 = identity
+            .update(title.clone(), "", &doc.clone().verified().unwrap())
+            .unwrap();
+        repo.set_identity_head_to(identity.current).unwrap();
+        // With two delegates, this revision stays pending until Bob accepts.
+        doc.visibility = Visibility::private([]);
+        let r2 = identity
+            .update(title, "", &doc.clone().verified().unwrap())
+            .unwrap();
+        let forged = cob::test::forge_identity(repo.raw(), &doc.verified().unwrap());
+
+        assert_eq!(repo.identity_doc_at(r0).unwrap().commit, r0);
+        assert_eq!(repo.identity_doc_at(r1).unwrap().commit, r1);
+        for commit in [r2, forged] {
+            assert_eq!(Doc::load_at(commit, &*repo).unwrap().commit, commit);
+            assert!(matches!(
+                repo.identity_doc_at(commit),
+                Err(crate::storage::IdentityDocError::UnacceptedRevision(id)) if id == commit
+            ));
+        }
+
+        // The current-document lookup also rejects an unaccepted cached head.
+        repo.set_identity_head_to(r2).unwrap();
+        assert!(matches!(
+            repo.identity_doc(),
+            Err(crate::storage::IdentityDocError::UnacceptedRevision(id)) if id == r2
+        ));
+        repo.set_identity_head_to(r1).unwrap();
+
+        let mut identity = Identity::load_mut(&*repo, &bob).unwrap();
+        identity.accept(&r2).unwrap();
+        // Accepted revisions are recognized even ahead of cached `rad/id`.
+        assert_eq!(repo.identity_head().unwrap(), r1);
+        assert_eq!(repo.identity_doc_at(r2).unwrap().commit, r2);
+        assert_eq!(repo.canonical_identity_doc().unwrap().commit, r2);
+        repo.set_identity_head_to(identity.current).unwrap();
+
+        for revision in [r0, r1, r2] {
+            assert_eq!(
+                repo.identity_doc_at(revision).unwrap(),
+                Doc::load_at(revision, &*repo).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn identity_document_lookup_preserves_loading_errors() {
+        let fixture = NodeWithRepo::default();
+        let repo = &fixture.repo;
+        let head = repo.identity_head().unwrap();
+        repo.raw()
+            .find_reference("refs/rad/id")
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        for result in [repo.identity_doc(), repo.identity_doc_at(head)] {
+            let Err(crate::storage::IdentityDocError::Repository(err)) = result else {
+                panic!("expected a repository loading error, got {result:?}");
+            };
+            assert!(err.is_not_found());
+        }
+    }
+
+    #[test]
+    fn identity_update_rejected() {
         let NodeWithRepo { node, repo } = NodeWithRepo::default();
         let bob = SigningKey::mock(200);
         let eve = SigningKey::mock(201);
@@ -1545,7 +1642,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_updates_concurrent() {
+    fn identity_updates_concurrent() {
         let network = Network::default();
         let alice = &network.alice;
         let bob = &network.bob;
@@ -1617,7 +1714,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_redact_revision() {
+    fn identity_redact_revision() {
         let network = Network::default();
         let alice = &network.alice;
         let bob = &network.bob;
@@ -1976,7 +2073,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_updates_concurrent_outdated() {
+    fn identity_updates_concurrent_outdated() {
         let network = Network::default();
         let alice = &network.alice;
         let bob = &network.bob;
@@ -2257,7 +2354,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_cannot_redact_terminal_states() {
+    fn identity_cannot_redact_terminal_states() {
         let network = Network::default();
         let alice = &network.alice;
         let bob = &network.bob;
@@ -2575,7 +2672,7 @@ mod test {
     }
 
     #[test]
-    fn test_valid_identity() {
+    fn valid_identity() {
         let tempdir = tempfile::tempdir().unwrap();
         let mut rng = fastrand::Rng::new();
 
@@ -2594,13 +2691,14 @@ mod test {
         let repo = storage.repository(id).unwrap();
         let mut identity = Identity::load_mut(&repo, &alice).unwrap();
         let doc = identity.doc().clone();
-        let prj = doc.project().unwrap();
+        let prj = doc.project().unwrap().unwrap();
         let mut doc = doc.edit();
 
         // Make a change to the description and sign it.
         let desc = prj.description().to_owned() + "!";
         let prj = prj.update(None, desc, None).unwrap();
-        doc.payload.insert(PayloadId::project(), prj.clone().into());
+        doc.payload
+            .insert(PayloadId::project().clone(), prj.clone().into());
         identity
             .update(
                 cob::Title::new("Update description").unwrap(),
@@ -2638,7 +2736,7 @@ mod test {
         // Update description again with signatures by Eve and Bob.
         let desc = prj.description().to_owned() + "?";
         let prj = prj.update(None, desc, None).unwrap();
-        doc.payload.insert(PayloadId::project(), prj.into());
+        doc.payload.insert(PayloadId::project().clone(), prj.into());
         let revision = bob_identity
             .update(
                 cob::Title::new("Update description again").unwrap(),
@@ -2649,6 +2747,7 @@ mod test {
 
         let mut eve_identity = Identity::load_mut(&repo, &eve).unwrap();
         eve_identity.accept(&revision).unwrap();
+        repo.set_identity_head_to(eve_identity.current).unwrap();
 
         let identity: Identity = Identity::load(&repo).unwrap();
         let root = repo.identity_root().unwrap();
@@ -2663,11 +2762,14 @@ mod test {
         assert_eq!(identity.head(), revision);
         assert_eq!(identity.doc(), &*doc);
         assert_eq!(
-            identity.doc().project().unwrap().description(),
+            identity.doc().project().unwrap().unwrap().description(),
             "Acme's repository!?"
         );
 
-        assert_eq!(doc.project().unwrap().description(), "Acme's repository!?");
+        assert_eq!(
+            doc.project().unwrap().unwrap().description(),
+            "Acme's repository!?"
+        );
     }
 
     #[test]
@@ -2748,12 +2850,39 @@ mod test {
         //     a1   [Accepted, 2/2 votes]
         //     |
         //     a0   [Accepted]
+        let head = bob.repo.identity_head().unwrap();
         bob_identity.accept(&a1).unwrap();
 
         assert_eq!(bob_identity.revision(&a1).unwrap().state, State::Accepted);
 
         assert_eq!(bob_identity.revision(&b1).unwrap().state, State::Accepted);
         assert_eq!(bob_identity.current, b1);
+        assert_eq!(bob.repo.identity_head().unwrap(), head);
+        // The caller synchronizes `rad/id` with the adopted child, not A1.
+        bob.repo.set_identity_head_to(bob_identity.current).unwrap();
+        assert_eq!(bob.repo.identity_head().unwrap(), b1);
+    }
+
+    #[test]
+    fn identity_update_leaves_identity_head_unchanged() {
+        let NodeWithRepo { node, repo } = NodeWithRepo::default();
+        let mut identity = Identity::load_mut(&*repo, &node.signer).unwrap();
+        let head = repo.identity_head().unwrap();
+        let mut doc = identity.doc().clone().edit();
+        doc.visibility = Visibility::private([]);
+        let revision = identity
+            .update(
+                Title::new("Make private").unwrap(),
+                "",
+                &doc.verified().unwrap(),
+            )
+            .unwrap();
+
+        // Adoption changes the COB state; updating `rad/id` is up to the caller.
+        assert_eq!(identity.current, revision);
+        assert_eq!(repo.identity_head().unwrap(), head);
+        repo.set_identity_head_to(identity.current).unwrap();
+        assert_eq!(repo.identity_head().unwrap(), revision);
     }
 
     /// When a revision is adopted that changes the delegate set, the majority
