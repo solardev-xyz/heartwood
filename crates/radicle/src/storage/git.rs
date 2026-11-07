@@ -6,21 +6,25 @@ pub mod reconcile;
 pub mod temp;
 pub use temp::TempRepository;
 
+use std::cell::{Cell, Ref as CellRef, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::{fs, io};
 
+use crate::cob::identity::TYPENAME as IDENTITY_TYPENAME;
+use crate::cob::object::{self, collaboration::get_from_objects};
+use crate::cob::{ObjectId, error, store};
 use crate::git::canonical::Quorum;
 use crate::git::raw::ErrorExt as _;
-use crate::identity::doc::DocError;
+use crate::identity::doc::{DocError, GetPayload as _};
 use crate::identity::{Doc, DocAt, RepoId};
 use crate::identity::{Identity, Project};
 use crate::storage::refs::{FeatureLevel, Refs, SignedRefs};
 use crate::storage::{
-    ReadRepository, ReadStorage, Remote, Remotes, RepositoryInfo, SetHead, SignRepository,
-    WriteRepository, WriteStorage,
+    IdentityDocError, ReadRepository, ReadStorage, Remote, Remotes, RepositoryInfo, SetHead,
+    SignRepository, WriteRepository, WriteStorage,
 };
 use crate::storage::{SignedRefsInfo, refs};
 use crate::{git, git::Oid, node};
@@ -160,10 +164,10 @@ impl ReadStorage for Storage {
 
             // For performance reasons, we don't do a full repository check here.
             let head = match repo.head() {
-                Ok((_, head)) => head,
+                Ok((_, head)) => Some(head),
                 Err(e) => {
-                    log::warn!(target: "storage", "Repository {rid} is invalid: looking up head: {e}");
-                    continue;
+                    log::debug!(target: "storage", "Repository {rid} is invalid: looking up head: {e}");
+                    None
                 }
             };
             // Nb. This will be `None` if they were not found.
@@ -257,7 +261,7 @@ impl Storage {
     {
         rids.map(|rid| {
             let repo = self.repository(*rid)?;
-            let (_, head) = repo.head()?;
+            let head = repo.head().ok().map(|(_, head)| head);
 
             let refs = SignedRefsInfo::new(refs::SignedRefs::load(self.info.key, &repo))
                 .map_err(|err| Error::Refs(refs::Error::Read(err)))?;
@@ -300,6 +304,26 @@ pub struct Repository {
     pub id: RepoId,
     /// The backing Git repository.
     pub backend: git::raw::Repository,
+    /// A cache of the evaluated identity.
+    cached_identity: RefCell<Option<CachedIdentity>>,
+    /// The root of the last resolved `rad/id` commit.
+    cached_identity_root: Cell<Option<CachedIdentityRoot>>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedIdentityRoot {
+    /// The commit referenced by `rad/id` when the root was resolved.
+    head: Oid,
+    /// The root commit of that identity history.
+    root: Oid,
+}
+
+struct CachedIdentity {
+    root: ObjectId,
+    /// Tips of the various COB references that were considered.
+    tips: BTreeSet<Oid>,
+    /// The actual evaluated identity being cached.
+    identity: Identity,
 }
 
 impl AsRef<Repository> for Repository {
@@ -424,7 +448,12 @@ impl Repository {
             &[] as &[&std::ffi::OsStr],
         )?;
 
-        Ok(Self { id, backend })
+        Ok(Self {
+            id,
+            backend,
+            cached_identity: RefCell::default(),
+            cached_identity_root: Cell::default(),
+        })
     }
 
     /// Create a new repository.
@@ -457,7 +486,21 @@ impl Repository {
         config.set_str("user.name", &info.name())?;
         config.set_str("user.email", &info.email())?;
 
-        Ok(Self { id, backend })
+        Ok(Self {
+            id,
+            backend,
+            cached_identity: RefCell::default(),
+            cached_identity_root: Cell::default(),
+        })
+    }
+
+    fn identity_root_at(&self, head: Oid) -> Result<Oid, RepositoryError> {
+        let root = self
+            .revwalk(head)?
+            .last()
+            .ok_or(RepositoryError::Doc(DocError::Missing))??;
+
+        Ok(root.into())
     }
 
     /// Remove an existing repository
@@ -571,12 +614,10 @@ impl Repository {
     }
 
     /// Get the canonical project information.
-    pub fn project(&self) -> Result<Project, RepositoryError> {
-        let head = self.identity_head()?;
-        let doc = self.identity_doc_at(head)?;
-        let proj = doc.project()?;
-
-        Ok(proj)
+    #[deprecated(note = "Use `Doc::project()` on `Self::identity_doc()`.")]
+    pub fn project(&self) -> Result<Option<Project>, RepositoryError> {
+        let identity = self.identity_doc()?;
+        Ok(identity.project().transpose()?)
     }
 
     pub fn identity_doc_of(&self, remote: &RemoteId) -> Result<Doc, DocError> {
@@ -835,8 +876,18 @@ impl ReadRepository for Repository {
         Ok(refs)
     }
 
-    fn identity_doc_at(&self, head: Oid) -> Result<DocAt, DocError> {
-        Doc::load_at(head, self)
+    fn identity_doc_at(&self, head: Oid) -> Result<DocAt, IdentityDocError> {
+        let identity = self.identity()?;
+        let revision = identity
+            .revision(&head)
+            .filter(|r| r.is_accepted())
+            .ok_or(IdentityDocError::UnacceptedRevision(head))?;
+
+        Ok(DocAt {
+            commit: revision.id,
+            blob: revision.blob,
+            doc: revision.doc.clone(),
+        })
     }
 
     fn head(&self) -> Result<(Qualified<'_>, Oid), RepositoryError> {
@@ -883,48 +934,108 @@ impl ReadRepository for Repository {
     }
 
     fn identity_root(&self) -> Result<Oid, RepositoryError> {
-        let oid = self.backend.refname_to_id(CANONICAL_IDENTITY.as_str())?;
-        let root = self
-            .revwalk(oid.into())?
-            .last()
-            .ok_or(RepositoryError::Doc(DocError::Missing))??;
+        let head = self
+            .backend
+            .refname_to_id(CANONICAL_IDENTITY.as_str())?
+            .into();
+        if let Some(cached) = self.cached_identity_root.get()
+            && cached.head == head
+        {
+            return Ok(cached.root);
+        }
+        let root = self.identity_root_at(head)?;
+        self.cached_identity_root
+            .set(Some(CachedIdentityRoot { head, root }));
 
-        Ok(root.into())
+        Ok(root)
     }
 
-    fn identity_root_of(&self, remote: &RemoteId) -> Result<Oid, RepositoryError> {
-        // Remotes that run newer clients will have this reference set. For older clients,
-        // compute the root OID based on the identity head.
-        if let Ok(root) = self.reference_oid(remote, &git::refs::storage::IDENTITY_ROOT) {
-            return Ok(root);
-        }
-        let oid = self.identity_head_of(remote)?;
-        let root = self
-            .revwalk(oid)?
-            .last()
-            .ok_or(RepositoryError::Doc(DocError::Missing))??;
+    fn identity_from(&self, root: &ObjectId) -> Result<CellRef<'_, Identity>, store::Error> {
+        // Another handle or process may have changed the refs. Evaluate exactly
+        // this snapshot of the refs, so the cache key matches the evaluation.
+        let refs = object::Storage::objects(self, &IDENTITY_TYPENAME, root)
+            .map_err(|err| error::Retrieve::Refs { err: Box::new(err) })?;
+        let tips = refs.iter().map(|r| r.target.id).collect();
+        let mut cached = self.cached_identity.borrow();
 
-        Ok(root.into())
+        if !cached
+            .as_ref()
+            .is_some_and(|cached| cached.root == *root && cached.tips == tips)
+        {
+            drop(cached);
+
+            let identity = get_from_objects(self, &IDENTITY_TYPENAME, root, &refs)?
+                .ok_or_else(|| store::Error::NotFound(IDENTITY_TYPENAME.clone(), *root))?
+                .object;
+
+            *self.cached_identity.borrow_mut() = Some(CachedIdentity {
+                root: *root,
+                tips,
+                identity,
+            });
+            cached = self.cached_identity.borrow();
+        }
+
+        Ok(CellRef::map(cached, |cached| {
+            &cached
+                .as_ref()
+                .expect("identity cache is populated")
+                .identity
+        }))
     }
 
     fn canonical_identity_head(&self) -> Result<Oid, RepositoryError> {
-        for remote in self.remote_ids()? {
-            let remote = remote?;
-            // Nb. A remote may not have an identity document if the user has not contributed
-            // any changes to the identity COB.
-            let Ok(root) = self.identity_root_of(&remote) else {
-                continue;
-            };
-            let blob = Doc::blob_at(root, self)?;
+        let blob = match self.backend.find_blob(self.id.deref().into()) {
+            Ok(blob) => blob,
+            Err(err) if err.is_not_found() => return Err(RepositoryError::Doc(DocError::Missing)),
+            Err(err) => return Err(err.into()),
+        };
 
-            // We've got an identity that goes back to the correct root.
-            if *self.id == blob.id() {
-                let identity = Identity::get(&root.into(), self)?;
+        let doc = Doc::from_blob(&blob)?;
+        let delegates = doc.delegates();
 
-                return Ok(identity.head());
-            }
+        if delegates.len() != 1 {
+            log::debug!(target: "storage", "Root identity document (blob '{}') has {} delegates, expected exactly 1.", self.id, delegates.len());
+            return Err(RepositoryError::Doc(DocError::Missing));
         }
-        Err(DocError::Missing.into())
+
+        let founder = delegates.first();
+
+        let root = match self.reference_oid(founder, &git::refs::storage::IDENTITY_ROOT) {
+            Ok(root) => {
+                log::debug!(target: "storage", "Obtained identity COB root commit '{root}' via reference '{}' in namespace of founder '{founder}' of identity document '{}'.", git::refs::storage::IDENTITY_ROOT.as_str(), self.id);
+                root
+            }
+            Err(err) if err.is_not_found() => {
+                // In case the namespace of the founder does not exist,
+                // or does not have `rad/root`, attempt to find the root
+                // by walking backwards from `rad/id`, which tracks the
+                // head of the identity COB.
+                let root = self.identity_root().map_err(|err| {
+                    if err.is_not_found() {
+                        RepositoryError::Doc(DocError::Missing)
+                    } else {
+                        err
+                    }
+                })?;
+
+                log::debug!(target: "storage", "Obtained identity COB root commit '{root}' via identity root of the repository.");
+                root
+            }
+            Err(err) => {
+                log::debug!(target: "storage", "Failed to find identity root for founder '{founder}' of identity document '{}': {err}", self.id);
+                return Err(RepositoryError::Doc(DocError::Missing));
+            }
+        };
+
+        let doc_at_root = Doc::load_at(root, self)?;
+
+        if doc_at_root.blob != *self.id {
+            log::debug!(target: "storage", "Root identity document (blob '{}') resolved via '{}' does not match the expected identity document (blob '{}').", doc_at_root.blob, CANONICAL_IDENTITY.as_str(), self.id);
+            return Err(RepositoryError::Doc(DocError::Missing));
+        }
+
+        Ok(self.identity_from(&root.into())?.head())
     }
 
     fn merge_base(&self, left: &Oid, right: &Oid) -> Result<Oid, crate::git::raw::Error> {
@@ -1159,7 +1270,7 @@ mod tests {
     use crate::test::fixtures;
 
     #[test]
-    fn test_references_of() {
+    fn references_of() {
         let tmp = tempfile::tempdir().unwrap();
         let signer = SigningKey::mock(54);
         let storage = Storage::open(tmp.path().join("storage"), fixtures::user()).unwrap();
@@ -1193,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_refs() {
+    fn sign_refs() {
         let tmp = tempfile::tempdir().unwrap();
         let signer = SigningKey::mock(0xb4);
         let storage = Storage::open(tmp.path(), fixtures::user()).unwrap();

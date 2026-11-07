@@ -41,7 +41,7 @@ git2 = { workspace = true, features = ["vendored-libgit2"] }
 getrandom = { workspace = true }
 # `GIT_COMMITTER_DATE`, read as git reads it.
 gix-date = { workspace = true }
-indexmap = { workspace = true, features = ["serde"] }
+indexmap = { workspace = true, features = ["serde", "std"] }
 # The libgit2 `git2` builds on, for its one option `git2` doesn't wrap: fsync
 # (`storage::git::reconcile::enable_fsync`).
 libgit2-sys = "0.18"
@@ -72,6 +72,7 @@ libc = { workspace = true }
 rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
+radicle-windows = { workspace = true }
 uds_windows = { workspace = true }
 
 [dev-dependencies]

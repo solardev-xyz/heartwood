@@ -32,6 +32,8 @@ pub enum ConnectError {
     Agent(#[from] AgentError),
     #[error("Unable to read environment variable '{var}': {source}")]
     EnvVar { var: String, source: VarError },
+    #[error("Environment variable '{var}' is set to the empty string.")]
+    EnvVarEmpty { var: String },
 }
 
 impl ConnectError {
@@ -75,7 +77,10 @@ impl Agent {
         const SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
 
         let path = match std::env::var(SSH_AUTH_SOCK) {
-            Ok(path) => Ok(PathBuf::from(path)),
+            Ok(path) if !path.is_empty() => Ok(PathBuf::from(path)),
+            Ok(_) => Err(ConnectError::EnvVarEmpty {
+                var: SSH_AUTH_SOCK.to_string(),
+            }),
             #[cfg(windows)]
             Err(VarError::NotPresent) => {
                 // Windows exposes the SSH Agent on a default named pipe.
@@ -114,14 +119,14 @@ impl Agent {
     /// than by `ssh-agent-lib`'s client, which encodes a request into a
     /// buffer it never wipes. This one is wiped once the request is sent, and
     /// is sized beforehand, so that it never grows and leaves a copy behind.
-    pub fn register(&mut self, key: &SigningKey) -> Result<(), AgentError> {
+    pub fn register(&mut self, key: &SigningKey, comment: String) -> Result<(), AgentError> {
         use ssh_key::private::{Ed25519Keypair, KeypairData};
 
         let bytes = Zeroizing::new(key.to_keypair_bytes());
         let request = proto::Request::AddIdentity(proto::AddIdentity {
             credential: PrivateCredential::Key {
                 privkey: KeypairData::Ed25519(Ed25519Keypair::from_bytes(&bytes).unwrap()),
-                comment: "".into(),
+                comment,
             },
         });
         match Self::secret_request(&mut self.stream, &request)? {
@@ -336,7 +341,8 @@ mod test {
         });
         let key = SigningKey::from_seed(crate::Seed::new(secret));
         let mut client = Agent::with(ours);
-        let (registered, found) = freed::watching(secret, || client.register(&key));
+        let comment = String::from("a key registered by a test");
+        let (registered, found) = freed::watching(secret, || client.register(&key, comment));
 
         registered.unwrap();
         let request = agent.join().unwrap();
@@ -357,7 +363,7 @@ mod test {
     use crate::VerifyingKey;
 
     #[test]
-    fn test_agent_encoding_remove() {
+    fn agent_encoding_remove() {
         use std::str::FromStr;
 
         let pk =
@@ -392,7 +398,7 @@ mod test {
     }
 
     #[test]
-    fn test_agent_encoding_sign() {
+    fn agent_encoding_sign() {
         use std::str::FromStr;
 
         let pk =
