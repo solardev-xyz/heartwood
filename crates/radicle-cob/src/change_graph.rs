@@ -253,6 +253,11 @@ impl ChangeGraph {
         if !root.valid_signatures() {
             return Err(EvaluateError::Signature(root.id).into());
         }
+        // As in `evaluate`: a root has no COB parents. `load_strict` already
+        // fails such a history, its parents being another root.
+        if !root.parents.is_empty() {
+            return Err(EvaluateError::RootHasParents(root.id).into());
+        }
         let mut object =
             T::init(&root.value, store).map_err(|e| EvaluateError::Init(Box::new(e)))?;
         let children = Vec::from_iter(root.dependents.iter().cloned());
@@ -502,5 +507,57 @@ mod test {
             );
             assert!(result.is_err(), "parent {parent}");
         }
+    }
+
+    // Freedom (upstream sync): what the lenient load above leaves out, a
+    // strict load (`get_strict`, H4d) refuses whole: an entry built on a
+    // parent that isn't a readable, signed change of the object, and a root
+    // with such a parent.
+    #[test]
+    fn unreadable_parents_fail_a_strict_load() {
+        use crate::object::collaboration::get_strict;
+
+        let limits = Limits {
+            changes: 64,
+            operations: 64,
+            bytes: 1 << 20,
+        };
+        let (_dir, repo) = setup();
+        let root = store(&repo, vec![], "root");
+        for parent in unreadable_parents(&repo, &root) {
+            let entry = store(&repo, vec![root.id], "child");
+            let child = with_parent(&repo, &entry, parent);
+            let descendant = store(&repo, vec![child], "descendant");
+            let result = get_strict::<NonEmpty<Entry>, _>(
+                &repo,
+                root.type_name(),
+                &root.id.into(),
+                &[descendant.id],
+                &limits,
+                &|| false,
+            );
+            assert!(result.is_err(), "child of {parent}");
+
+            let rooted = with_parent(&repo, &root, parent);
+            let result = get_strict::<NonEmpty<Entry>, _>(
+                &repo,
+                root.type_name(),
+                &rooted.into(),
+                &[rooted],
+                &limits,
+                &|| false,
+            );
+            assert!(result.is_err(), "root with {parent}");
+        }
+        // The history without them loads.
+        let result = get_strict::<NonEmpty<Entry>, _>(
+            &repo,
+            root.type_name(),
+            &root.id.into(),
+            &[root.id],
+            &limits,
+            &|| false,
+        );
+        assert!(matches!(result, Ok(Some(_))));
     }
 }
