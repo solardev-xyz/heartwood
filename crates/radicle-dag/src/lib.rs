@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn test_len() {
+    fn len() {
         let mut dag = Dag::new();
 
         dag.node(0, ());
@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_empty() {
+    fn is_empty() {
         let mut dag = Dag::new();
         assert!(dag.is_empty());
 
@@ -724,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dependencies() {
+    fn dependencies() {
         let mut dag = Dag::new();
 
         dag.node(0, ());
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get() {
+    fn get() {
         let mut dag = Dag::new();
 
         dag.node(0, "rad");
@@ -748,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cycle() {
+    fn cycle() {
         let mut dag = Dag::new();
 
         dag.node(0, ());
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_1() {
+    fn merge_1() {
         let mut a = Dag::new();
         let mut b = Dag::new();
         let mut c = Dag::new();
@@ -788,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_2() {
+    fn merge_2() {
         let mut a = Dag::new();
         let mut b = Dag::new();
 
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_diamond() {
+    fn diamond() {
         let mut dag = Dag::new();
 
         dag.node(0, ());
@@ -852,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_complex() {
+    fn complex() {
         let mut dag = Dag::new();
 
         dag.node(0, ());
@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_sorting_1() {
+    fn fold_sorting_1() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -944,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_sorting_2() {
+    fn fold_sorting_2() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -979,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_diamond() {
+    fn fold_diamond() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -1003,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_multiple_roots() {
+    fn fold_multiple_roots() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -1021,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_reject() {
+    fn fold_reject() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove() {
+    fn remove() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -1106,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_1() {
+    fn prune_1() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn test_siblings() {
+    fn siblings() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -1184,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_2() {
+    fn prune_2() {
         let mut dag = Dag::new();
 
         dag.node("R", ());
@@ -1219,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_by_sorting() {
+    fn prune_by_sorting() {
         let mut dag = Dag::new();
 
         dag.node("R", 0);
@@ -1279,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn test_contains() {
+    fn contains() {
         let mut dag = Dag::<u8, ()>::new();
 
         assert!(!dag.contains(&0));

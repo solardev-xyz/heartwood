@@ -1765,6 +1765,13 @@ where
         self.dequeue_fetches();
     }
 
+    /// Record that raw data was received from a peer on a worker stream.
+    pub fn received_bytes(&mut self, remote: NodeId) {
+        if let Some(session) = self.sessions.get_mut(&remote) {
+            session.last_active = self.clock;
+        }
+    }
+
     pub fn received_message(&mut self, remote: NodeId, message: Message) {
         if self.stopped {
             return;

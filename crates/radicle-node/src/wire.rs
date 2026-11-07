@@ -962,6 +962,9 @@ where
                     data: FrameData::Git(data),
                     ..
                 })) => {
+                    // Counts as liveness: this peer is sending something
+                    self.service.received_bytes(nid);
+
                     metrics.received_git_bytes += data.len();
                     if let Some(event) = deliver(streams, stream, ChannelEvent::Data(data)) {
                         *held = Some((stream, event));
@@ -2169,7 +2172,7 @@ mod test {
     }
 
     #[test]
-    fn test_pong_message_with_extension() {
+    fn pong_message_with_extension() {
         use protocol::deserializer;
 
         let mut stream = Vec::new();
@@ -2200,7 +2203,7 @@ mod test {
     }
 
     #[test]
-    fn test_inventory_ann_with_extension() {
+    fn inventory_ann_with_extension() {
         use protocol::deserializer;
 
         #[derive(Debug)]
