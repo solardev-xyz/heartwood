@@ -41,7 +41,7 @@ git2 = { workspace = true, optional = true }
 gix-packetline = { workspace = true, features = ["blocking-io"] }
 # The password of each remote node's SOCKS5 credentials.
 hmac = "0.12.1"
-indexmap = { workspace = true }
+indexmap = { workspace = true, features = ["std"] }
 lexopt = { workspace = true }
 log = { workspace = true, features = ["kv", "std"] }
 mio = { version = "1", features = ["net", "os-poll"] }

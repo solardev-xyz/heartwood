@@ -114,9 +114,6 @@ pub enum Error {
     /// thread of it has been joined.
     #[error("the node's {0} thread panicked")]
     Panicked(&'static str),
-    /// A git version error.
-    #[error("git version error: {0}")]
-    GitVersion(#[from] git::VersionError),
     /// The configuration asks for no fetches at all.
     #[error("invalid configuration: fetch concurrency must be at least 1")]
     ZeroFetchConcurrency,

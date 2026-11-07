@@ -198,8 +198,14 @@ impl std::ops::Deref for Identity {
 }
 
 impl Identity {
-    pub fn new(root: Revision) -> Self {
+    fn new(root: Revision) -> Self {
         let root_id = root.id;
+        let founder = *root.author.id();
+
+        debug_assert_eq!(
+            *root.doc.delegates(),
+            crate::identity::doc::Delegates::from(founder)
+        );
 
         Self {
             root: root_id,
@@ -503,8 +509,8 @@ impl Identity {
         let did = author.into();
 
         match action {
-            action @ (Action::RevisionAccept { revision: id, .. }
-            | Action::RevisionReject { revision: id }) => {
+            Action::RevisionAccept { revision: id, .. }
+            | Action::RevisionReject { revision: id } => {
                 let noun = match action {
                     Action::RevisionAccept { .. } => "acceptance",
                     Action::RevisionReject { .. } => "rejection",
@@ -1380,7 +1386,7 @@ mod test {
     use crate::crypto::{PublicKey, Signer as _, SigningKey};
     use crate::identity::Visibility;
     use crate::identity::did::Did;
-    use crate::identity::doc::PayloadId;
+    use crate::identity::doc::{GetPayload as _, PayloadId};
     use crate::rad;
     use crate::storage::ReadStorage as _;
     use crate::storage::git::Storage;
@@ -1402,7 +1408,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_updates() {
+    fn identity_updates() {
         let NodeWithRepo { node, repo } = NodeWithRepo::default();
         let bob = SigningKey::mock(103);
         let signer = &node.signer;
@@ -1465,7 +1471,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_update_rejected() {
+    fn identity_update_rejected() {
         let NodeWithRepo { node, repo } = NodeWithRepo::default();
         let bob = SigningKey::mock(200);
         let eve = SigningKey::mock(201);
@@ -1545,7 +1551,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_updates_concurrent() {
+    fn identity_updates_concurrent() {
         let network = Network::default();
         let alice = &network.alice;
         let bob = &network.bob;
@@ -1617,7 +1623,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_redact_revision() {
+    fn identity_redact_revision() {
         let network = Network::default();
         let alice = &network.alice;
         let bob = &network.bob;
@@ -1976,7 +1982,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_updates_concurrent_outdated() {
+    fn identity_updates_concurrent_outdated() {
         let network = Network::default();
         let alice = &network.alice;
         let bob = &network.bob;
@@ -2257,7 +2263,7 @@ mod test {
     }
 
     #[test]
-    fn test_identity_cannot_redact_terminal_states() {
+    fn identity_cannot_redact_terminal_states() {
         let network = Network::default();
         let alice = &network.alice;
         let bob = &network.bob;
@@ -2575,7 +2581,7 @@ mod test {
     }
 
     #[test]
-    fn test_valid_identity() {
+    fn valid_identity() {
         let tempdir = tempfile::tempdir().unwrap();
         let mut rng = fastrand::Rng::new();
 
@@ -2594,13 +2600,14 @@ mod test {
         let repo = storage.repository(id).unwrap();
         let mut identity = Identity::load_mut(&repo, &alice).unwrap();
         let doc = identity.doc().clone();
-        let prj = doc.project().unwrap();
+        let prj = doc.project().unwrap().unwrap();
         let mut doc = doc.edit();
 
         // Make a change to the description and sign it.
         let desc = prj.description().to_owned() + "!";
         let prj = prj.update(None, desc, None).unwrap();
-        doc.payload.insert(PayloadId::project(), prj.clone().into());
+        doc.payload
+            .insert(PayloadId::project().clone(), prj.clone().into());
         identity
             .update(
                 cob::Title::new("Update description").unwrap(),
@@ -2638,7 +2645,7 @@ mod test {
         // Update description again with signatures by Eve and Bob.
         let desc = prj.description().to_owned() + "?";
         let prj = prj.update(None, desc, None).unwrap();
-        doc.payload.insert(PayloadId::project(), prj.into());
+        doc.payload.insert(PayloadId::project().clone(), prj.into());
         let revision = bob_identity
             .update(
                 cob::Title::new("Update description again").unwrap(),
@@ -2663,11 +2670,14 @@ mod test {
         assert_eq!(identity.head(), revision);
         assert_eq!(identity.doc(), &*doc);
         assert_eq!(
-            identity.doc().project().unwrap().description(),
+            identity.doc().project().unwrap().unwrap().description(),
             "Acme's repository!?"
         );
 
-        assert_eq!(doc.project().unwrap().description(), "Acme's repository!?");
+        assert_eq!(
+            doc.project().unwrap().unwrap().description(),
+            "Acme's repository!?"
+        );
     }
 
     #[test]
