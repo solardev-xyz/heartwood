@@ -351,6 +351,20 @@ impl Identity {
         })
     }
 
+    /// Every key a revision names as a delegate, a redacted revision too.
+    ///
+    /// Only these keys' changes can change the identity: a revision, and a
+    /// verdict on one, need their author to be a delegate of its parent; an
+    /// edit or a redaction, to be its author; and the root, the founder.
+    /// Anyone else's change is refused, or changes nothing, such as a
+    /// verdict on a revision that isn't active anymore.
+    pub(crate) fn named_delegates(&self) -> std::collections::BTreeSet<PublicKey> {
+        self.revisions
+            .values()
+            .flat_map(|revision| revision.delegates().iter().map(|did| *did.as_key()))
+            .collect()
+    }
+
     pub fn latest_by(&self, who: &Did) -> Option<&Revision> {
         self.revisions().rev().find(|r| r.author.id() == who)
     }
