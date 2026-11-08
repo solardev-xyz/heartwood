@@ -1,6 +1,7 @@
 pub mod git;
 pub mod refs;
 
+use std::cell::Ref;
 use std::collections::{HashSet, hash_map};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -155,6 +156,25 @@ pub enum RepositoryError {
     CanonicalRefs(#[from] doc::CanonicalRefsError),
     #[error(transparent)]
     FindObjects(#[from] canonical::effects::FindObjectsError),
+    #[error(transparent)]
+    IdentityDoc(#[from] IdentityDocError),
+}
+
+/// Error looking up an accepted repository identity document.
+#[derive(Error, Debug)]
+pub enum IdentityDocError {
+    #[error(transparent)]
+    Repository(Box<RepositoryError>),
+    #[error(transparent)]
+    Doc(#[from] DocError),
+    #[error("commit {0} is not an accepted revision of the repository identity")]
+    UnacceptedRevision(Oid),
+}
+
+impl From<RepositoryError> for IdentityDocError {
+    fn from(err: RepositoryError) -> Self {
+        Self::Repository(Box::new(err))
+    }
 }
 
 impl From<Error> for RepositoryError {
@@ -546,13 +566,14 @@ pub trait ReadRepository: Sized + ValidateRepository {
     /// Get the root commit of the canonical identity branch.
     fn identity_root(&self) -> Result<Oid, RepositoryError>;
 
-    /// Load the identity history.
-    fn identity(&self) -> Result<Identity, RepositoryError>
-    where
-        Self: cob::Store,
-    {
-        Identity::load(self)
+    /// Borrow the identity of this repository.
+    fn identity(&self) -> Result<Ref<'_, Identity>, RepositoryError> {
+        let root = self.identity_root()?;
+        Ok(self.identity_from(&root.into())?)
     }
+
+    /// Borrow the identity history for a specific COB root.
+    fn identity_from(&self, root: &cob::ObjectId) -> Result<Ref<'_, Identity>, cob::store::Error>;
 
     /// Compute the canonical `rad/id` of this repository.
     ///
@@ -562,7 +583,8 @@ pub trait ReadRepository: Sized + ValidateRepository {
     /// Compute the canonical identity document.
     fn canonical_identity_doc(&self) -> Result<DocAt, RepositoryError> {
         let head = self.canonical_identity_head()?;
-        let doc = self.identity_doc_at(head)?;
+        // The computed head is authoritative and may be ahead of cached `rad/id`.
+        let doc = Doc::load_at(head, self)?;
 
         Ok(doc)
     }
@@ -618,7 +640,7 @@ pub trait ReadRepository: Sized + ValidateRepository {
     }
 
     /// Get the repository's identity document.
-    fn identity_doc(&self) -> Result<DocAt, RepositoryError> {
+    fn identity_doc(&self) -> Result<DocAt, IdentityDocError> {
         let head = self.identity_head()?;
         let doc = self.identity_doc_at(head)?;
 
@@ -626,7 +648,11 @@ pub trait ReadRepository: Sized + ValidateRepository {
     }
 
     /// Get the repository's identity document at a specific commit.
-    fn identity_doc_at(&self, head: Oid) -> Result<DocAt, DocError>;
+    ///
+    /// The commit must be an accepted revision of the evaluated [`Identity`] COB.
+    /// Returns [`IdentityDocError::UnacceptedRevision`] otherwise.
+    /// For document loading without this check, use [`Doc::load_at`].
+    fn identity_doc_at(&self, head: Oid) -> Result<DocAt, IdentityDocError>;
 
     /// Get the merge base of two commits.
     fn merge_base(&self, left: &Oid, right: &Oid) -> Result<Oid, crate::git::raw::Error>;

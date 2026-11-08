@@ -16,11 +16,10 @@ use crate::cob::store::{Cob, CobAction};
 use crate::cob::thread::{Comment, CommentId, Thread};
 use crate::cob::{ActorId, Embed, EntryId, ObjectId, TypeName, op, store};
 use crate::cob::{TitleError, thread};
-use crate::identity::doc::DocError;
 use crate::node::NodeId;
 use crate::prelude::{Did, Doc, ReadRepository, RepoId};
 use crate::storage;
-use crate::storage::{HasRepoId, RepositoryError, WriteRepository};
+use crate::storage::{HasRepoId, IdentityDocError, RepositoryError, WriteRepository};
 
 pub use cache::Cache;
 
@@ -48,7 +47,7 @@ impl<'a> IssueStream<'a> {
 pub enum Error {
     /// Error loading the identity document.
     #[error("identity doc failed to load: {0}")]
-    Doc(#[from] DocError),
+    Doc(#[from] IdentityDocError),
     #[error("thread apply failed: {0}")]
     Thread(#[from] thread::Error),
     #[error("store: {0}")]
@@ -937,12 +936,14 @@ mod test {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::cob::change::{Storage as _, Template};
     use crate::cob::{ActorId, Reaction, store::CobWithType};
     use crate::crypto::{Signer as _, SigningKey};
     use crate::git::Oid;
     use crate::issue::cache::Issues as _;
     use crate::test::arbitrary;
     use crate::{assert_matches, test};
+    use nonempty::NonEmpty;
 
     #[test]
     fn concurrency() {
@@ -1471,6 +1472,219 @@ mod test {
         assert_eq!(issue.state(), &State::Open);
     }
 
+    /// Point `signer`'s ref for `issue` at `entry`.
+    fn write_cob_ref(
+        repo: &storage::git::Repository,
+        signer: &SigningKey,
+        issue: &IssueId,
+        entry: Oid,
+    ) {
+        let name =
+            crate::git::refs::storage::cob_with_namespace(signer.public_key(), &TYPENAME, issue);
+
+        repo.backend
+            .reference(name.as_str(), entry.into(), true, "test")
+            .unwrap();
+    }
+
+    /// Store a signed issue entry with the given COB parents, without moving any ref.
+    fn store_entry(
+        repo: &storage::git::Repository,
+        signer: &SigningKey,
+        parents: Vec<Oid>,
+        action: Action,
+    ) -> Oid {
+        let resource = repo.identity_head().unwrap();
+        let template = Template {
+            type_name: TYPENAME.clone(),
+            tips: parents,
+            message: String::from("test"),
+            embeds: vec![],
+            contents: NonEmpty::new(store::encoding::encode(action).unwrap()),
+        };
+
+        repo.store(Some(resource), vec![], signer, template)
+            .unwrap()
+            .id
+    }
+
+    /// Write a plain Git commit that is not a COB entry.
+    fn plain_commit(repo: &storage::git::Repository) -> Oid {
+        let tree = repo.backend.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.backend.find_tree(tree).unwrap();
+        let sig = crate::git::raw::Signature::now("test", "test@example.com").unwrap();
+
+        repo.backend
+            .commit(None, &sig, &sig, "not a COB entry", &tree, &[])
+            .unwrap()
+            .into()
+    }
+
+    fn close() -> Action {
+        Action::Lifecycle {
+            state: State::Closed {
+                reason: CloseReason::Other,
+            },
+        }
+    }
+
+    #[test]
+    fn foreign_entries_are_not_part_of_the_object() {
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+        let a = issues
+            .create(cob::Title::new("A").unwrap(), "A", &[], &[], [])
+            .unwrap()
+            .id;
+        let b = issues
+            .create(cob::Title::new("B").unwrap(), "B", &[], &[], [])
+            .unwrap()
+            .id;
+        let mallory = SigningKey::mock(!1);
+
+        // Mallory points her ref for A at the tip of B.
+        write_cob_ref(&repo, &mallory, &a, *b);
+
+        let object = cob::get::<Issue, _>(&*repo, &TYPENAME, &a)
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.history.len(), 1);
+        assert_eq!(object.history.tips(), BTreeSet::from([*a]));
+    }
+
+    #[test]
+    fn honest_update_does_not_build_on_a_foreign_tip() {
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+        let a = issues
+            .create(cob::Title::new("A").unwrap(), "A", &[], &[], [])
+            .unwrap()
+            .id;
+        let b = issues
+            .create(cob::Title::new("B").unwrap(), "B", &[], &[], [])
+            .unwrap()
+            .id;
+        let mallory = SigningKey::mock(!1);
+
+        // Mallory points her ref for A at the tip of B, then Maya closes A.
+        write_cob_ref(&repo, &mallory, &a, *b);
+        let closed = issues
+            .get_mut(&a)
+            .unwrap()
+            .lifecycle(State::Closed {
+                reason: CloseReason::Other,
+            })
+            .unwrap();
+
+        let entry = repo.load(closed).unwrap();
+        assert_eq!(entry.parents, vec![*a]);
+    }
+
+    #[test]
+    fn entry_with_an_unapplied_parent_is_not_applied() {
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+        let a = issues
+            .create(cob::Title::new("A").unwrap(), "A", &[], &[], [])
+            .unwrap()
+            .id;
+        let b = issues
+            .create(cob::Title::new("B").unwrap(), "B", &[], &[], [])
+            .unwrap()
+            .id;
+        let mallory = SigningKey::mock(!1);
+
+        // Maya's close of A, written with the tip of B as an extra parent.
+        let closed = store_entry(&repo, &node.signer, vec![*a, *b], close());
+        // Mallory points her ref for B at it.
+        write_cob_ref(&repo, &mallory, &b, closed);
+
+        let issue = issues.get(&b).unwrap().unwrap();
+        assert_eq!(issue.state(), &State::Open);
+    }
+
+    #[test]
+    fn entry_with_parents_cannot_be_an_object_root() {
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+        let a = issues
+            .create(cob::Title::new("A").unwrap(), "A", &[], &[], [])
+            .unwrap()
+            .id;
+        let mallory = SigningKey::mock(!1);
+
+        // Maya's comment on A, which Mallory then publishes as the root of a new issue.
+        let comment = store_entry(
+            &repo,
+            &node.signer,
+            vec![*a],
+            Action::Comment {
+                body: String::from("Hello"),
+                reply_to: None,
+                embeds: vec![],
+            },
+        );
+        let ghost = IssueId::from(comment);
+        write_cob_ref(&repo, &mallory, &ghost, comment);
+
+        assert!(!matches!(issues.get(&ghost), Ok(Some(_))));
+        let listed = issues
+            .list()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn disconnected_invalid_entry_is_not_adopted_by_an_update() {
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+        let a = issues
+            .create(cob::Title::new("A").unwrap(), "A", &[], &[], [])
+            .unwrap()
+            .id;
+        let mallory = SigningKey::mock(!1);
+
+        // Mallory's unauthorized close of A, with no COB parents, under her own ref for A.
+        let invalid = store_entry(&repo, &mallory, vec![], close());
+        write_cob_ref(&repo, &mallory, &a, invalid);
+
+        let reply = issues
+            .get_mut(&a)
+            .unwrap()
+            .comment("Reply", *a, vec![])
+            .unwrap();
+
+        let entry = repo.load(reply).unwrap();
+        assert_eq!(entry.parents, vec![*a]);
+        assert_eq!(issues.get(&a).unwrap().unwrap().state(), &State::Open);
+    }
+
+    #[test]
+    fn entry_with_only_an_unloadable_parent_is_not_adopted_by_an_update() {
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+        let a = issues
+            .create(cob::Title::new("A").unwrap(), "A", &[], &[], [])
+            .unwrap()
+            .id;
+        let mallory = SigningKey::mock(!1);
+
+        // Mallory's entry whose only parent is not a COB entry, under her own ref for A.
+        let orphan = store_entry(&repo, &mallory, vec![plain_commit(&repo)], close());
+        write_cob_ref(&repo, &mallory, &a, orphan);
+
+        let reply = issues
+            .get_mut(&a)
+            .unwrap()
+            .comment("Reply", *a, vec![])
+            .unwrap();
+
+        let entry = repo.load(reply).unwrap();
+        assert_eq!(entry.parents, vec![*a]);
+    }
+
     /// Point `mallory`'s ref for `issue` at a blob instead of a commit.
     fn write_non_commit_cob_ref(repo: &storage::git::Repository, issue: &IssueId) {
         let mallory = SigningKey::mock(!1);
@@ -1555,6 +1769,63 @@ mod test {
         write_non_commit_cob_ref(&repo, &id);
 
         assert!(issues.get(&id).unwrap().is_none());
+    }
+
+    /// Entries written before the `Rad-Related` trailer have code commits as parents.
+    /// Such a parent is not a COB parent, and the entry applies.
+    #[test]
+    fn entry_with_an_unloadable_parent_is_applied() {
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+        let a = issues
+            .create(cob::Title::new("A").unwrap(), "A", &[], &[], [])
+            .unwrap()
+            .id;
+
+        // Maya's comment on A, with a parent that is not a COB entry.
+        let comment = store_entry(
+            &repo,
+            &node.signer,
+            vec![*a, plain_commit(&repo)],
+            Action::Comment {
+                body: String::from("Hello"),
+                reply_to: Some(*a),
+                embeds: vec![],
+            },
+        );
+        write_cob_ref(&repo, &node.signer, &a, comment);
+
+        let issue = issues.get(&a).unwrap().unwrap();
+        assert_eq!(issue.comments().count(), 2);
+    }
+
+    /// A root written before the `Rad-Related` trailer has code commits as parents.
+    #[test]
+    fn root_with_unloadable_parents_loads() {
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+
+        let root = store_entry(
+            &repo,
+            &node.signer,
+            vec![plain_commit(&repo), plain_commit(&repo)],
+            Action::Comment {
+                body: String::from("Hello"),
+                reply_to: None,
+                embeds: vec![],
+            },
+        );
+        let id = IssueId::from(root);
+        write_cob_ref(&repo, &node.signer, &id, root);
+
+        let issue = issues.get(&id).unwrap().unwrap();
+        assert_eq!(issue.comments().count(), 1);
+        let reply = issues
+            .get_mut(&id)
+            .unwrap()
+            .comment("Reply", root, vec![])
+            .unwrap();
+        assert_eq!(repo.load(reply).unwrap().parents, vec![root]);
     }
 
     #[test]
@@ -1844,5 +2115,42 @@ mod test {
         assert_eq!(eve_issue.comments().count(), 3);
         assert_eq!(cob.history.len(), 3);
         assert_eq!(cob.object.len(), 3);
+    }
+
+    #[test]
+    fn test_issue_forged_identity_resource() {
+        use crate::cob::test::SignerOpExt as _;
+
+        let test::setup::NodeWithRepo { node, repo, .. } = test::setup::NodeWithRepo::default();
+        let eve = SigningKey::mock(31);
+        let mut issues = Cache::no_cache(&*repo, &node.signer).unwrap();
+        let id = issues
+            .create(
+                cob::Title::new("My first issue").unwrap(),
+                "Blah blah blah.",
+                &[],
+                &[],
+                [],
+            )
+            .unwrap()
+            .id;
+        let label = Action::Label {
+            labels: BTreeSet::from([Label::new("bug").unwrap()]),
+        };
+
+        // Eve is not a delegate, so the real identity does not allow the action.
+        let identity = repo.identity_head().unwrap();
+        cob::test::store_change::<Issue>(&repo, &eve, identity, &id, &label);
+        let issue = issues.get(&id).unwrap().unwrap();
+        assert_eq!(issue.labels().count(), 0);
+
+        // A forged identity document that names Eve as a delegate must not
+        // allow the action either.
+        let mut doc = repo.identity_doc().unwrap().doc.edit();
+        doc.delegate(eve.did());
+        let forged = cob::test::forge_identity(repo.raw(), &doc.verified().unwrap());
+        cob::test::store_change::<Issue>(&repo, &eve, forged, &id, &label);
+        let issue = issues.get(&id).unwrap().unwrap();
+        assert_eq!(issue.labels().count(), 0);
     }
 }

@@ -415,10 +415,7 @@ fn a_refs_blob_past_the_byte_budget_is_never_read_into_memory() {
             .spawn(move || {
                 // The storage's repository, as `SignedRefs::load` reads it.
                 let rid = RepoId::from(Oid::from_sha1([99; 20]));
-                let repo = crate::storage::git::Repository {
-                    id: rid,
-                    backend: git::raw::Repository::open_bare(&path).unwrap(),
-                };
+                let repo = crate::storage::git::Repository::open(&path, rid).unwrap();
                 reset_peak();
                 let before = peak_kib();
                 let result = SignedRefsReader::new(rid, Tip::Commit(head), &repo, &verifier)
