@@ -74,7 +74,7 @@ pub use backend::git;
 pub use backend::stable;
 
 mod change_graph;
-pub use change_graph::{Limits, StrictError};
+pub use change_graph::{Exceeded, Limits, Spent, StrictError};
 mod trailers;
 
 pub mod change;
@@ -92,7 +92,7 @@ pub use type_name::TypeName;
 pub mod object;
 pub use object::{
     CollaborativeObject, Create, Evaluate, ObjectId, Update, Updated, create, get, get_strict,
-    info, list, remove, update,
+    get_within, info, list, remove, update,
 };
 
 #[cfg(test)]

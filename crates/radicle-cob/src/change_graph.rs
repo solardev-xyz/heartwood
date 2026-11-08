@@ -37,6 +37,28 @@ pub struct Limits {
     pub bytes: u64,
 }
 
+/// What lenient loads within [`Limits`] ([`crate::get_within`]) have read so
+/// far. Loads that share one are bounded together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spent {
+    /// Changes read, or tried: one that doesn't load counts too.
+    pub changes: usize,
+    /// Operations of the changes read.
+    pub operations: usize,
+    /// Bytes of the changes' objects, each change measured before it is
+    /// read, with what evaluating it reads besides.
+    pub bytes: u64,
+}
+
+/// A lenient load within [`Limits`] ([`crate::get_within`]) stopped at one
+/// of them, before reading past it.
+#[derive(Debug, thiserror::Error)]
+#[error("the COB has more than {limit} {what}")]
+pub struct Exceeded {
+    pub what: &'static str,
+    pub limit: u64,
+}
+
 /// Why a COB doesn't load strictly: any change that doesn't load, or that a
 /// lenient load would leave out, fails it, rather than leaving a partial
 /// object.
@@ -229,6 +251,126 @@ impl ChangeGraph {
         // The object's own change is its history's only root.
         if let Some((root, _)) = graph.roots().find(|(root, _)| **root != **oid) {
             return Err(StrictError::Foreign(*root));
+        }
+        Ok(Some(ChangeGraph {
+            object_id: *oid,
+            graph,
+        }))
+    }
+
+    /// Loads the change graph of `oid` from `tips` as [`ChangeGraph::load`]
+    /// does, leniently: a change that doesn't load is left out. But each
+    /// change is counted against `limits`, on top of what `spent` holds,
+    /// before it is read, and past any of them the load stops: a history is
+    /// as long as its writers make it. `extra` gives the bytes evaluating a
+    /// change reads besides the change itself, measured beforehand up to the
+    /// bytes left, which it is given (past them, any number above them);
+    /// they are charged with it. `None` if no change loads.
+    pub(crate) fn load_within<S>(
+        storage: &S,
+        tips: &[Oid],
+        typename: &TypeName,
+        oid: &ObjectId,
+        limits: &Limits,
+        spent: &mut Spent,
+        extra: &dyn Fn(&Oid, u64) -> u64,
+    ) -> Result<Option<ChangeGraph>, Exceeded>
+    where
+        S: change::Storage<
+                ObjectId = Oid,
+                Parent = Oid,
+                PublicKey = crypto::PublicKey,
+                Signature = crypto::Signature,
+            >,
+    {
+        log::debug!(target: "cob", "Loading object of type {typename} at {oid} within {limits:?}.");
+
+        let mut graph: Dag<Oid, Entry> = Dag::new();
+        let mut child_ids = tips.to_vec();
+        let mut edges_to_add = Vec::new();
+        // Changes that didn't load, which aren't tried again.
+        let mut skipped = BTreeSet::new();
+
+        while let Some(child_id) = child_ids.pop() {
+            if graph.contains(&child_id) || skipped.contains(&child_id) {
+                continue;
+            }
+            if spent.changes >= limits.changes {
+                return Err(Exceeded {
+                    what: "changes",
+                    limit: limits.changes as u64,
+                });
+            }
+            spent.changes += 1;
+
+            let too_large = Exceeded {
+                what: "bytes",
+                limit: limits.bytes,
+            };
+            let left = limits.bytes.saturating_sub(spent.bytes);
+            let measured = match storage.size_of(&child_id, left) {
+                Ok(measured) => measured,
+                Err(e) => {
+                    log::warn!(target: "cob", "Unable to measure change {child_id}: {e}");
+                    skipped.insert(child_id);
+                    continue;
+                }
+            };
+            if measured.is_some_and(|size| size > left) {
+                return Err(too_large);
+            }
+            let besides = extra(&child_id, left - measured.unwrap_or(0));
+            if let Some(size) = measured {
+                let size = size.saturating_add(besides);
+                if size > left {
+                    return Err(too_large);
+                }
+                spent.bytes += size;
+            }
+            let change = match storage.load(child_id) {
+                Ok(change) => change,
+                Err(e) => {
+                    log::warn!(
+                        target: "cob",
+                        "Unable to load change tree from commit {child_id}: {e}",
+                    );
+                    skipped.insert(child_id);
+                    continue;
+                }
+            };
+            // A store that can't measure beforehand is charged its contents.
+            if measured.is_none() {
+                let size = change
+                    .contents
+                    .iter()
+                    .map(|content| content.len() as u64)
+                    .sum::<u64>()
+                    .saturating_add(besides);
+                spent.bytes = spent.bytes.saturating_add(size);
+                if spent.bytes > limits.bytes {
+                    return Err(too_large);
+                }
+            }
+            spent.operations += change.contents.len();
+            if spent.operations > limits.operations {
+                return Err(Exceeded {
+                    what: "operations",
+                    limit: limits.operations as u64,
+                });
+            }
+            for parent_id in &change.parents {
+                edges_to_add.push((child_id, *parent_id));
+                child_ids.push(*parent_id);
+            }
+            graph.node(child_id, change);
+        }
+        for (child_id, parent_id) in edges_to_add {
+            if graph.contains(&parent_id) {
+                graph.dependency(child_id, parent_id);
+            }
+        }
+        if graph.roots().next().is_none() {
+            return Ok(None);
         }
         Ok(Some(ChangeGraph {
             object_id: *oid,
@@ -559,5 +701,130 @@ mod test {
             &|| false,
         );
         assert!(matches!(result, Ok(Some(_))));
+    }
+
+    // Freedom (bounded identity evaluation): a lenient load within limits
+    // gives what `get_from_objects` gives, while it fits; one change past
+    // any limit stops it, before that change is read.
+    #[test]
+    fn a_load_within_limits_stops_at_them() {
+        use crate::object::collaboration::get_within;
+
+        let (_dir, repo) = setup();
+        let root = store(&repo, vec![], "root");
+        let child = store(&repo, vec![root.id], "child");
+        let tip = store(&repo, vec![child.id], "tip");
+        let roomy = Limits {
+            changes: 3,
+            operations: 3,
+            bytes: 1 << 20,
+        };
+        let get = |limits: &Limits, spent: &mut Spent, extra: &dyn Fn(&Oid, u64) -> u64| {
+            get_within::<NonEmpty<Entry>, _>(
+                &repo,
+                root.type_name(),
+                &root.id.into(),
+                &[tip.id],
+                limits,
+                spent,
+                extra,
+            )
+        };
+
+        let mut spent = Spent::default();
+        let object = get(&roomy, &mut spent, &|_, _| 0).unwrap().unwrap();
+        let lenient = get_from_objects::<NonEmpty<Entry>, _>(
+            &repo,
+            root.type_name(),
+            &root.id.into(),
+            &objects(tip.id),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(object.history, lenient.history);
+        assert_eq!((spent.changes, spent.operations), (3, 3));
+        let bytes = spent.bytes;
+
+        // Each limit, one short.
+        for (limits, what) in [
+            (
+                Limits {
+                    changes: 2,
+                    ..roomy
+                },
+                "changes",
+            ),
+            (
+                Limits {
+                    operations: 2,
+                    ..roomy
+                },
+                "operations",
+            ),
+            (
+                Limits {
+                    bytes: bytes - 1,
+                    ..roomy
+                },
+                "bytes",
+            ),
+        ] {
+            let result = get(&limits, &mut Spent::default(), &|_, _| 0);
+            assert!(
+                matches!(&result, Err(crate::object::collaboration::error::Retrieve::Limit(e)) if e.what == what),
+                "{what}: {result:?}"
+            );
+        }
+        // What evaluating a change reads besides is charged with it.
+        let result = get(
+            &Limits {
+                bytes: bytes + 2,
+                ..roomy
+            },
+            &mut Spent::default(),
+            &|_, _| 1,
+        );
+        assert!(result.is_err());
+        // Loads sharing what they spent are bounded together.
+        let mut spent = Spent {
+            changes: 1,
+            ..Spent::default()
+        };
+        assert!(get(&roomy, &mut spent, &|_, _| 0).is_err());
+    }
+
+    // A change that doesn't load is counted, once, however many changes
+    // name it as a parent, and left out, as the lenient load leaves it out.
+    #[test]
+    fn a_change_that_does_not_load_is_tried_once() {
+        use crate::object::collaboration::get_within;
+
+        let (_dir, repo) = setup();
+        let root = store(&repo, vec![], "root");
+        let missing: Oid = "1111111111111111111111111111111111111111".parse().unwrap();
+        let mut tips = Vec::new();
+        for i in 0..4 {
+            let entry = store(&repo, vec![root.id], &format!("child {i}"));
+            tips.push(with_parent(&repo, &entry, missing));
+        }
+        let limits = Limits {
+            changes: 6,
+            operations: 6,
+            bytes: 1 << 20,
+        };
+        let mut spent = Spent::default();
+        let object = get_within::<NonEmpty<Entry>, _>(
+            &repo,
+            root.type_name(),
+            &root.id.into(),
+            &tips,
+            &limits,
+            &mut spent,
+            &|_, _| 0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spent.changes, 6);
+        assert_eq!(object.history.tips(), BTreeSet::from([root.id]));
     }
 }
