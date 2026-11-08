@@ -2,7 +2,8 @@
 
 use oid::Oid;
 
-use crate::change_graph::{ChangeGraph, Limits, StrictError};
+use crate::change_graph::{ChangeGraph, Limits, Spent, StrictError};
+use crate::object::Objects;
 use crate::{CollaborativeObject, Evaluate, ObjectId, TypeName};
 
 use super::error;
@@ -31,11 +32,36 @@ where
             Signature = crypto::Signature,
         >,
 {
-    let tip_refs = storage
+    let objects = storage
         .objects(typename, oid)
         .map_err(|err| error::Retrieve::Refs { err: Box::new(err) })?;
 
-    ChangeGraph::load(storage, tip_refs.iter(), typename, oid)
+    get_from_objects(storage, typename, oid, &objects)
+}
+
+/// Get a [`CollaborativeObject`] from given `objects`.
+///
+/// The corresponding higher-level function is [`get`], which will resolve
+/// `objects` from storage.
+///
+/// This function is useful for callers that want to avoid re-reading
+/// references from storage.
+pub fn get_from_objects<T, S>(
+    storage: &S,
+    typename: &TypeName,
+    oid: &ObjectId,
+    objects: &Objects,
+) -> Result<Option<CollaborativeObject<T>>, error::Retrieve>
+where
+    T: Evaluate<S>,
+    S: crate::change::Storage<
+            ObjectId = crate::object::Oid,
+            Parent = crate::object::Oid,
+            PublicKey = crypto::PublicKey,
+            Signature = crypto::Signature,
+        >,
+{
+    ChangeGraph::load(storage, objects.iter(), typename, oid)
         .map(|graph| graph.evaluate(storage).map_err(error::Retrieve::evaluate))
         .transpose()
 }
@@ -70,4 +96,38 @@ where
         return Ok(None);
     };
     graph.evaluate_strict(storage, stop).map(Some)
+}
+
+/// Get a [`CollaborativeObject`] as [`get_from_objects`] does, leniently,
+/// from the changes `tips` reach, but within `limits`, if it exists.
+///
+/// Each change is counted against `limits`, on top of what `spent` holds
+/// already, before it is read: past any of them the load fails with
+/// [`error::Retrieve::Limit`], rather than costing what the writers of the
+/// history make it cost. `extra` gives the bytes evaluating a change reads
+/// besides the change itself, such as embeds the object's type reads,
+/// measured beforehand up to the bytes left, which it is given (past them,
+/// any number above them); they are charged with it. Loads that share
+/// `spent` are bounded together. `None` if no change loads.
+pub fn get_within<T, S>(
+    storage: &S,
+    typename: &TypeName,
+    oid: &ObjectId,
+    tips: &[Oid],
+    limits: &Limits,
+    spent: &mut Spent,
+    extra: &dyn Fn(&Oid, u64) -> u64,
+) -> Result<Option<CollaborativeObject<T>>, error::Retrieve>
+where
+    T: Evaluate<S>,
+    S: crate::change::Storage<
+            ObjectId = crate::object::Oid,
+            Parent = crate::object::Oid,
+            PublicKey = crypto::PublicKey,
+            Signature = crypto::Signature,
+        >,
+{
+    ChangeGraph::load_within(storage, tips, typename, oid, limits, spent, extra)?
+        .map(|graph| graph.evaluate(storage).map_err(error::Retrieve::evaluate))
+        .transpose()
 }

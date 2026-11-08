@@ -24,7 +24,9 @@ pub use radicle_cob::{
     Store, TypeName, Update, Updated, Version, change, history::EntryId, object,
     object::collaboration::error, type_name::TypeNameParse,
 };
-pub use radicle_cob::{Limits, StrictError, create, get, get_strict, list, remove, update};
+pub use radicle_cob::{
+    Exceeded, Limits, Spent, StrictError, create, get, get_strict, get_within, list, remove, update,
+};
 
 /// The exact identifier for a particular COB.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]

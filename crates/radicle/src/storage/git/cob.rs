@@ -1,4 +1,5 @@
 //! COB storage Git backend.
+use std::cell::Ref as CellRef;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -14,10 +15,10 @@ use crate::git;
 use crate::git::fmt::*;
 use crate::git::*;
 use crate::identity;
-use crate::identity::doc::DocError;
 use crate::node::NodeId;
 use crate::storage;
 use crate::storage::Error;
+use crate::storage::IdentityDocError;
 use crate::storage::{
     ReadRepository,
     git::{Remote, Remotes, Validations},
@@ -368,11 +369,11 @@ impl<R: storage::ReadRepository> ReadRepository for DraftStore<'_, R> {
         self.repo.references_glob(pattern)
     }
 
-    fn identity_doc(&self) -> Result<crate::identity::DocAt, RepositoryError> {
+    fn identity_doc(&self) -> Result<crate::identity::DocAt, IdentityDocError> {
         self.repo.identity_doc()
     }
 
-    fn identity_doc_at(&self, head: Oid) -> Result<crate::identity::DocAt, DocError> {
+    fn identity_doc_at(&self, head: Oid) -> Result<crate::identity::DocAt, IdentityDocError> {
         self.repo.identity_doc_at(head)
     }
 
@@ -386,6 +387,13 @@ impl<R: storage::ReadRepository> ReadRepository for DraftStore<'_, R> {
 
     fn identity_root(&self) -> Result<Oid, RepositoryError> {
         self.repo.identity_root()
+    }
+
+    fn identity_from(
+        &self,
+        root: &ObjectId,
+    ) -> Result<CellRef<'_, identity::Identity>, store::Error> {
+        self.repo.identity_from(root)
     }
 
     fn canonical_identity_head(&self) -> Result<Oid, RepositoryError> {

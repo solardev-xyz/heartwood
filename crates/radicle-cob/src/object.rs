@@ -9,8 +9,8 @@ use thiserror::Error;
 
 pub mod collaboration;
 pub use collaboration::{
-    CollaborativeObject, Create, Evaluate, Update, Updated, create, get, get_strict, info, list,
-    parse_refstr, remove, update,
+    CollaborativeObject, Create, Evaluate, Update, Updated, create, get, get_strict, get_within,
+    info, list, parse_refstr, remove, update,
 };
 
 pub mod storage;

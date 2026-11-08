@@ -2,16 +2,24 @@
 pub mod cob;
 pub mod transport;
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod identity_bound;
 pub mod reconcile;
 pub mod temp;
 pub use temp::TempRepository;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::{Cell, Ref as CellRef, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{fs, io};
 
+use crate::cob::identity::TYPENAME as IDENTITY_TYPENAME;
+use crate::cob::object;
+use crate::cob::{ObjectId, error, store};
+use crate::crypto::PublicKey;
 use crate::git::canonical::Quorum;
 use crate::git::raw::ErrorExt as _;
 use crate::identity::doc::{DocError, GetPayload as _};
@@ -19,8 +27,8 @@ use crate::identity::{Doc, DocAt, RepoId};
 use crate::identity::{Identity, Project};
 use crate::storage::refs::{FeatureLevel, Refs, SignedRefs};
 use crate::storage::{
-    ReadRepository, ReadStorage, Remote, Remotes, RepositoryInfo, SetHead, SignRepository,
-    WriteRepository, WriteStorage,
+    IdentityDocError, ReadRepository, ReadStorage, Remote, Remotes, RepositoryInfo, SetHead,
+    SignRepository, WriteRepository, WriteStorage,
 };
 use crate::storage::{SignedRefsInfo, refs};
 use crate::{git, git::Oid, node};
@@ -46,6 +54,101 @@ pub static CANONICAL_IDENTITY: LazyLock<git::fmt::Qualified> = LazyLock::new(|| 
         None,
     )
 });
+
+/// What evaluating a repository's identity COB reads, at most, in all
+/// ([`ReadRepository::identity_from`]): changes, their operations, and the
+/// bytes of their objects with the documents they embed, each change counted
+/// and measured before it is read. Past any of them the identity doesn't
+/// load, with [`crate::cob::error::Retrieve::Limit`]: inbound fetches of the
+/// repository are then refused, rather than each costing what the writers
+/// of the history choose.
+///
+/// Only delegates' namespaces are read (see `Repository::evaluate_identity`),
+/// so another peer's changes count only where a delegate's history holds
+/// them. One can: anyone's verdict on a revision that isn't active anymore
+/// is applied, changing nothing, so a delegate's client that has fetched
+/// such changes builds its next identity change on them.
+///
+/// The largest identity histories of the repositories seed.radicle.xyz lists,
+/// measured 2026-11-08 across every namespace: 34 changes and 35 KB
+/// (radicle-gui), 25 changes and 30 KB (heartwood); one operation a change.
+pub const IDENTITY_LIMITS: crate::cob::Limits = crate::cob::Limits {
+    changes: 1_024,
+    operations: 4_096,
+    bytes: 16 * 1024 * 1024,
+};
+
+/// Identities [`Evaluations`] holds at most, and the bytes their
+/// evaluations read, in all, at most: past either, the oldest go.
+const EVALUATED_IDENTITIES: usize = 256;
+const EVALUATED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Identities evaluated through a [`Storage`], shared by every handle of
+/// their repositories it opens: `Worker::is_authorized` opens one for each
+/// inbound fetch, which would evaluate the identity again. An evaluation is
+/// taken as long as the references it read have the tips they had: it is
+/// of the objects they reach, which never change.
+#[derive(Clone, Default)]
+struct Evaluations(Arc<Mutex<Evaluated>>);
+
+impl std::fmt::Debug for Evaluations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Evaluations")
+    }
+}
+
+/// The identities of [`Evaluations`], by repository and root.
+#[derive(Default)]
+struct Evaluated {
+    entries: HashMap<(RepoId, ObjectId), Arc<Evaluation>>,
+    /// Their keys, oldest first.
+    order: VecDeque<(RepoId, ObjectId)>,
+    /// What their evaluations read, in all.
+    bytes: u64,
+}
+
+/// An evaluated identity, the references it was read from, and the bytes
+/// its evaluation read.
+struct Evaluation {
+    read: IdentityRead,
+    identity: Identity,
+    bytes: u64,
+}
+
+impl Evaluated {
+    /// The evaluation of `key`'s identity, if its references still have
+    /// the tips they had.
+    fn get(&self, key: &(RepoId, ObjectId), tips: &IdentityTips) -> Option<Arc<Evaluation>> {
+        self.entries
+            .get(key)
+            .filter(|evaluation| evaluation.read.is_current(tips))
+            .cloned()
+    }
+
+    /// Keeps `evaluation` for `key`, in place of any other.
+    fn insert(&mut self, key: (RepoId, ObjectId), evaluation: Arc<Evaluation>) {
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes -= old.bytes;
+            self.order.retain(|k| *k != key);
+        }
+        if evaluation.bytes > EVALUATED_BYTES {
+            return;
+        }
+        while self.entries.len() >= EVALUATED_IDENTITIES
+            || self.bytes + evaluation.bytes > EVALUATED_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.entries.remove(&oldest) {
+                self.bytes -= old.bytes;
+            }
+        }
+        self.bytes += evaluation.bytes;
+        self.order.push_back(key);
+        self.entries.insert(key, evaluation);
+    }
+}
 
 /// A parsed Git reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +184,8 @@ impl TryFrom<git::raw::Reference<'_>> for Ref {
 pub struct Storage {
     path: PathBuf,
     info: UserInfo,
+    /// The identities its repositories' handles evaluated.
+    evaluations: Evaluations,
 }
 
 impl ReadStorage for Storage {
@@ -107,7 +212,7 @@ impl ReadStorage for Storage {
     }
 
     fn repository(&self, rid: RepoId) -> Result<Self::Repository, RepositoryError> {
-        Repository::open(paths::repository(self, &rid), rid)
+        Repository::open(paths::repository(self, &rid), rid).map(|repo| self.sharing(repo))
     }
 
     fn repositories(&self) -> Result<Vec<RepositoryInfo>, Error> {
@@ -191,11 +296,12 @@ impl WriteStorage for Storage {
     type RepositoryMut = Repository;
 
     fn repository_mut(&self, rid: RepoId) -> Result<Self::RepositoryMut, RepositoryError> {
-        Repository::open(paths::repository(self, &rid), rid)
+        Repository::open(paths::repository(self, &rid), rid).map(|repo| self.sharing(repo))
     }
 
     fn create(&self, rid: RepoId) -> Result<Self::RepositoryMut, Error> {
         Repository::create(paths::repository(self, &rid), rid, &self.info)
+            .map(|repo| self.sharing(repo))
     }
 
     fn clean(&self, rid: RepoId) -> Result<Vec<RemoteId>, RepositoryError> {
@@ -216,6 +322,12 @@ impl WriteStorage for Storage {
 }
 
 impl Storage {
+    /// `repo`, sharing the identities this storage's handles evaluated.
+    fn sharing(&self, mut repo: Repository) -> Repository {
+        repo.evaluations = Some(self.evaluations.clone());
+        repo
+    }
+
     /// Open a new storage instance and load its inventory.
     pub fn open<P: AsRef<Path>>(path: P, info: UserInfo) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
@@ -225,7 +337,11 @@ impl Storage {
             Err(err) => return Err(Error::Io(err)),
             Ok(()) => {}
         }
-        Ok(Self { path, info })
+        Ok(Self {
+            path,
+            info,
+            evaluations: Evaluations::default(),
+        })
     }
 
     /// Create a [`Repository`] in a temporary directory.
@@ -300,6 +416,72 @@ pub struct Repository {
     pub id: RepoId,
     /// The backing Git repository.
     pub backend: git::raw::Repository,
+    /// A cache of the evaluated identity.
+    cached_identity: RefCell<Option<CachedIdentity>>,
+    /// The root of the last resolved `rad/id` commit.
+    cached_identity_root: Cell<Option<CachedIdentityRoot>>,
+    /// The identities evaluated through the storage that opened it, if any.
+    evaluations: Option<Evaluations>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedIdentityRoot {
+    /// The commit referenced by `rad/id` when the root was resolved.
+    head: Oid,
+    /// The root commit of that identity history.
+    root: Oid,
+}
+
+struct CachedIdentity {
+    root: ObjectId,
+    /// The references the identity was evaluated from.
+    read: IdentityRead,
+    /// The actual evaluated identity being cached.
+    identity: Identity,
+}
+
+/// The tips of an identity COB's references, one in each namespace.
+struct IdentityTips {
+    /// Each namespace's tip, by its key.
+    by_key: BTreeMap<PublicKey, Oid>,
+    /// Every reference's tip, including a namespace that isn't a key.
+    all: BTreeSet<Oid>,
+}
+
+impl From<&object::Objects> for IdentityTips {
+    fn from(refs: &object::Objects) -> Self {
+        let by_key = refs
+            .iter()
+            .filter_map(|r| {
+                let (key, _) = git::parse_ref_namespaced::<PublicKey>(r.name.as_str()).ok()?;
+                Some((key, r.target.id))
+            })
+            .collect();
+        let all = refs.iter().map(|r| r.target.id).collect();
+
+        Self { by_key, all }
+    }
+}
+
+/// The references an identity was evaluated from.
+#[derive(Clone)]
+enum IdentityRead {
+    /// The namespaces of these keys, with the tips they had, if any.
+    Delegates(BTreeMap<PublicKey, Option<Oid>>),
+    /// Every namespace, with these tips: no delegate's namespace had one.
+    All(BTreeSet<Oid>),
+}
+
+impl IdentityRead {
+    /// Whether the references read still have the tips they had.
+    fn is_current(&self, tips: &IdentityTips) -> bool {
+        match self {
+            Self::Delegates(read) => read
+                .iter()
+                .all(|(key, tip)| tips.by_key.get(key) == tip.as_ref()),
+            Self::All(read) => *read == tips.all,
+        }
+    }
 }
 
 impl AsRef<Repository> for Repository {
@@ -424,7 +606,13 @@ impl Repository {
             &[] as &[&std::ffi::OsStr],
         )?;
 
-        Ok(Self { id, backend })
+        Ok(Self {
+            id,
+            backend,
+            cached_identity: RefCell::default(),
+            cached_identity_root: Cell::default(),
+            evaluations: None,
+        })
     }
 
     /// Create a new repository.
@@ -457,7 +645,163 @@ impl Repository {
         config.set_str("user.name", &info.name())?;
         config.set_str("user.email", &info.email())?;
 
-        Ok(Self { id, backend })
+        Ok(Self {
+            id,
+            backend,
+            cached_identity: RefCell::default(),
+            cached_identity_root: Cell::default(),
+            evaluations: None,
+        })
+    }
+
+    /// The root of the identity history at `head`: the last commit of its
+    /// history, walked within [`IDENTITY_LIMITS`]' changes. A longer history
+    /// wouldn't evaluate within them either.
+    fn identity_root_at(&self, head: Oid) -> Result<Oid, RepositoryError> {
+        let mut root = None;
+        for (walked, oid) in self.revwalk(head)?.enumerate() {
+            if walked >= IDENTITY_LIMITS.changes {
+                let exceeded = crate::cob::Exceeded {
+                    what: "changes",
+                    limit: IDENTITY_LIMITS.changes as u64,
+                };
+                return Err(store::Error::Retrieve(exceeded.into()).into());
+            }
+            root = Some(oid?);
+        }
+        let root = root.ok_or(RepositoryError::Doc(DocError::Missing))?;
+
+        Ok(root.into())
+    }
+
+    /// The bytes of the document `commit` embeds, as an identity revision
+    /// does, and of its `embeds` tree, measured without reading the
+    /// document: what [`Doc::load_at`] reads besides the commit and its tree.
+    /// Measuring stops past `left`, giving a number above it. 0 if `commit`
+    /// embeds no document, or doesn't read: then evaluating it reads none.
+    fn embedded_doc_size(&self, commit: Oid, left: u64) -> u64 {
+        let measure = || -> Result<u64, git::raw::Error> {
+            let odb = self.backend.odb()?;
+            let tree = self.backend.find_commit(commit.into())?.tree()?;
+            let Some(embeds) = tree
+                .get_name("embeds")
+                .filter(|entry| entry.kind() == Some(git::raw::ObjectType::Tree))
+            else {
+                return Ok(0);
+            };
+            let (size, _) = odb.read_header(embeds.id())?;
+            let size = size as u64;
+            if size > left {
+                return Ok(size);
+            }
+            let embeds = self.backend.find_tree(embeds.id())?;
+            let Some(doc) = embeds.get_path(*crate::identity::doc::PATH).ok() else {
+                return Ok(size);
+            };
+            let (doc, _) = odb.read_header(doc.id())?;
+
+            Ok(size.saturating_add(doc as u64))
+        };
+        measure().unwrap_or(0)
+    }
+
+    /// The delegates of the document `commit` embeds, if it has one that
+    /// reads within what `spent` leaves of `limits`, which is charged for it.
+    fn delegates_within(
+        &self,
+        commit: Oid,
+        limits: &crate::cob::Limits,
+        spent: &mut crate::cob::Spent,
+    ) -> Vec<PublicKey> {
+        let left = limits.bytes.saturating_sub(spent.bytes);
+        let size = self.embedded_doc_size(commit, left);
+        if size > left {
+            return Vec::new();
+        }
+        spent.bytes += size;
+        Doc::load_at(commit, self)
+            .map(|doc| doc.delegates().iter().map(|did| *did.as_key()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Evaluates the identity COB `root` from the references `tips`, within
+    /// `limits`, reading the namespaces of its delegates only.
+    ///
+    /// Only a delegate's change can change an identity
+    /// ([`Identity::named_delegates`]), and a delegate writes its changes in
+    /// its own namespace. So the namespaces read are those of the delegates
+    /// of the root and of `rad/id` first, then of every key a revision of
+    /// the result names, until no revision names another key with a
+    /// namespace. Other peers' changes are read only where a delegate's
+    /// history holds them: the identity is the one a node evaluates that
+    /// hasn't fetched those peers. Only if no delegate's namespace has a
+    /// reference the identity loads from is every namespace read, as
+    /// upstream does, still within `limits`.
+    fn evaluate_identity(
+        &self,
+        root: &ObjectId,
+        tips: &IdentityTips,
+        limits: &crate::cob::Limits,
+    ) -> Result<(Identity, IdentityRead, u64), store::Error> {
+        let mut spent = crate::cob::Spent::default();
+        let extra = |id: &Oid, left: u64| self.embedded_doc_size(*id, left);
+        let mut keys = BTreeSet::new();
+        let head = self
+            .backend
+            .refname_to_id(CANONICAL_IDENTITY.as_str())
+            .ok()
+            .map(Oid::from);
+        for commit in [Some(**root), head].into_iter().flatten() {
+            keys.extend(self.delegates_within(commit, limits, &mut spent));
+        }
+        loop {
+            let selected = keys
+                .iter()
+                .filter_map(|key| tips.by_key.get(key))
+                .copied()
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                break;
+            }
+            let Some(cob) = crate::cob::get_within::<Identity, _>(
+                self,
+                &IDENTITY_TYPENAME,
+                root,
+                &selected,
+                limits,
+                &mut spent,
+                &extra,
+            )?
+            else {
+                break;
+            };
+            let named = cob.object.named_delegates();
+            let more = named
+                .iter()
+                .any(|key| !keys.contains(key) && tips.by_key.contains_key(key));
+            keys.extend(named);
+            if !more {
+                let read = keys
+                    .into_iter()
+                    .map(|key| (key, tips.by_key.get(&key).copied()))
+                    .collect();
+                return Ok((cob.object, IdentityRead::Delegates(read), spent.bytes));
+            }
+        }
+        let all = tips.all.iter().copied().collect::<Vec<_>>();
+        let identity = crate::cob::get_within::<Identity, _>(
+            self,
+            &IDENTITY_TYPENAME,
+            root,
+            &all,
+            limits,
+            &mut spent,
+            &extra,
+        )?
+        .ok_or_else(|| store::Error::NotFound(IDENTITY_TYPENAME.clone(), *root))?
+        .object;
+
+        Ok((identity, IdentityRead::All(tips.all.clone()), spent.bytes))
     }
 
     /// Remove an existing repository
@@ -573,12 +917,8 @@ impl Repository {
     /// Get the canonical project information.
     #[deprecated(note = "Use `Doc::project()` on `Self::identity_doc()`.")]
     pub fn project(&self) -> Result<Option<Project>, RepositoryError> {
-        self.identity_doc().and_then(|identity| {
-            identity
-                .project()
-                .transpose()
-                .map_err(RepositoryError::Payload)
-        })
+        let identity = self.identity_doc()?;
+        Ok(identity.project().transpose()?)
     }
 
     pub fn identity_doc_of(&self, remote: &RemoteId) -> Result<Doc, DocError> {
@@ -837,8 +1177,18 @@ impl ReadRepository for Repository {
         Ok(refs)
     }
 
-    fn identity_doc_at(&self, head: Oid) -> Result<DocAt, DocError> {
-        Doc::load_at(head, self)
+    fn identity_doc_at(&self, head: Oid) -> Result<DocAt, IdentityDocError> {
+        let identity = self.identity()?;
+        let revision = identity
+            .revision(&head)
+            .filter(|r| r.is_accepted())
+            .ok_or(IdentityDocError::UnacceptedRevision(head))?;
+
+        Ok(DocAt {
+            commit: revision.id,
+            blob: revision.blob,
+            doc: revision.doc.clone(),
+        })
     }
 
     fn head(&self) -> Result<(Qualified<'_>, Oid), RepositoryError> {
@@ -885,13 +1235,71 @@ impl ReadRepository for Repository {
     }
 
     fn identity_root(&self) -> Result<Oid, RepositoryError> {
-        let oid = self.backend.refname_to_id(CANONICAL_IDENTITY.as_str())?;
-        let root = self
-            .revwalk(oid.into())?
-            .last()
-            .ok_or(RepositoryError::Doc(DocError::Missing))??;
+        let head = self
+            .backend
+            .refname_to_id(CANONICAL_IDENTITY.as_str())?
+            .into();
+        if let Some(cached) = self.cached_identity_root.get()
+            && cached.head == head
+        {
+            return Ok(cached.root);
+        }
+        let root = self.identity_root_at(head)?;
+        self.cached_identity_root
+            .set(Some(CachedIdentityRoot { head, root }));
 
-        Ok(root.into())
+        Ok(root)
+    }
+
+    fn identity_from(&self, root: &ObjectId) -> Result<CellRef<'_, Identity>, store::Error> {
+        // Another handle or process may have changed the refs. Evaluate exactly
+        // this snapshot of the refs, so the cache key matches the evaluation.
+        let refs = object::Storage::objects(self, &IDENTITY_TYPENAME, root)
+            .map_err(|err| error::Retrieve::Refs { err: Box::new(err) })?;
+        let tips = IdentityTips::from(&refs);
+        let current = self
+            .cached_identity
+            .borrow()
+            .as_ref()
+            .is_some_and(|cached| cached.root == *root && cached.read.is_current(&tips));
+
+        if !current {
+            let key = (self.id, *root);
+            let shared = self
+                .evaluations
+                .as_ref()
+                .and_then(|evaluations| evaluations.0.lock().ok())
+                .and_then(|evaluated| evaluated.get(&key, &tips));
+            let (identity, read) = match shared {
+                Some(evaluation) => (evaluation.identity.clone(), evaluation.read.clone()),
+                None => {
+                    let (identity, read, bytes) =
+                        self.evaluate_identity(root, &tips, &IDENTITY_LIMITS)?;
+                    let evaluations = self.evaluations.as_ref();
+                    if let Some(mut evaluated) = evaluations.and_then(|e| e.0.lock().ok()) {
+                        let evaluation = Evaluation {
+                            read: read.clone(),
+                            identity: identity.clone(),
+                            bytes,
+                        };
+                        evaluated.insert(key, Arc::new(evaluation));
+                    }
+                    (identity, read)
+                }
+            };
+            *self.cached_identity.borrow_mut() = Some(CachedIdentity {
+                root: *root,
+                read,
+                identity,
+            });
+        }
+
+        Ok(CellRef::map(self.cached_identity.borrow(), |cached| {
+            &cached
+                .as_ref()
+                .expect("identity cache is populated")
+                .identity
+        }))
     }
 
     fn canonical_identity_head(&self) -> Result<Oid, RepositoryError> {
@@ -945,7 +1353,7 @@ impl ReadRepository for Repository {
             return Err(RepositoryError::Doc(DocError::Missing));
         }
 
-        Ok(Identity::get(&root.into(), self)?.head())
+        Ok(self.identity_from(&root.into())?.head())
     }
 
     fn merge_base(&self, left: &Oid, right: &Oid) -> Result<Oid, crate::git::raw::Error> {

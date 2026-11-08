@@ -47,6 +47,9 @@ pub enum Retrieve {
     },
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A load within limits ([`crate::get_within`]) stopped at one of them.
+    #[error(transparent)]
+    Limit(#[from] crate::change_graph::Exceeded),
 }
 
 impl Retrieve {
