@@ -930,8 +930,25 @@ where
                 if opts.persistent {
                     self.config.connect.insert((nid, addr.clone()).into());
                 }
-                if let Err(e) = self.connect(nid, addr) {
+                if let Err(e) = self.connect(nid, addr.clone()) {
                     match e {
+                        // A persistent peer whose connection dropped keeps a disconnected
+                        // session while it waits out its reconnection delay, which grows with
+                        // each failed dial, up to an hour. Asked to connect, dial it now, at
+                        // the address asked for: answering "connected" would leave the caller
+                        // with neither a connection nor a dial.
+                        ConnectError::SessionExists { nid }
+                            if self
+                                .sessions
+                                .get(&nid)
+                                .is_some_and(|session| session.is_disconnected()) =>
+                        {
+                            if let Some(session) = self.sessions.get_mut(&nid) {
+                                session.addr = addr.clone();
+                            }
+                            debug!(target: "service", "Reconnecting to {nid} ({addr}) on request..");
+                            self.reconnect(nid, addr);
+                        }
                         ConnectError::SessionExists { nid } => {
                             self.emitter.emit(Event::PeerConnected { nid });
                         }
