@@ -943,9 +943,6 @@ where
                                 .get(&nid)
                                 .is_some_and(|session| session.is_disconnected()) =>
                         {
-                            if let Some(session) = self.sessions.get_mut(&nid) {
-                                session.addr = addr.clone();
-                            }
                             debug!(target: "service", "Reconnecting to {nid} ({addr}) on request..");
                             self.reconnect(nid, addr);
                         }
@@ -2669,9 +2666,15 @@ where
         Ok((refs, timestamp))
     }
 
+    /// Dial `nid`, whose session is disconnected, at `addr`. The session's link becomes
+    /// outbound, as the dial is, and its address `addr`. A persistent peer's last connection
+    /// may have been inbound, and `disconnected` ignores an outbound connection's end on a
+    /// session whose link is inbound: the dial's failure would leave it `Attempted`.
     fn reconnect(&mut self, nid: NodeId, addr: Address) -> bool {
         if let Some(sess) = self.sessions.get_mut(&nid) {
             sess.to_initial();
+            sess.link = Link::Outbound;
+            sess.addr = addr.clone();
             self.outbox.connect(nid, addr);
 
             return true;
