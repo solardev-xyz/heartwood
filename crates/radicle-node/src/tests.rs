@@ -1278,6 +1278,140 @@ fn persistent_peer_reconnect_success() {
 }
 
 #[test]
+fn persistent_peer_connect_command_redials_a_disconnected_session() {
+    use indexmap::IndexSet;
+
+    let bob = Peer::bob();
+    let bob_connect = (*bob.nid(), bob.address()).into();
+    let mut amy =
+        Peer::amy_with(move |config| config.config.connect = IndexSet::from_iter([bob_connect]));
+    let reason =
+        DisconnectReason::Connection(Arc::new(io::Error::from(io::ErrorKind::ConnectionReset)));
+
+    // Bob's connection drops, as every connection does when the node's transport (a SOCKS
+    // proxy, say) restarts, and a redial fails: Amy keeps a disconnected session for him, and
+    // waits out a reconnection delay before she dials him again.
+    amy.connect_to(&bob);
+    amy.disconnected(*bob.nid(), Link::Outbound, &reason);
+    amy.elapse(MAX_RECONNECTION_DELTA);
+    amy.outbox()
+        .find(|o| matches!(o, Io::Connect(id, _) if id == bob.nid()))
+        .expect("Amy redials Bob once the delay is over");
+    amy.attempted(*bob.nid(), bob.address());
+    amy.disconnected(*bob.nid(), Link::Outbound, &reason);
+    assert!(!amy.outbox().any(|o| matches!(o, Io::Connect(_, _))));
+    assert!(
+        amy.sessions()
+            .get(bob.nid())
+            .is_some_and(|session| session.is_disconnected())
+    );
+
+    // Asked to connect, she dials him now, before the delay is over, and doesn't answer that
+    // he is connected before he is.
+    let events = amy.events();
+    amy.command(Command::Connect(
+        *bob.nid(),
+        bob.address(),
+        ConnectOptions {
+            persistent: true,
+            ..ConnectOptions::default()
+        },
+    ));
+    assert_matches!(
+        amy.outbox().filter(|o| matches!(o, Io::Connect { .. })).collect::<Vec<_>>().as_slice(),
+        [Io::Connect(id, addr)]
+        if *id == *bob.nid() && *addr == bob.address()
+    );
+    assert!(
+        !events
+            .try_iter()
+            .any(|e| matches!(e, Event::PeerConnected { .. }))
+    );
+
+    // The dial goes on as any other: Bob is connected once it succeeds.
+    amy.attempted(*bob.nid(), bob.address());
+    amy.connected(*bob.nid(), bob.address(), Link::Outbound);
+    assert!(
+        amy.sessions()
+            .get(bob.nid())
+            .is_some_and(|session| session.is_connected())
+    );
+    assert!(
+        events
+            .try_iter()
+            .any(|e| matches!(e, Event::PeerConnected { nid } if nid == *bob.nid()))
+    );
+}
+
+#[test]
+fn persistent_peer_connect_command_redials_a_session_last_connected_inbound() {
+    use indexmap::IndexSet;
+
+    let bob = Peer::bob();
+    let bob_connect = (*bob.nid(), bob.address()).into();
+    let mut amy =
+        Peer::amy_with(move |config| config.config.connect = IndexSet::from_iter([bob_connect]));
+    let reset =
+        DisconnectReason::Connection(Arc::new(io::Error::from(io::ErrorKind::ConnectionReset)));
+    let refused =
+        DisconnectReason::Dial(Arc::new(io::Error::from(io::ErrorKind::ConnectionRefused)));
+    let opts = ConnectOptions {
+        persistent: true,
+        ..ConnectOptions::default()
+    };
+    let session = |amy: &Peer<_>| amy.sessions().get(bob.nid()).cloned().unwrap();
+
+    // Bob, a persistent peer of Amy's, connects to her, and his connection drops: Amy keeps a
+    // disconnected session for him whose link is inbound.
+    amy.connected(*bob.nid(), bob.address(), Link::Inbound);
+    amy.disconnected(*bob.nid(), Link::Inbound, &reset);
+    assert!(session(&amy).is_disconnected());
+    assert_eq!(session(&amy).link, Link::Inbound);
+    amy.outbox().for_each(drop);
+
+    // Asked to connect, she dials him: the session's link is the dial's.
+    let events = amy.events();
+    amy.command(Command::Connect(*bob.nid(), bob.address(), opts.clone()));
+    amy.outbox()
+        .find(|o| matches!(o, Io::Connect(id, _) if id == bob.nid()))
+        .expect("Amy dials Bob");
+    assert_eq!(session(&amy).link, Link::Outbound);
+    assert_eq!(session(&amy).addr, bob.address());
+
+    // The dial fails. The failure reaches the caller, and the session waits out a delay, rather
+    // than staying `Attempted`.
+    amy.attempted(*bob.nid(), bob.address());
+    amy.disconnected(*bob.nid(), Link::Outbound, &refused);
+    assert!(session(&amy).is_disconnected());
+    assert!(
+        events
+            .try_iter()
+            .any(|e| matches!(e, Event::PeerDisconnected { nid, .. } if nid == *bob.nid()))
+    );
+    assert!(!amy.outbox().any(|o| matches!(o, Io::Connect(_, _))));
+
+    // Once the delay is over, Amy redials him, and that dial succeeds.
+    amy.elapse(MAX_RECONNECTION_DELTA);
+    amy.outbox()
+        .find(|o| matches!(o, Io::Connect(id, _) if id == bob.nid()))
+        .expect("Amy redials Bob once the delay is over");
+    amy.attempted(*bob.nid(), bob.address());
+    amy.connected(*bob.nid(), bob.address(), Link::Outbound);
+    assert!(session(&amy).is_connected());
+    assert_eq!(session(&amy).link, Link::Outbound);
+
+    // The next end of that outbound connection isn't ignored either: the session is disconnected,
+    // and a request to connect dials Bob again.
+    amy.disconnected(*bob.nid(), Link::Outbound, &reset);
+    assert!(session(&amy).is_disconnected());
+    amy.outbox().for_each(drop);
+    amy.command(Command::Connect(*bob.nid(), bob.address(), opts));
+    amy.outbox()
+        .find(|o| matches!(o, Io::Connect(id, _) if id == bob.nid()))
+        .expect("Amy dials Bob again");
+}
+
+#[test]
 fn maintain_connections() {
     // Peers Amy starts out connected to.
     let connected = [

@@ -930,8 +930,22 @@ where
                 if opts.persistent {
                     self.config.connect.insert((nid, addr.clone()).into());
                 }
-                if let Err(e) = self.connect(nid, addr) {
+                if let Err(e) = self.connect(nid, addr.clone()) {
                     match e {
+                        // A persistent peer whose connection dropped keeps a disconnected
+                        // session while it waits out its reconnection delay, which grows with
+                        // each failed dial, up to an hour. Asked to connect, dial it now, at
+                        // the address asked for: answering "connected" would leave the caller
+                        // with neither a connection nor a dial.
+                        ConnectError::SessionExists { nid }
+                            if self
+                                .sessions
+                                .get(&nid)
+                                .is_some_and(|session| session.is_disconnected()) =>
+                        {
+                            debug!(target: "service", "Reconnecting to {nid} ({addr}) on request..");
+                            self.reconnect(nid, addr);
+                        }
                         ConnectError::SessionExists { nid } => {
                             self.emitter.emit(Event::PeerConnected { nid });
                         }
@@ -2652,9 +2666,15 @@ where
         Ok((refs, timestamp))
     }
 
+    /// Dial `nid`, whose session is disconnected, at `addr`. The session's link becomes
+    /// outbound, as the dial is, and its address `addr`. A persistent peer's last connection
+    /// may have been inbound, and `disconnected` ignores an outbound connection's end on a
+    /// session whose link is inbound: the dial's failure would leave it `Attempted`.
     fn reconnect(&mut self, nid: NodeId, addr: Address) -> bool {
         if let Some(sess) = self.sessions.get_mut(&nid) {
             sess.to_initial();
+            sess.link = Link::Outbound;
+            sess.addr = addr.clone();
             self.outbox.connect(nid, addr);
 
             return true;
