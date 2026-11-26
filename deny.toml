@@ -54,6 +54,17 @@ ignore = [
     # crypto-bigint, timing variability: fixed from 0.7.6 only, which
     # elliptic-curve 0.13 can't use.
     { id = "RUSTSEC-2026-0387", reason = "no ECDSA private-key operation in heartwood; crypto-bigint 0.5 has no fix" },
+    # chrono is unmaintained: an informational notice, no vulnerability, and
+    # no release to move to. Two crates take it: radicle-log, to stamp the
+    # lines of the `Logger` the radicle-node and `rad` binaries install with
+    # the local time, and radicle-cli, to print COB and identity timestamps
+    # in `rad cob` and `rad inspect`.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained notice, no vulnerability: chrono formats timestamps only, radicle-log's log lines and radicle-cli's `rad cob` and `rad inspect` output" },
+    # humantime is unmaintained, an informational notice from the same chrono
+    # issue, with no vulnerability and no release to move to. Only
+    # radicle-cli takes it, to parse the duration arguments of `rad` commands
+    # (`--timeout` and the like) from the user's own command line.
+    { id = "RUSTSEC-2026-0542", reason = "unmaintained notice, no vulnerability: only radicle-cli parses `rad`'s duration arguments with it" },
 ]
 
 # This section is considered when running `cargo deny check licenses`
